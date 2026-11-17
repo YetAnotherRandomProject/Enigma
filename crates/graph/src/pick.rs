@@ -25,6 +25,25 @@ pub fn pick_node(
         .map(|(i, _)| i)
 }
 
+/// Nœud projeté à l'écran sous `p` : parmi ceux dont le disque (plus une
+/// tolérance) contient `p`, le plus proche de la caméra (`depth` minimale),
+/// puis le plus proche du pointeur. Éléments : `(indice, centre, rayon,
+/// profondeur)`.
+pub fn pick_front(
+    items: impl IntoIterator<Item = (usize, Vec2, f32, f32)>,
+    p: Vec2,
+    tolerance: f32,
+) -> Option<usize> {
+    items
+        .into_iter()
+        .filter_map(|(i, c, r, depth)| {
+            let d = (c - p).length();
+            (d <= r + tolerance).then_some((i, depth, d))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)))
+        .map(|(i, _, _)| i)
+}
+
 /// Distance de `p` au segment `[a, b]`.
 pub fn distance_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
     let ab = b - a;
@@ -111,6 +130,22 @@ mod tests {
             pick_node(&pos, Vec2::new(50.0, 0.0), 2.0, r, |_| true),
             None
         );
+    }
+
+    #[test]
+    fn pick_front_prefers_nearest_to_camera() {
+        let items = [
+            (0, Vec2::new(0.0, 0.0), 10.0, 500.0),
+            (1, Vec2::new(4.0, 0.0), 10.0, 200.0),
+            (2, Vec2::new(1.0, 0.0), 10.0, 200.0),
+            (3, Vec2::new(100.0, 0.0), 10.0, 1.0),
+        ];
+        assert_eq!(pick_front(items, Vec2::new(2.0, 0.0), 0.0), Some(2));
+        assert_eq!(
+            pick_front(items[..1].to_vec(), Vec2::new(2.0, 0.0), 0.0),
+            Some(0)
+        );
+        assert_eq!(pick_front(items, Vec2::new(50.0, 50.0), 2.0), None);
     }
 
     #[test]
