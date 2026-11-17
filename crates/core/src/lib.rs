@@ -17,6 +17,7 @@ pub mod filter;
 pub mod fuzzy;
 pub mod history;
 pub mod id;
+pub mod import;
 pub mod link_edit;
 pub mod links;
 pub mod markdown;
