@@ -110,7 +110,7 @@ pub struct FieldDef {
     pub kind: FieldKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Template {
     pub id: String,
@@ -121,6 +121,15 @@ pub struct Template {
     pub status: Option<String>,
     #[serde(default)]
     pub body: String,
+}
+
+impl Template {
+    /// Corps d'une nouvelle fiche : `{{title}}` / `{{titre}}` remplacés.
+    pub fn body_for(&self, title: &str) -> String {
+        self.body
+            .replace("{{title}}", title)
+            .replace("{{titre}}", title)
+    }
 }
 
 /// Un pack de jeu.
@@ -234,6 +243,15 @@ impl Pack {
         let mut problems = Vec::new();
         if self.id.trim().is_empty() {
             problems.push("`id` du pack vide".to_owned());
+        } else if !self
+            .id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            problems.push(format!(
+                "`id` du pack « {} » : seulement minuscules sans accent, chiffres, _ et -",
+                self.id
+            ));
         }
         if self.name.trim().is_empty() {
             problems.push("`name` du pack vide".to_owned());
@@ -282,6 +300,29 @@ impl Pack {
             }
         }
         problems
+    }
+
+    /// Texte JSON indenté du pack.
+    pub fn to_json(&self) -> String {
+        // La sérialisation d'un Pack ne peut pas échouer (que des chaînes,
+        // nombres et booléens) ; repli sur un objet vide par prudence.
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_owned())
+    }
+
+    /// Valide puis écrit le pack dans `dir/pack.json` (atomiquement).
+    pub fn save_dir(&self, dir: &Path) -> Result<PathBuf, PackError> {
+        let path = dir.join(PACK_FILE);
+        let problems = self.problems();
+        if !problems.is_empty() {
+            return Err(PackError::Invalid { path, problems });
+        }
+        let mut text = self.to_json();
+        text.push('\n');
+        crate::storage::write_atomic(&path, text.as_bytes()).map_err(|source| PackError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(path)
     }
 
     pub fn category(&self, id: &str) -> Option<&Category> {

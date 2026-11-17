@@ -7,6 +7,7 @@
 //! - [`history`] : pile annuler/refaire générique.
 //! - [`storage`] : écriture atomique et noms de fichiers sûrs.
 
+pub mod filter;
 pub mod history;
 pub mod id;
 pub mod links;

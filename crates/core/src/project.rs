@@ -12,11 +12,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::filter::NoteFilter;
 use crate::id::NoteId;
 use crate::links::{LinkEnd, LinkIndex, RawTarget, ResolvedLink, merge};
 use crate::markdown;
 use crate::note::{Note, NoteMeta, NoteSerializeError};
-use crate::pack::{DiscoveredPack, Pack, discover_packs};
+use crate::pack::{DiscoveredPack, Pack, Template, discover_packs};
 use crate::storage::{file_stem_for_title, unique_note_path, write_atomic};
 
 /// Dossier des données internes d'un projet (ignoré lors du parcours des fiches).
@@ -70,6 +71,8 @@ pub enum ProjectError {
     Serialize(#[from] NoteSerializeError),
     #[error("configuration du projet : {0}")]
     Config(String),
+    #[error("pack de jeu : {0}")]
+    Pack(String),
 }
 
 fn io_err(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> ProjectError {
@@ -133,12 +136,14 @@ pub struct Project {
     pack_roots: Vec<PathBuf>,
     pack: Pack,
     pack_issue: Option<String>,
+    pack_dir: Option<PathBuf>,
     notes: HashMap<NoteId, NoteEntry>,
     by_path: HashMap<PathBuf, NoteId>,
     titles: HashMap<String, Vec<NoteId>>,
     issues: BTreeMap<PathBuf, String>,
     links: LinkIndex,
     generation: u64,
+    content_version: u64,
 }
 
 impl Project {
@@ -157,12 +162,14 @@ impl Project {
             pack_roots: pack_roots.to_vec(),
             pack: Pack::empty(),
             pack_issue: None,
+            pack_dir: None,
             notes: HashMap::new(),
             by_path: HashMap::new(),
             titles: HashMap::new(),
             issues: BTreeMap::new(),
             links: LinkIndex::default(),
             generation: 0,
+            content_version: 0,
         };
         project.load_config();
         project.reload_pack();
@@ -293,12 +300,44 @@ impl Project {
         categories: Vec<String>,
         body: String,
     ) -> Result<NoteId, ProjectError> {
+        self.create_with(title, categories, None, body)
+    }
+
+    /// Crée une fiche à partir d'un modèle du pack (catégories, statut et
+    /// corps ; `{{title}}` ou `{{titre}}` dans le corps est remplacé par le titre).
+    pub fn create_from_template(
+        &mut self,
+        title: &str,
+        template: Option<&Template>,
+    ) -> Result<NoteId, ProjectError> {
+        match template {
+            None => self.create_with(title, Vec::new(), None, String::new()),
+            Some(t) => {
+                let clean = Self::validate_title(title)?;
+                self.create_with(
+                    &clean,
+                    t.categories.clone(),
+                    t.status.clone(),
+                    t.body_for(&clean),
+                )
+            }
+        }
+    }
+
+    fn create_with(
+        &mut self,
+        title: &str,
+        categories: Vec<String>,
+        status: Option<String>,
+        body: String,
+    ) -> Result<NoteId, ProjectError> {
         let title = Self::validate_title(title)?;
         if self.is_title_taken(&title, None) {
             return Err(ProjectError::TitleTaken(title));
         }
         let mut note = Note::new(title.clone());
         note.meta.categories = categories;
+        note.meta.status = status;
         note.body = body;
         let path = unique_note_path(&self.root, &file_stem_for_title(&title), |p| {
             self.by_path.contains_key(p) || p.exists()
@@ -321,6 +360,7 @@ impl Project {
             let links_changed = e.note.meta.links != meta.links;
             e.note.meta = meta;
             e.dirty = true;
+            self.content_version += 1;
             if links_changed {
                 self.reindex_links(id);
             }
@@ -680,6 +720,88 @@ impl Project {
         Ok(())
     }
 
+    /// Dossier d'où vient le pack actuel.
+    pub fn pack_dir(&self) -> Option<&Path> {
+        self.pack_dir.as_deref()
+    }
+
+    /// Dossier des packs propres au projet (`.enigma/packs`).
+    pub fn local_packs_dir(&self) -> PathBuf {
+        self.root.join(META_DIR).join(LOCAL_PACKS_DIR)
+    }
+
+    /// Valide et enregistre un pack dans `dir` (`dir/pack.json`). S'il s'agit
+    /// du pack du projet, il est rechargé.
+    pub fn save_pack(&mut self, pack: &Pack, dir: &Path) -> Result<(), ProjectError> {
+        pack.save_dir(dir)
+            .map_err(|e| ProjectError::Pack(e.to_string()))?;
+        if self.config.pack.as_deref() == Some(pack.id.as_str()) {
+            self.reload_pack();
+        }
+        Ok(())
+    }
+
+    /// Compteur incrémenté à chaque modification de contenu (corps,
+    /// métadonnées, liens) : sert à invalider les caches qui en dépendent.
+    pub fn content_version(&self) -> u64 {
+        self.content_version
+    }
+
+    /// Fiches qui passent le filtre. Tri : titre commençant par le texte,
+    /// puis titre le contenant, puis texte trouvé seulement dans le corps ;
+    /// ordre alphabétique ensuite.
+    pub fn filter(&self, filter: &NoteFilter) -> Vec<NoteId> {
+        let q = filter.text.trim().to_lowercase();
+        let mut hits: Vec<(u8, &str, &NoteId)> = Vec::new();
+        for (id, e) in &self.notes {
+            let meta = &e.note.meta;
+            if !filter.matches_categories(&meta.categories)
+                || !filter.matches_status(meta.status.as_deref())
+            {
+                continue;
+            }
+            let rank = if q.is_empty() || e.title_lower.starts_with(&q) {
+                0
+            } else if e.title_lower.contains(&q) {
+                1
+            } else if filter.in_body && e.note.body.to_lowercase().contains(&q) {
+                2
+            } else {
+                continue;
+            };
+            if filter.broken_only {
+                let broken = self
+                    .outgoing_links(id)
+                    .iter()
+                    .any(|l| matches!(l.other, LinkEnd::Broken(_)));
+                if !broken {
+                    continue;
+                }
+            }
+            if !filter.link_types.is_empty() {
+                // Raccourci : un lien sortant typé (brut) suffit ; la
+                // résolution complète n'est utile que sinon.
+                let raw_hit = self
+                    .links
+                    .raw_outgoing(id)
+                    .iter()
+                    .any(|l| l.kind.is_some() && filter.link_types.contains(&l.kind));
+                let has_type = raw_hit
+                    || self
+                        .outgoing_links(id)
+                        .iter()
+                        .chain(self.backlinks(id).iter())
+                        .any(|l| filter.link_types.contains(&l.kind));
+                if !has_type {
+                    continue;
+                }
+            }
+            hits.push((rank, e.title_lower.as_str(), id));
+        }
+        hits.sort();
+        hits.into_iter().map(|(_, _, id)| id.clone()).collect()
+    }
+
     // --- interne ---
 
     fn all_pack_roots(&self) -> Vec<PathBuf> {
@@ -713,6 +835,7 @@ impl Project {
     fn reload_pack(&mut self) {
         self.pack = Pack::empty();
         self.pack_issue = None;
+        self.pack_dir = None;
         self.generation += 1;
         let Some(wanted) = self.config.pack.clone() else {
             return;
@@ -722,6 +845,7 @@ impl Project {
             match found.result {
                 Ok(p) if p.id == wanted => {
                     self.pack = p;
+                    self.pack_dir = Some(found.dir);
                     return;
                 }
                 Ok(_) => {}
@@ -796,6 +920,7 @@ impl Project {
     }
 
     fn reindex_links(&mut self, id: &NoteId) {
+        self.content_version += 1;
         if let Some(e) = self.notes.get(id) {
             self.links.update(id, &e.note.meta, &e.note.body);
         }
@@ -1285,10 +1410,167 @@ title: Fiche {i}
             p.set_body(&source, format!("{body} {i}")).unwrap();
         }
         let update_time = t.elapsed() / 100;
-        eprintln!("ouverture {open_time:?}, rétroliens {back_time:?}, mise à jour {update_time:?}");
+        let filter = NoteFilter {
+            link_types: vec![Some("indique".to_owned())],
+            ..Default::default()
+        };
+        let t = std::time::Instant::now();
+        assert_eq!(p.filter(&filter).len(), n);
+        let filter_time = t.elapsed();
+        eprintln!(
+            "ouverture {open_time:?}, rétroliens {back_time:?}, mise à jour {update_time:?}, filtre par type {filter_time:?}"
+        );
         // Bornes très larges (machines lentes, mode debug) : on vérifie
         // seulement qu'aucune opération ne parcourt tout le projet.
         assert!(back_time < std::time::Duration::from_millis(20));
         assert!(update_time < std::time::Duration::from_millis(20));
+    }
+
+    fn filtered_titles(p: &Project, f: &NoteFilter) -> Vec<String> {
+        p.filter(f)
+            .iter()
+            .map(|id| p.note(id).unwrap().meta.title.clone())
+            .collect()
+    }
+
+    fn sample_for_filters() -> (tempfile::TempDir, Project) {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = open(d.path());
+        p.set_pack(Some("blue_prince".into())).unwrap();
+        let salle = p
+            .create_note(
+                "Salle",
+                vec!["piece".into(), "indice".into()],
+                "Un [[Coffre|ouvre]] et [[Fantôme]]".into(),
+            )
+            .unwrap();
+        let coffre = p
+            .create_note(
+                "Coffre",
+                vec!["objet".into(), "code".into()],
+                "chiffres 1945".into(),
+            )
+            .unwrap();
+        p.create_note("Bureau", vec!["piece".into()], "rien".into())
+            .unwrap();
+        for (id, status) in [(&salle, "theorie"), (&coffre, "resolu")] {
+            let mut m = p.note(id).unwrap().meta.clone();
+            m.status = Some(status.into());
+            p.set_meta(id, m).unwrap();
+        }
+        (d, p)
+    }
+
+    #[test]
+    fn filter_combines_criteria() {
+        let (_d, p) = sample_for_filters();
+        let mut f = NoteFilter::default();
+        assert_eq!(filtered_titles(&p, &f), ["Bureau", "Coffre", "Salle"]);
+
+        // Catégorie A ET B.
+        f.cycle_category("piece");
+        f.cycle_category("indice");
+        assert_eq!(filtered_titles(&p, &f), ["Salle"]);
+        // A OU B.
+        f.category_mode = crate::filter::CategoryMode::Any;
+        assert_eq!(filtered_titles(&p, &f), ["Bureau", "Salle"]);
+        // Exclusion.
+        f.cycle_category("indice");
+        assert_eq!(filtered_titles(&p, &f), ["Bureau"]);
+        f.clear_criteria();
+
+        // Statut (OU, avec « sans statut »).
+        NoteFilter::toggle(&mut f.statuses, Some("resolu".to_owned()));
+        NoteFilter::toggle(&mut f.statuses, None);
+        assert_eq!(filtered_titles(&p, &f), ["Bureau", "Coffre"]);
+        f.clear_criteria();
+
+        // Type de lien présent, dans un sens ou dans l'autre.
+        NoteFilter::toggle(&mut f.link_types, Some("ouvre".to_owned()));
+        assert_eq!(filtered_titles(&p, &f), ["Coffre", "Salle"]);
+        f.clear_criteria();
+
+        // Liens cassés.
+        f.broken_only = true;
+        assert_eq!(filtered_titles(&p, &f), ["Salle"]);
+    }
+
+    #[test]
+    fn filter_text_in_title_then_body() {
+        let (_d, p) = sample_for_filters();
+        let mut f = NoteFilter {
+            text: "1945".into(),
+            ..Default::default()
+        };
+        assert!(filtered_titles(&p, &f).is_empty());
+        f.in_body = true;
+        assert_eq!(filtered_titles(&p, &f), ["Coffre"]);
+        // Titre avant corps.
+        f.text = "co".into();
+        assert_eq!(filtered_titles(&p, &f), ["Coffre", "Salle"]);
+    }
+
+    #[test]
+    fn content_version_tracks_edits() {
+        let (_d, mut p) = sample_for_filters();
+        let id = p.resolve_title("Bureau").unwrap().clone();
+        let v = p.content_version();
+        p.set_body(&id, "autre".into()).unwrap();
+        assert!(p.content_version() > v);
+        let v = p.content_version();
+        let mut m = p.note(&id).unwrap().meta.clone();
+        m.categories.clear();
+        p.set_meta(&id, m).unwrap();
+        assert!(p.content_version() > v);
+    }
+
+    #[test]
+    fn create_from_template_applies_it() {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = open(d.path());
+        let t = crate::pack::Template {
+            id: "piece".into(),
+            label: "Nouvelle pièce".into(),
+            categories: vec!["piece".into()],
+            status: Some("theorie".into()),
+            body: "# {{title}}\n\n## Indices\n".into(),
+        };
+        let id = p.create_from_template(" Serre ", Some(&t)).unwrap();
+        let n = p.note(&id).unwrap();
+        assert_eq!(n.meta.title, "Serre");
+        assert_eq!(n.meta.categories, ["piece"]);
+        assert_eq!(n.meta.status.as_deref(), Some("theorie"));
+        assert_eq!(n.body, "# Serre\n\n## Indices\n");
+        let empty = p.create_from_template("Vide", None).unwrap();
+        assert!(p.note(&empty).unwrap().body.is_empty());
+    }
+
+    #[test]
+    fn save_pack_locally_overrides_and_reloads() {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = open(d.path());
+        p.set_pack(Some("blue_prince".into())).unwrap();
+        assert!(p.pack_dir().unwrap().ends_with("blue_prince"));
+        let mut pack = p.pack().clone();
+        pack.categories.push(crate::pack::Category {
+            id: "lieu".into(),
+            label: "Lieu".into(),
+            color: crate::Color([1, 2, 3, 255]),
+            icon: None,
+        });
+        let local = p.local_packs_dir().join(&pack.id);
+        p.save_pack(&pack, &local).unwrap();
+        // La copie du projet est prioritaire et rechargée immédiatement.
+        assert!(p.pack().category("lieu").is_some());
+        assert_eq!(p.pack_dir(), Some(local.as_path()));
+        assert!(open(d.path()).pack().category("lieu").is_some());
+
+        // Un pack invalide n'est pas écrit.
+        pack.categories.push(pack.categories[0].clone());
+        assert!(matches!(
+            p.save_pack(&pack, &local),
+            Err(ProjectError::Pack(_))
+        ));
+        assert!(open(d.path()).pack().problems().is_empty());
     }
 }
