@@ -17,6 +17,10 @@ mod notices;
 mod pack_editor;
 mod palette;
 mod paths;
+// Pas encore branché sur l'écran d'accueil (intégration en cours).
+#[allow(dead_code)]
+mod project_file;
+mod reading;
 mod shortcuts_ui;
 mod watcher;
 mod workspace;

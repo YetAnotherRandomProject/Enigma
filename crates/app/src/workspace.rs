@@ -39,8 +39,14 @@ struct PendingPng {
 /// Demande adressée à l'application (hors du projet ouvert).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppRequest {
-    /// Choisir et ouvrir un autre dossier de projet.
+    /// Choisir et ouvrir un autre projet (`.enigma`).
     OpenProject,
+    /// Créer un nouveau projet.
+    NewProject,
+    /// Convertir un dossier de fiches `.md` en projet.
+    ImportFolder,
+    /// Associer les fichiers `.enigma` à l'application.
+    AssociateFiles,
 }
 
 /// Vue de la zone centrale.
@@ -96,6 +102,13 @@ pub struct Workspace {
     /// Export PNG en attente de la capture d'écran.
     pending_png: Option<PendingPng>,
     requests: Vec<AppRequest>,
+    /// Un fichier du projet a changé sur le disque depuis le dernier
+    /// enregistrement du fichier `.enigma`.
+    disk_changed: bool,
+    /// Mode Lecture (fiche mise en forme) plutôt qu'Édition.
+    pub reading: bool,
+    /// Horloge de la dernière image (historique de l'éditeur).
+    now_ms: u64,
 }
 
 impl Workspace {
@@ -159,6 +172,9 @@ impl Workspace {
             board_view: BoardView::default(),
             pending_png: None,
             requests: Vec::new(),
+            disk_changed: false,
+            reading: false,
+            now_ms: 0,
         };
         ws.refresh_packs();
         Ok(ws)
@@ -172,6 +188,12 @@ impl Workspace {
     pub fn set_keymap(&mut self, keymap: Keymap, path: Option<PathBuf>) {
         self.keymap = keymap;
         self.keymap_path = path;
+    }
+
+    /// Le projet a-t-il changé sur le disque depuis le dernier appel ?
+    #[allow(dead_code)] // branché avec le fichier .enigma (en cours)
+    pub fn take_disk_changed(&mut self) -> bool {
+        std::mem::take(&mut self.disk_changed)
     }
 
     /// Demandes à traiter par l'application.
@@ -193,8 +215,95 @@ impl Workspace {
             );
             return;
         }
-        if let Err(e) = self.board.save(&self.board_path()) {
-            notices.error(e.to_string());
+        match self.board.save(&self.board_path()) {
+            Ok(()) => self.disk_changed = true,
+            Err(e) => notices.error(e.to_string()),
+        }
+    }
+
+    /// Importe des fiches `.md` (et leurs images) dans le projet.
+    pub fn import_notes(&mut self, files: &[PathBuf], notices: &mut Notices) {
+        match enigma_core::import::import_files(self.project.root(), files) {
+            Ok(report) => {
+                for path in &report.notes {
+                    self.project.on_file_changed(path);
+                }
+                self.disk_changed = true;
+                let mut msg = format!(
+                    "{} fiche(s) importée(s), {} image(s) copiée(s).",
+                    report.notes.len(),
+                    report.images
+                );
+                if !report.missing.is_empty() {
+                    msg.push_str(&format!(
+                        " Images introuvables : {}.",
+                        report.missing.join(", ")
+                    ));
+                }
+                notices.info(msg);
+                if let Some(id) = report
+                    .notes
+                    .first()
+                    .and_then(|p| self.project.id_for_path(p))
+                    .cloned()
+                {
+                    self.select(&id, notices);
+                }
+            }
+            Err(e) => notices.error(format!("Import impossible : {e}")),
+        }
+    }
+
+    /// Copie une image dans le projet et l'insère dans la fiche ouverte.
+    pub fn insert_image(&mut self, file: &Path, notices: &mut Notices) {
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        match enigma_core::import::add_asset(self.project.root(), file) {
+            Ok(rel) => {
+                let alt = file
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let md = enigma_core::render::image_markdown(&alt, &rel);
+                editor.insert_text(&md, &mut self.project, self.now_ms);
+                self.disk_changed = true;
+                self.mark_edited();
+            }
+            Err(e) => notices.error(format!("Image non insérée : {e}")),
+        }
+    }
+
+    /// Fichiers glissés sur la fenêtre : images insérées dans la fiche
+    /// ouverte, fiches `.md` importées.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context, notices: &mut Notices) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_owned())
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        let (md, other): (Vec<PathBuf>, Vec<PathBuf>) = dropped
+            .into_iter()
+            .partition(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("md")));
+        if !md.is_empty() {
+            self.import_notes(&md, notices);
+        }
+        for file in other {
+            if !enigma_core::import::is_image_path(&file) {
+                notices.error(format!(
+                    "« {} » n'est ni une image ni une fiche .md.",
+                    file.display()
+                ));
+            } else if self.editor.is_none() {
+                notices.info("Ouvrez d'abord une fiche pour y déposer une image.");
+            } else {
+                self.insert_image(&file, notices);
+            }
         }
     }
 
@@ -209,7 +318,11 @@ impl Workspace {
                 .editor
                 .as_ref()
                 .is_some_and(|e| self.board.contains(&e.id)),
-            Command::DeleteNote | Command::Undo | Command::Redo => self.editor.is_some(),
+            Command::DeleteNote | Command::Undo | Command::Redo | Command::InsertImage => {
+                self.editor.is_some()
+            }
+            // Association de fichiers : Windows seulement pour l'instant.
+            Command::AssociateFiles => cfg!(windows),
             Command::EditPack => !self.project.pack().id.is_empty(),
             _ => true,
         }
@@ -294,6 +407,33 @@ impl Workspace {
                 }
             }
             Command::OpenProject => self.requests.push(AppRequest::OpenProject),
+            Command::NewProject => self.requests.push(AppRequest::NewProject),
+            Command::ImportFolder => self.requests.push(AppRequest::ImportFolder),
+            Command::AssociateFiles => self.requests.push(AppRequest::AssociateFiles),
+            Command::ImportNotes => {
+                if let Some(files) = rfd::FileDialog::new()
+                    .set_title("Importer des fiches .md")
+                    .add_filter("Fiches Markdown", &["md"])
+                    .pick_files()
+                {
+                    self.import_notes(&files, notices);
+                }
+            }
+            Command::InsertImage => {
+                if self.editor.is_none() {
+                    notices.info("Ouvrez d'abord une fiche pour y insérer une image.");
+                } else if let Some(file) = rfd::FileDialog::new()
+                    .set_title("Insérer une image")
+                    .add_filter("Images", enigma_core::import::IMAGE_EXTENSIONS)
+                    .pick_file()
+                {
+                    self.insert_image(&file, notices);
+                }
+            }
+            Command::ToggleReading => {
+                self.reading = !self.reading;
+                self.view = View::Note;
+            }
             Command::DeleteNote => {
                 if let Some(ed) = &self.editor {
                     self.dialog = Some(Dialog::ConfirmDelete(ed.id.clone()));
@@ -395,6 +535,9 @@ impl Workspace {
 
     /// Enregistre toutes les modifications en attente.
     pub fn flush(&mut self, notices: &mut Notices) {
+        if !self.project.dirty_ids().is_empty() {
+            self.disk_changed = true;
+        }
         for (id, err) in self.project.save_dirty() {
             let title = self
                 .project
@@ -511,6 +654,8 @@ impl Workspace {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, notices: &mut Notices, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.handle_dropped_files(&ui.ctx().clone(), notices);
         self.process_fs_events(notices, now_ms);
         self.handle_screenshot(&ui.ctx().clone(), notices);
         let modal_open = self.dialog.is_some()
@@ -587,6 +732,7 @@ impl Workspace {
                 pack_editor::Outcome::Closed => self.pack_editor = None,
                 pack_editor::Outcome::Saved => {
                     self.pack_editor = None;
+                    self.disk_changed = true;
                     self.refresh_packs();
                 }
             }
@@ -598,6 +744,9 @@ impl Workspace {
             return;
         };
         let (paths, errors) = watcher.drain();
+        if !paths.is_empty() {
+            self.disk_changed = true;
+        }
         for e in errors {
             tracing::warn!("surveillance des fichiers : {e}");
         }
@@ -937,6 +1086,7 @@ impl Workspace {
         };
 
         let edited = editor.header_ui(ui, &mut self.project, now_ms, notices);
+        let mut insert_image = false;
 
         if self
             .project
@@ -970,8 +1120,29 @@ impl Workspace {
             }
         }
 
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.reading, false, "Édition")
+                .on_hover_text("Texte Markdown");
+            ui.selectable_value(&mut self.reading, true, "Lecture")
+                .on_hover_text("Fiche mise en forme, avec ses images (glisser le coin d'une image pour la redimensionner)");
+            ui.separator();
+            if ui
+                .button("Insérer une image…")
+                .on_hover_text("Ou glissez une image sur la fenêtre")
+                .clicked()
+            {
+                insert_image = true;
+            }
+        });
         ui.separator();
-        let body = editor.body_ui(ui, &mut self.project, now_ms, notices);
+        let body = if self.reading {
+            editor.reading_ui(ui, &mut self.project, now_ms, notices)
+        } else {
+            editor.body_ui(ui, &mut self.project, now_ms, notices)
+        };
+        if insert_image {
+            self.run_command(Command::InsertImage, &ui.ctx().clone(), notices);
+        }
         if edited || body.edited {
             self.mark_edited();
         }

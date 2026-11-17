@@ -17,6 +17,10 @@ directories = "6.0.0"
 eframe = { version = "0.37.0", features = ["persistence"] }
 # Police d'emoji embarquée : icônes des packs (🚪, 🔎…) lisibles sur tous les OS.
 egui = { version = "0.37.0", default-features = false, features = ["monochrome_emoji_fonts"] }
+# Chargeurs d'images d'egui (PNG/JPEG/GIF/WebP via image, SVG via resvg, fichiers locaux).
+egui_extras = { version = "0.37.0", default-features = false, features = ["file", "image", "svg", "gif", "webp"] }
+# Formats PNG et JPEG pour egui_extras ; déjà présent dans l'arbre (arboard).
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 notify-debouncer-full = "0.7.0"
 # Export PNG du graphe ; déjà présent dans l'arbre via egui/epaint (même version).
 png = "0.18.1"

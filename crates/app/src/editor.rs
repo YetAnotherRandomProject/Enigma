@@ -14,6 +14,7 @@ use crate::colors::{c32, text_on};
 use crate::completion::{self, ItemKind, Nav, Popup};
 use crate::highlight::Highlighter;
 use crate::notices::Notices;
+use crate::reading::{ReadingAction, ReadingState};
 
 /// État complet annulable d'une fiche (le titre est exclu : il ne change
 /// que par renommage).
@@ -43,6 +44,10 @@ pub struct Editor {
     dismissed: Option<usize>,
     /// Position du curseur (en caractères) à appliquer à la prochaine frame.
     pending_cursor: Option<usize>,
+    /// Dernière position connue du curseur (octet), pour insérer une image.
+    last_cursor: Option<usize>,
+    /// État du mode Lecture (blocs en cache, redimensionnement en cours).
+    reading: ReadingState,
 }
 
 /// Résultat de l'affichage du corps.
@@ -72,6 +77,8 @@ impl Editor {
             popup_rect: None,
             dismissed: None,
             pending_cursor: None,
+            last_cursor: None,
+            reading: ReadingState::default(),
         };
         editor.refresh_field_bufs();
         Some(editor)
@@ -399,6 +406,9 @@ impl Editor {
             self.commit_body(project, EditKind::Typing, now_ms);
             outcome.edited = true;
         }
+        if let Some(r) = output.cursor_range {
+            self.last_cursor = Some(char_to_byte(&self.body, r.primary.index.0));
+        }
 
         // 4. Ctrl+clic sur un lien.
         let cursor_byte = output
@@ -448,6 +458,68 @@ impl Editor {
                 outcome.edited |= self.navigate(Nav::Accept, project, now_ms, notices);
                 ui.ctx().request_repaint();
             }
+        }
+        outcome
+    }
+
+    /// Insère du texte au curseur (ou à la fin), comme une étape d'historique.
+    pub fn insert_text(&mut self, text: &str, project: &mut Project, now_ms: u64) {
+        let len = self.body.len();
+        let pos = self
+            .last_cursor
+            .filter(|&p| p <= len && self.body.is_char_boundary(p))
+            .unwrap_or(len);
+        // Une image se place sur sa propre ligne.
+        let mut insert = String::new();
+        if pos > 0 && !self.body[..pos].ends_with('\n') {
+            insert.push('\n');
+        }
+        insert.push_str(text);
+        if !self.body[pos..].starts_with('\n') {
+            insert.push('\n');
+        }
+        self.body.insert_str(pos, &insert);
+        let end = pos + insert.len();
+        self.last_cursor = Some(end);
+        self.pending_cursor = Some(self.body[..end].chars().count());
+        self.commit_body(project, EditKind::Discrete, now_ms);
+    }
+
+    /// Fiche mise en forme (mode Lecture) : liens cliquables, images
+    /// redimensionnables (la largeur est écrite dans le texte).
+    pub fn reading_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        project: &mut Project,
+        now_ms: u64,
+        notices: &mut Notices,
+    ) -> BodyOutcome {
+        let mut outcome = BodyOutcome::default();
+        let Some(note_path) = project.entry(&self.id).map(|e| e.path.clone()) else {
+            return outcome;
+        };
+        match self.reading.show(ui, &self.body, project, &note_path) {
+            Some(ReadingAction::Resize { image, width }) => {
+                self.body = enigma_core::render::set_image_width(&self.body, &image, Some(width));
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                outcome.edited = true;
+            }
+            Some(ReadingAction::OpenTitle(title)) => {
+                outcome.open = match project.resolve_title(&title) {
+                    Some(id) => Some(id.clone()),
+                    None => match project.create_note(&title, Vec::new(), String::new()) {
+                        Ok(id) => {
+                            notices.info(format!("Fiche « {title} » créée."));
+                            Some(id)
+                        }
+                        Err(e) => {
+                            notices.error(format!("Création impossible : {e}"));
+                            None
+                        }
+                    },
+                };
+            }
+            None => {}
         }
         outcome
     }

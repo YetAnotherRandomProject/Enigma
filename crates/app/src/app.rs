@@ -223,6 +223,11 @@ impl eframe::App for EnigmaApp {
         for req in requests {
             match req {
                 AppRequest::OpenProject => self.pick_folder(&ui.ctx().clone()),
+                // Fichier .enigma : intégration à l'écran d'accueil en cours.
+                AppRequest::NewProject | AppRequest::ImportFolder | AppRequest::AssociateFiles => {
+                    self.notices
+                        .info("Fonction en cours d'intégration (fichier .enigma).")
+                }
             }
         }
     }

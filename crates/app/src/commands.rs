@@ -32,6 +32,12 @@ pub enum Command {
     EditPack,
     OpenProject,
     DeleteNote,
+    NewProject,
+    ImportFolder,
+    ImportNotes,
+    InsertImage,
+    ToggleReading,
+    AssociateFiles,
 }
 
 impl Command {
@@ -61,6 +67,12 @@ impl Command {
         Command::EditPack,
         Command::OpenProject,
         Command::DeleteNote,
+        Command::NewProject,
+        Command::ImportFolder,
+        Command::ImportNotes,
+        Command::InsertImage,
+        Command::ToggleReading,
+        Command::AssociateFiles,
     ];
 
     /// Identifiant stable (fichier de raccourcis).
@@ -91,6 +103,12 @@ impl Command {
             Command::EditPack => "edit_pack",
             Command::OpenProject => "open_project",
             Command::DeleteNote => "delete_note",
+            Command::NewProject => "new_project",
+            Command::ImportFolder => "import_folder",
+            Command::ImportNotes => "import_notes",
+            Command::InsertImage => "insert_image",
+            Command::ToggleReading => "toggle_reading",
+            Command::AssociateFiles => "associate_files",
         }
     }
 
@@ -120,8 +138,14 @@ impl Command {
             Command::ThemeSystem => "Thème du système",
             Command::Shortcuts => "Raccourcis clavier…",
             Command::EditPack => "Modifier le pack de jeu…",
-            Command::OpenProject => "Ouvrir un dossier de projet…",
+            Command::OpenProject => "Ouvrir un projet…",
             Command::DeleteNote => "Supprimer la fiche…",
+            Command::NewProject => "Nouveau projet…",
+            Command::ImportFolder => "Importer un dossier de fiches .md…",
+            Command::ImportNotes => "Importer des fiches .md…",
+            Command::InsertImage => "Insérer une image…",
+            Command::ToggleReading => "Basculer lecture / édition",
+            Command::AssociateFiles => "Ouvrir les fichiers .enigma avec Enigma Notes",
         }
     }
 
@@ -137,6 +161,8 @@ impl Command {
             Command::ToggleGraph => &["Ctrl+G"],
             Command::ShowBoard => &["Ctrl+T"],
             Command::ToggleTheme => &["Ctrl+Maj+L"],
+            Command::ToggleReading => &["Ctrl+E"],
+            Command::OpenProject => &["Ctrl+O"],
             _ => &[],
         }
     }
