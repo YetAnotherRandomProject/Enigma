@@ -116,6 +116,16 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
 - **egui** : dans une `Grid`, forcer la largeur d'un `TextEdit` avec
   `ui.add_sized` (sinon la colonne reste étroite). Dans les tests kittest,
   donner le focus (`.focus()` + `run()`) avant `type_text`.
+- **Graphe 2D** (`enigma_graph::layout` + `app/graph_view.rs`) : la vue se
+  resynchronise sur (generation, content_version, filtres) mais ne relance la
+  disposition que si la structure (nœuds, paires reliées) change. Clic :
+  sélection (panneau latéral) ; double-clic : éditeur ; glisser : épingle
+  (`pos` écrit dans la fiche). En vue graphe le panneau latéral reste
+  toujours affiché (sinon le canevas se redimensionne sous le curseur).
+- **Tests kittest** : pas de temps fixé à 1/60 s (le défaut, 0,25 s, rend
+  les double-clics impossibles) ; `run()` ne termine pas tant que la
+  simulation tourne : utiliser `run_steps(n)`. Mesure de la vue graphe :
+  `cargo test --release -p enigma-app graph_frame_time -- --ignored --nocapture`.
 - **Fichiers sans en-tête** : jamais réécrits tant qu'ils ne sont pas modifiés.
 - **Écho de nos écritures** : `Project` garde l'empreinte du dernier contenu
   écrit/lu ; `on_file_changed` ignore les événements identiques.
@@ -143,7 +153,7 @@ jalons suivants n'est codé avant validation.
   auto, annuler/refaire, modifications externes (`notify`).
 - [x] **2. Liens et rétroliens** — auto-complétion `[[` puis `|type`, panneau
   liens sortants / rétroliens / cassés, index incrémental (1000+ fiches).
-- [ ] **3. Packs de jeu et filtres** — modèles, couleurs/icônes, changement et
+- [x] **3. Packs de jeu et filtres** — modèles, couleurs/icônes, changement et
   création de pack, filtres combinables.
 - [ ] **4. Graphe 2D** — nœuds en secteurs multi-catégories, arêtes typées,
   layout en forces, épinglage, filtres, voisinage, aperçu au survol.

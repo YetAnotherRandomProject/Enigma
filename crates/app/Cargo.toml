@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 enigma-core.workspace = true
+enigma-graph.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 eframe.workspace = true

@@ -7,6 +7,8 @@ mod app;
 mod colors;
 mod completion;
 mod editor;
+mod filter_ui;
+mod graph_view;
 mod highlight;
 mod notices;
 mod pack_editor;

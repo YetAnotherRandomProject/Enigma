@@ -5,13 +5,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, KeyboardShortcut, Modifiers, RichText, Sense};
-use enigma_core::filter::{CategoryMode, NoteFilter};
+use enigma_core::filter::NoteFilter;
 use enigma_core::links::{LinkEnd, ResolvedLink};
 use enigma_core::project::FileChange;
 use enigma_core::{NoteId, Project};
 
 use crate::colors::c32;
 use crate::editor::Editor;
+use crate::filter_ui;
+use crate::graph_view::{GraphOutcome, GraphView};
 use crate::notices::Notices;
 use crate::pack_editor::{self, PackEditor};
 use crate::watcher::FsWatcher;
@@ -26,6 +28,14 @@ const REDO_SHIFT: KeyboardShortcut =
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::S);
 const NEW_NOTE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::N);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::F);
+const TOGGLE_GRAPH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::G);
+
+/// Vue de la zone centrale.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum View {
+    Note,
+    Graph,
+}
 
 enum Dialog {
     NewNote {
@@ -56,6 +66,8 @@ pub struct Workspace {
     last_edit: Option<Instant>,
     focus_search: bool,
     pack_editor: Option<PackEditor>,
+    pub view: View,
+    graph: GraphView,
     /// Dossier des packs de l'utilisateur (pour tous les projets).
     user_packs_dir: Option<PathBuf>,
 }
@@ -98,6 +110,8 @@ impl Workspace {
             last_edit: None,
             focus_search: false,
             pack_editor: None,
+            view: View::Note,
+            graph: GraphView::default(),
             user_packs_dir: pack_roots.first().cloned(),
         };
         ws.refresh_packs();
@@ -238,7 +252,9 @@ impl Workspace {
             .min_size(180.0)
             .show(ui, |ui| self.list_ui(ui, notices));
 
-        if self.editor.is_some() {
+        // En vue graphe, le panneau reste affiché même sans sélection : sinon
+        // sélectionner un nœud redimensionnerait le canevas sous le curseur.
+        if self.editor.is_some() || self.view == View::Graph {
             egui::Panel::right("fields")
                 .resizable(true)
                 .default_size(240.0)
@@ -250,7 +266,12 @@ impl Workspace {
                         .show(ui, |ui| {
                             let edited = match &mut self.editor {
                                 Some(ed) => ed.fields_ui(ui, &mut self.project, now_ms),
-                                None => false,
+                                None => {
+                                    ui.weak(
+                                        "Cliquez sur un nœud pour afficher sa fiche ici ;                                          double-cliquez pour l'ouvrir dans l'éditeur.",
+                                    );
+                                    false
+                                }
                             };
                             if edited {
                                 self.mark_edited();
@@ -328,7 +349,7 @@ impl Workspace {
     fn handle_shortcuts(&mut self, ctx: &egui::Context, notices: &mut Notices) {
         // Les raccourcis sont consommés avant les widgets : l'historique
         // interne du TextEdit d'egui n'est donc jamais utilisé.
-        let (redo, undo, save, new_note, find) = ctx.input_mut(|i| {
+        let (redo, undo, save, new_note, find, toggle_graph) = ctx.input_mut(|i| {
             let redo = i.consume_shortcut(&REDO_SHIFT) || i.consume_shortcut(&REDO);
             let undo = i.consume_shortcut(&UNDO);
             (
@@ -337,8 +358,15 @@ impl Workspace {
                 i.consume_shortcut(&SAVE),
                 i.consume_shortcut(&NEW_NOTE),
                 i.consume_shortcut(&FIND),
+                i.consume_shortcut(&TOGGLE_GRAPH),
             )
         });
+        if toggle_graph {
+            self.view = match self.view {
+                View::Note => View::Graph,
+                View::Graph => View::Note,
+            };
+        }
         if let Some(ed) = &mut self.editor {
             let changed =
                 (undo && ed.undo(&mut self.project)) || (redo && ed.redo(&mut self.project));
@@ -511,67 +539,9 @@ impl Workspace {
             .id_salt("filters")
             .show(ui, |ui| {
                 ui.checkbox(&mut f.in_body, "Chercher aussi dans le texte");
-
-                if !pack.categories.is_empty() {
-                    small_heading(ui, "Catégories")
-                        .on_hover_text("Clic : inclure · 2e clic : exclure · 3e clic : neutre");
-                    ui.horizontal_wrapped(|ui| {
-                        for cat in &pack.categories {
-                            let state = if f.include_categories.contains(&cat.id) {
-                                Chip::On
-                            } else if f.exclude_categories.contains(&cat.id) {
-                                Chip::Excluded
-                            } else {
-                                Chip::Off
-                            };
-                            if chip(ui, &cat.label, c32(cat.color), state).clicked() {
-                                f.cycle_category(&cat.id);
-                            }
-                        }
-                    });
-                    if f.include_categories.len() >= 2 {
-                        ui.horizontal(|ui| {
-                            ui.radio_value(&mut f.category_mode, CategoryMode::All, "Toutes (ET)");
-                            ui.radio_value(
-                                &mut f.category_mode,
-                                CategoryMode::Any,
-                                "Au moins une (OU)",
-                            );
-                        });
-                    }
-                }
-
-                small_heading(ui, "Statut");
-                ui.horizontal_wrapped(|ui| {
-                    let grey = ui.visuals().weak_text_color();
-                    let on = f.statuses.contains(&None);
-                    if chip(ui, "Sans statut", grey, Chip::from(on)).clicked() {
-                        NoteFilter::toggle(&mut f.statuses, None);
-                    }
-                    for st in &pack.statuses {
-                        let value = Some(st.id.clone());
-                        let on = f.statuses.contains(&value);
-                        if chip(ui, &st.label, c32(st.color), Chip::from(on)).clicked() {
-                            NoteFilter::toggle(&mut f.statuses, value);
-                        }
-                    }
-                });
-
-                small_heading(ui, "Liens présents");
-                ui.horizontal_wrapped(|ui| {
-                    let grey = ui.visuals().weak_text_color();
-                    let on = f.link_types.contains(&None);
-                    if chip(ui, "Sans type", grey, Chip::from(on)).clicked() {
-                        NoteFilter::toggle(&mut f.link_types, None);
-                    }
-                    for lt in &pack.link_types {
-                        let value = Some(lt.id.clone());
-                        let on = f.link_types.contains(&value);
-                        if chip(ui, &lt.label, c32(lt.color), Chip::from(on)).clicked() {
-                            NoteFilter::toggle(&mut f.link_types, value);
-                        }
-                    }
-                });
+                filter_ui::categories_ui(ui, f, &pack);
+                filter_ui::statuses_ui(ui, f, &pack);
+                filter_ui::link_types_ui(ui, "Liens présents", &mut f.link_types, &pack, false);
                 ui.checkbox(&mut f.broken_only, "Avec liens cassés");
 
                 if n > 0 && ui.button("Réinitialiser les filtres").clicked() {
@@ -581,6 +551,19 @@ impl Workspace {
     }
 
     fn central_ui(&mut self, ui: &mut egui::Ui, notices: &mut Notices, now_ms: u64) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.view, View::Note, "Fiche")
+                .on_hover_text("Éditeur de la fiche (Ctrl+G pour basculer)");
+            ui.selectable_value(&mut self.view, View::Graph, "Graphe")
+                .on_hover_text("Graphe des fiches (Ctrl+G pour basculer)");
+        });
+        ui.separator();
+        if self.view == View::Graph {
+            let selected = self.editor.as_ref().map(|e| e.id.clone());
+            let outcome = self.graph.ui(ui, &self.project, selected.as_ref());
+            self.apply_graph_outcome(outcome, notices, now_ms);
+            return;
+        }
         let Some(editor) = &mut self.editor else {
             ui.centered_and_justified(|ui| {
                 ui.weak(if self.project.is_empty() {
@@ -633,6 +616,41 @@ impl Workspace {
         }
         if let Some(target) = body.open {
             self.select(&target, notices);
+        }
+    }
+
+    #[cfg(test)]
+    fn graph_stop_for_bench(&mut self) {
+        self.graph.stop_for_bench();
+    }
+
+    fn apply_graph_outcome(&mut self, outcome: GraphOutcome, notices: &mut Notices, now_ms: u64) {
+        for (id, pos) in outcome.pins {
+            let Some(note) = self.project.note(&id) else {
+                continue;
+            };
+            let mut meta = note.meta.clone();
+            meta.pos = pos;
+            match self.project.set_meta(&id, meta) {
+                Ok(()) => {
+                    if let Some(ed) = self.editor.as_mut().filter(|e| e.id == id) {
+                        ed.sync_from_project(&self.project, now_ms);
+                    }
+                    self.mark_edited();
+                }
+                Err(e) => notices.error(format!("Épinglage impossible : {e}")),
+            }
+        }
+        if let Some(id) = outcome.select {
+            self.select(&id, notices);
+        }
+        if let Some(id) = outcome.open_editor {
+            self.select(&id, notices);
+            self.view = View::Note;
+        }
+        if outcome.deselect {
+            self.flush(notices);
+            self.editor = None;
         }
     }
 
@@ -835,52 +853,6 @@ impl Workspace {
     }
 }
 
-/// État d'une pastille de filtre.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Chip {
-    Off,
-    On,
-    Excluded,
-}
-
-impl From<bool> for Chip {
-    fn from(on: bool) -> Self {
-        if on { Chip::On } else { Chip::Off }
-    }
-}
-
-fn small_heading(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add_space(2.0);
-    ui.label(RichText::new(text).small().weak())
-}
-
-/// Pastille de filtre : contour (neutre), remplie (incluse), barrée (exclue).
-fn chip(ui: &mut egui::Ui, label: &str, color: Color32, state: Chip) -> egui::Response {
-    let text = match state {
-        Chip::Off => RichText::new(label).color(color),
-        Chip::On => RichText::new(label).color(crate::colors::text_on(color)),
-        Chip::Excluded => RichText::new(format!("− {label}"))
-            .color(ui.visuals().error_fg_color)
-            .strikethrough(),
-    };
-    let fill = if state == Chip::On {
-        color
-    } else {
-        Color32::TRANSPARENT
-    };
-    let stroke_color = if state == Chip::Excluded {
-        ui.visuals().error_fg_color
-    } else {
-        color
-    };
-    ui.add(
-        egui::Button::new(text.small())
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, stroke_color))
-            .corner_radius(8.0),
-    )
-}
-
 /// Étiquette colorée du type de lien.
 fn type_chip(ui: &mut egui::Ui, project: &Project, kind: Option<&str>) {
     let (label, color) = match kind {
@@ -1056,6 +1028,8 @@ mod ui_tests {
         let packs = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs")];
         let mut harness = Harness::builder()
             .with_size([1200.0, 760.0])
+            // 60 images/s : délais réalistes (double-clic < 0,3 s).
+            .with_step_dt(1.0 / 60.0)
             .build_ui_state(
                 |ui, state: &mut State| {
                     if let Some(ws) = &mut state.ws {
@@ -1403,5 +1377,183 @@ id: "
                 .unwrap()
                 .contains("\"lieu\"")
         );
+    }
+
+    fn note_id(harness: &Harness<'_, State>, title: &str) -> NoteId {
+        harness
+            .state()
+            .ws
+            .as_ref()
+            .unwrap()
+            .project
+            .resolve_title(title)
+            .unwrap()
+            .clone()
+    }
+
+    fn node_pos(harness: &Harness<'_, State>, title: &str) -> egui::Pos2 {
+        let id = note_id(harness, title);
+        harness
+            .state()
+            .ws
+            .as_ref()
+            .unwrap()
+            .graph
+            .screen_pos(&id)
+            .unwrap()
+    }
+
+    fn click_at(harness: &mut Harness<'_, State>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        harness.run_steps(1);
+        harness.drag_at(pos);
+        harness.run_steps(1);
+        harness.drop_at(pos);
+        harness.run_steps(2);
+    }
+
+    #[test]
+    fn graph_view_select_open_and_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::G);
+        harness.run_steps(600);
+        {
+            let ws = harness.state().ws.as_ref().unwrap();
+            assert_eq!(ws.view, View::Graph);
+            assert!(
+                !ws.graph.is_animating(),
+                "la disposition doit se stabiliser"
+            );
+            assert_eq!(ws.graph.node_count(), 3);
+            // Salle→Coffre (ouvre, indique), Salle→Majordome, Majordome→Salle.
+            assert_eq!(ws.graph.edge_count(), 4);
+        }
+        snapshot(&mut harness, "10_graphe");
+
+        // Clic : sélection (le panneau latéral affiche la fiche).
+        let coffre = note_id(&harness, "Coffre du bureau");
+        let pos = node_pos(&harness, "Coffre du bureau");
+        click_at(&mut harness, pos);
+        {
+            let ws = harness.state().ws.as_ref().unwrap();
+            assert_eq!(ws.editor.as_ref().map(|e| &e.id), Some(&coffre));
+            assert_eq!(ws.view, View::Graph);
+        }
+        harness.run_steps(30);
+        snapshot(&mut harness, "11_selection");
+
+        // Glisser « Majordome » : la fiche est épinglée et la position enregistrée.
+        let from = node_pos(&harness, "Majordome");
+        let to = from + egui::vec2(90.0, 60.0);
+        harness.hover_at(from);
+        harness.run_steps(1);
+        harness.drag_at(from);
+        harness.run_steps(1);
+        for k in 1..=6 {
+            harness.hover_at(from + (to - from) * (k as f32 / 6.0));
+            harness.run_steps(1);
+        }
+        harness.drop_at(to);
+        harness.run_steps(5);
+        flush(&mut harness);
+        let majordome = std::fs::read_to_string(dir.path().join("Majordome.md")).unwrap();
+        assert!(majordome.contains("pinned: true"), "{majordome}");
+        let after = node_pos(&harness, "Majordome");
+        assert!((after - to).length() < 2.0, "le nœud reste où on l'a lâché");
+
+        // Le clic sur le fond désélectionne.
+        let rect_corner = node_pos(&harness, "Coffre du bureau") + egui::vec2(0.0, -400.0);
+        let empty = rect_corner.clamp(egui::pos2(300.0, 120.0), egui::pos2(900.0, 700.0));
+        let ws = harness.state().ws.as_ref().unwrap();
+        let far_from_nodes = ["Coffre du bureau", "Majordome", "Salle des Archives"]
+            .iter()
+            .all(|t| (node_pos(&harness, t) - empty).length() > 40.0);
+        let _ = ws;
+        if far_from_nodes {
+            click_at(&mut harness, empty);
+            assert!(harness.state().ws.as_ref().unwrap().editor.is_none());
+        }
+
+        // Double-clic : ouvre l'éditeur. Pause d'abord, sinon egui compterait
+        // un triple clic avec le clic précédent.
+        harness.run_steps(30);
+        let salle = note_id(&harness, "Salle des Archives");
+        let pos = node_pos(&harness, "Salle des Archives");
+        harness.hover_at(pos);
+        harness.run_steps(1);
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.run_steps(1);
+            }
+        }
+        let ws = harness.state().ws.as_ref().unwrap();
+        assert_eq!(ws.view, View::Note);
+        assert_eq!(ws.editor.as_ref().map(|e| &e.id), Some(&salle));
+    }
+
+    /// Mesure (ignorée par défaut) : coût d'une image de la vue graphe avec
+    /// 2000 fiches et ~5000 liens. Lancer avec
+    /// `cargo test --release -p enigma-app graph_frame_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn graph_frame_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = 2000;
+        let types = ["indique", "ouvre", "contredit", "situe_dans"];
+        let cats = ["piece", "indice", "objet", "code", "personnage"];
+        for i in 0..n {
+            let links: String = (1..=5)
+                .map(|k| format!("[[Fiche {}|{}]] ", (i * 7 + k * 13) % n, types[(i + k) % 4]))
+                .take(if i % 2 == 0 { 3 } else { 2 })
+                .collect();
+            let c1 = cats[i % 5];
+            let c2 = cats[(i / 5) % 5];
+            std::fs::write(
+                dir.path().join(format!("Fiche {i}.md")),
+                format!("---\nid: N{i}\ntitle: Fiche {i}\ncategories: [{c1}, {c2}]\nstatus: theorie\n---\n{links}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join(".enigma")).unwrap();
+        std::fs::write(
+            dir.path().join(".enigma/project.json"),
+            "{\"version\": 1, \"pack\": \"blue_prince\"}",
+        )
+        .unwrap();
+        let mut harness = setup(dir.path());
+        harness.state_mut().ws.as_mut().unwrap().view = View::Graph;
+        let t = std::time::Instant::now();
+        harness.run_steps(1);
+        eprintln!(
+            "première image (construction + pré-disposition) : {:?}",
+            t.elapsed()
+        );
+        let ws = harness.state().ws.as_ref().unwrap();
+        eprintln!(
+            "{} nœuds, {} arêtes",
+            ws.graph.node_count(),
+            ws.graph.edge_count()
+        );
+        // Images pendant la simulation (un pas de disposition par image).
+        let t = std::time::Instant::now();
+        harness.run_steps(60);
+        eprintln!("image pendant la simulation : {:?}", t.elapsed() / 60);
+        // Images au repos (zoom réduit : peu d'étiquettes).
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .graph_stop_for_bench();
+        let t = std::time::Instant::now();
+        harness.run_steps(60);
+        eprintln!("image au repos : {:?}", t.elapsed() / 60);
     }
 }
