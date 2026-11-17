@@ -318,6 +318,21 @@ mod tests {
     }
 
     #[test]
+    fn every_list_item_marker_after_heading() {
+        let text = "# T\n\nPièce **x**. Un *c* [[A|ouvre]].\n\n## Indices\n- Le portrait au mur regarde vers l'est\n- Une date : `1-9-4-5`\n- Voir [[M]] et [[N]]\n\n> x\n";
+        let a = analyze(text);
+        let dashes: Vec<usize> = text.match_indices("- ").map(|(i, _)| i).collect();
+        assert_eq!(dashes.len(), 3);
+        for d in dashes {
+            assert!(
+                style_at(&a, d).list_marker,
+                "tiret à l'octet {d}: {:?}",
+                a.spans
+            );
+        }
+    }
+
+    #[test]
     fn list_marker_detected() {
         let a = analyze("- un\n2. deux\n");
         assert!(style_at(&a, 0).list_marker);

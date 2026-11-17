@@ -643,6 +643,7 @@ impl Project {
     fn reload_pack(&mut self) {
         self.pack = Pack::empty();
         self.pack_issue = None;
+        self.generation += 1;
         let Some(wanted) = self.config.pack.clone() else {
             return;
         };
@@ -662,7 +663,6 @@ impl Project {
             }
         }
         self.pack_issue = Some(failure.unwrap_or_else(|| format!("pack « {wanted} » introuvable")));
-        self.generation += 1;
     }
 
     fn is_note_path(&self, path: &Path) -> bool {
@@ -692,7 +692,9 @@ impl Project {
             }
         };
         self.issues.remove(path);
-        let mut dirty = !note.had_frontmatter;
+        // Un fichier sans en-tête n'est pas réécrit tant qu'on ne le modifie
+        // pas : l'en-tête sera ajouté à sa première sauvegarde.
+        let mut dirty = false;
         if self.notes.contains_key(&note.meta.id) {
             tracing::warn!(
                 "identifiant {} en double ({}) : un nouvel identifiant est attribué",
@@ -811,9 +813,11 @@ mod tests {
         assert_eq!(p.issues().len(), 1);
         assert!(p.issues().keys().next().unwrap().ends_with("casse.md"));
         let b = p.resolve_title("B").unwrap().clone();
+        let entry = p.entry(&b).unwrap();
+        assert!(!entry.note.had_frontmatter);
         assert!(
-            p.entry(&b).unwrap().is_dirty(),
-            "à compléter avec un en-tête"
+            !entry.is_dirty(),
+            "pas réécrit tant qu'il n'est pas modifié"
         );
         assert_eq!(p.pack().id, "", "aucun pack configuré");
     }
@@ -1010,13 +1014,15 @@ mod tests {
             panic!("attendu Added");
         };
         assert_eq!(p.note(&id).unwrap().meta.title, "Nouvelle");
+        // Modifiée en mémoire puis supprimée du disque : elle est conservée.
+        p.set_body(&id, "modifiée".into()).unwrap();
         std::fs::remove_file(&path).unwrap();
-        // La fiche sans en-tête est « dirty » : elle est conservée.
         assert_eq!(
             p.on_file_changed(&path),
             FileChange::RemovedWhileDirty(id.clone())
         );
         p.save(&id).unwrap();
+        assert!(path.exists());
         std::fs::remove_file(&path).unwrap();
         assert_eq!(p.on_file_changed(&path), FileChange::Removed(id));
         assert!(p.is_empty());
