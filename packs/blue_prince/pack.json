@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "id": "blue_prince",
+  "name": "Blue Prince",
+  "description": "Manoir de 45 pièces : pièces, personnages, indices, objets et codes.",
+  "categories": [
+    { "id": "piece", "label": "Pièce", "color": "#4aa3ff", "icon": "🚪" },
+    { "id": "personnage", "label": "Personnage", "color": "#ff7a59", "icon": "🧑" },
+    { "id": "indice", "label": "Indice", "color": "#ffd23f", "icon": "🔎" },
+    { "id": "objet", "label": "Objet", "color": "#6ee7a8", "icon": "🎒" },
+    { "id": "code", "label": "Code / Énigme", "color": "#c084fc", "icon": "🔐" }
+  ],
+  "link_types": [
+    { "id": "indique", "label": "indique", "color": "#ffd23f", "directed": true },
+    { "id": "contredit", "label": "contredit", "color": "#ff4d4d", "directed": false },
+    { "id": "ouvre", "label": "ouvre", "color": "#4ade80", "directed": true },
+    { "id": "situe_dans", "label": "se trouve dans", "color": "#60a5fa", "directed": true }
+  ],
+  "statuses": [
+    { "id": "theorie", "label": "Théorie", "color": "#9ca3af" },
+    { "id": "confirme", "label": "Confirmé", "color": "#4ade80" },
+    { "id": "resolu", "label": "Résolu", "color": "#38bdf8" }
+  ],
+  "fields": [
+    { "id": "jour_decouverte", "label": "Jour de découverte", "type": "number" }
+  ],
+  "templates": [
+    {
+      "id": "piece",
+      "label": "Nouvelle pièce",
+      "categories": ["piece"],
+      "body": "## Description\n\n## Indices\n"
+    }
+  ]
+}
