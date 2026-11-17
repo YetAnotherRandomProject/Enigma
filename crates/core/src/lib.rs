@@ -23,6 +23,7 @@ pub mod markdown;
 pub mod note;
 pub mod pack;
 pub mod project;
+pub mod render;
 pub mod shortcut;
 pub mod storage;
 

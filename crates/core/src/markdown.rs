@@ -60,7 +60,7 @@ pub struct Analysis {
     pub links: Vec<WikiLink>,
 }
 
-fn options() -> Options {
+pub(crate) fn options() -> Options {
     Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES
 }
 
