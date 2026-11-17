@@ -1,0 +1,21 @@
+[package]
+name = "enigma-core"
+description = "Modèle de données, parsing des fiches, index des liens et packs de jeu (sans UI)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pulldown-cmark.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+walkdir.workspace = true
+
+[lints]
+workspace = true

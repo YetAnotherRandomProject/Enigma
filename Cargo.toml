@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/graph", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+enigma-core = { path = "crates/core" }
+enigma-graph = { path = "crates/graph" }
+
+anyhow = "1.0.104"
+directories = "6.0.0"
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "wgpu", "persistence", "accesskit"] }
+notify = "8.2.2"
+notify-debouncer-full = "0.7.0"
+pulldown-cmark = { version = "0.13.6", default-features = false }
+rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml_ng = "0.10.0"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ulid = "3.0.0"
+walkdir = "2.5.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
