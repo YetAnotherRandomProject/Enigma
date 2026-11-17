@@ -13,7 +13,7 @@ use enigma_core::{NoteId, Project};
 use crate::colors::c32;
 use crate::editor::Editor;
 use crate::filter_ui;
-use crate::graph_view::{GraphOutcome, GraphView};
+use crate::graph_view::{GraphOutcome, GraphView, LinkOp};
 use crate::notices::Notices;
 use crate::pack_editor::{self, PackEditor};
 use crate::watcher::FsWatcher;
@@ -639,6 +639,43 @@ impl Workspace {
                     self.mark_edited();
                 }
                 Err(e) => notices.error(format!("Épinglage impossible : {e}")),
+            }
+        }
+        for op in outcome.link_ops {
+            // La fiche source est sélectionnée d'abord : le panneau latéral
+            // montre le résultat et Ctrl+Z annule la modification.
+            let source = op.source().clone();
+            if self.editor.as_ref().is_none_or(|e| e.id != source) {
+                self.select(&source, notices);
+            }
+            let result = match op {
+                LinkOp::Add {
+                    from,
+                    to,
+                    kind,
+                    note,
+                } => self.project.add_link(&from, &to, kind, note),
+                LinkOp::Update {
+                    from,
+                    to,
+                    old_kind,
+                    kind,
+                    note,
+                } => self
+                    .project
+                    .update_link(&from, &to, old_kind.as_deref(), kind, note),
+                LinkOp::Remove { from, to, kind } => {
+                    self.project.remove_link(&from, &to, kind.as_deref())
+                }
+            };
+            match result {
+                Ok(()) => {
+                    if let Some(ed) = self.editor.as_mut().filter(|e| e.id == source) {
+                        ed.sync_from_project(&self.project, now_ms);
+                    }
+                    self.mark_edited();
+                }
+                Err(e) => notices.error(format!("Lien non modifié : {e}")),
             }
         }
         if let Some(id) = outcome.select {
@@ -1496,6 +1533,169 @@ id: "
         let ws = harness.state().ws.as_ref().unwrap();
         assert_eq!(ws.view, View::Note);
         assert_eq!(ws.editor.as_ref().map(|e| &e.id), Some(&salle));
+    }
+
+    fn settle(harness: &mut Harness<'_, State>) {
+        for _ in 0..60 {
+            harness.run_steps(20);
+            if !harness.state().ws.as_ref().unwrap().graph.is_animating() {
+                return;
+            }
+        }
+    }
+
+    fn choose_link_type(harness: &mut Harness<'_, State>, label: &str) {
+        harness.get_by_label("Type").click();
+        harness.run_steps(2);
+        harness.get_by_label(label).click();
+        harness.run_steps(2);
+    }
+
+    #[test]
+    fn graph_links_with_the_mouse() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::G);
+        settle(&mut harness);
+        let coffre = note_id(&harness, "Coffre du bureau");
+        let majordome = note_id(&harness, "Majordome");
+
+        // Ctrl+glisser de Majordome vers le Coffre : dialogue de création.
+        let from = node_pos(&harness, "Majordome");
+        let to = node_pos(&harness, "Coffre du bureau");
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+        harness.hover_at(from);
+        harness.run_steps(1);
+        harness.drag_at(from);
+        harness.run_steps(1);
+        for k in 1..=6 {
+            harness.hover_at(from + (to - from) * (k as f32 / 6.0));
+            harness.run_steps(1);
+        }
+        snapshot(&mut harness, "14_fil");
+        harness.drop_at(to);
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        harness.run_steps(3);
+        {
+            let ws = harness.state().ws.as_ref().unwrap();
+            assert!(ws.graph.link_dialog_open());
+            assert!(
+                !ws.project
+                    .note(&majordome)
+                    .unwrap()
+                    .meta
+                    .pos
+                    .is_some_and(|p| p.pinned),
+                "Ctrl+glisser n'épingle pas"
+            );
+        }
+        choose_link_type(&mut harness, "contredit");
+        harness
+            .get_by(|n| n.placeholder() == Some("Note (facultative)"))
+            .focus();
+        harness.run_steps(1);
+        harness
+            .get_by(|n| n.placeholder() == Some("Note (facultative)"))
+            .type_text("ment sur ses horaires");
+        harness.run_steps(1);
+        snapshot(&mut harness, "15_dialogue_lien");
+        harness.get_by_label("Créer le lien").click();
+        harness.run_steps(3);
+        flush(&mut harness);
+        let text = std::fs::read_to_string(dir.path().join("Majordome.md")).unwrap();
+        assert!(text.contains(coffre.as_str()), "{text}");
+        assert!(text.contains("type: contredit"), "{text}");
+        assert!(text.contains("ment sur ses horaires"), "{text}");
+        {
+            let ws = harness.state().ws.as_ref().unwrap();
+            assert!(!ws.graph.link_dialog_open());
+            assert_eq!(ws.editor.as_ref().map(|e| &e.id), Some(&majordome));
+            assert_eq!(ws.graph.edge_count(), 5);
+        }
+
+        // Clic sur le lien : modification du type.
+        settle(&mut harness);
+        let mid = |h: &Harness<'_, State>| {
+            let a = node_pos(h, "Majordome");
+            let b = node_pos(h, "Coffre du bureau");
+            a + (b - a) * 0.5
+        };
+        let m = mid(&harness);
+        click_at(&mut harness, m);
+        assert!(
+            harness
+                .state()
+                .ws
+                .as_ref()
+                .unwrap()
+                .graph
+                .link_dialog_open()
+        );
+        choose_link_type(&mut harness, "se trouve dans");
+        harness.get_by_label("Enregistrer").click();
+        harness.run_steps(3);
+        flush(&mut harness);
+        let text = std::fs::read_to_string(dir.path().join("Majordome.md")).unwrap();
+        assert!(text.contains("type: situe_dans"), "{text}");
+        assert!(
+            text.contains("ment sur ses horaires"),
+            "note conservée : {text}"
+        );
+
+        // Clic droit sur le lien : suppression ; Ctrl+Z la rétablit.
+        settle(&mut harness);
+        let m = mid(&harness);
+        harness.hover_at(m);
+        harness.run_steps(1);
+        harness.event(egui::Event::PointerButton {
+            pos: m,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: m,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(3);
+        harness.get_by_label("Supprimer le lien").click();
+        harness.run_steps(3);
+        flush(&mut harness);
+        let text = std::fs::read_to_string(dir.path().join("Majordome.md")).unwrap();
+        assert!(!text.contains(coffre.as_str()), "{text}");
+        assert!(
+            text.contains("[[salle des archives]]"),
+            "texte intact : {text}"
+        );
+        assert_eq!(harness.state().ws.as_ref().unwrap().graph.edge_count(), 4);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        harness.run_steps(3);
+        assert_eq!(harness.state().ws.as_ref().unwrap().graph.edge_count(), 5);
+
+        // Lien écrit dans le texte : le supprimer garde le mot.
+        let salle = note_id(&harness, "Salle des Archives");
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .apply_graph_outcome(
+                GraphOutcome {
+                    link_ops: vec![LinkOp::Remove {
+                        from: salle.clone(),
+                        to: majordome.clone(),
+                        kind: None,
+                    }],
+                    ..GraphOutcome::default()
+                },
+                &mut Notices::default(),
+                0,
+            );
+        let ws = harness.state().ws.as_ref().unwrap();
+        let body = &ws.project.note(&salle).unwrap().body;
+        assert!(body.contains("Voir aussi Majordome et"), "{body}");
     }
 
     #[test]

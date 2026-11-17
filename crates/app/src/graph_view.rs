@@ -53,6 +53,9 @@ struct Edge {
     color: Color32,
     /// Décalage (en multiples) pour séparer les arêtes parallèles.
     offset: f32,
+    note: Option<String>,
+    /// Écrit dans le texte de la fiche source (`[[...]]`).
+    in_body: bool,
 }
 
 /// Ce que la vue demande à l'espace de travail.
@@ -66,6 +69,55 @@ pub struct GraphOutcome {
     pub deselect: bool,
     /// Positions à écrire dans les fiches (`None` : désépingler).
     pub pins: Vec<(NoteId, Option<Pos>)>,
+    /// Créations / modifications / suppressions de liens.
+    pub link_ops: Vec<LinkOp>,
+}
+
+/// Modification d'un lien demandée depuis le graphe.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkOp {
+    Add {
+        from: NoteId,
+        to: NoteId,
+        kind: Option<String>,
+        note: Option<String>,
+    },
+    Update {
+        from: NoteId,
+        to: NoteId,
+        old_kind: Option<String>,
+        kind: Option<String>,
+        note: Option<String>,
+    },
+    Remove {
+        from: NoteId,
+        to: NoteId,
+        kind: Option<String>,
+    },
+}
+
+impl LinkOp {
+    /// Fiche dont le contenu change.
+    pub fn source(&self) -> &NoteId {
+        match self {
+            LinkOp::Add { from, .. }
+            | LinkOp::Update { from, .. }
+            | LinkOp::Remove { from, .. } => from,
+        }
+    }
+}
+
+/// Dialogue de création ou de modification d'un lien.
+#[derive(Clone, Debug)]
+struct LinkDialog {
+    from: NoteId,
+    to: NoteId,
+    /// Type actuel du lien modifié ; `None` : création.
+    existing: Option<Option<String>>,
+    kind: Option<String>,
+    note: String,
+    in_body: bool,
+    focus: bool,
 }
 
 /// Échelle de l'axe Z lié à un champ numérique.
@@ -106,6 +158,8 @@ enum Drag {
     Node(usize, f32),
     Pan,
     Orbit,
+    /// Fil tiré depuis un nœud (création de lien).
+    Wire(usize, Pos2),
 }
 
 pub struct GraphView {
@@ -132,6 +186,12 @@ pub struct GraphView {
     drag: Option<Drag>,
     menu_node: Option<usize>,
     last_rect: Option<Rect>,
+    menu_edge: Option<usize>,
+    /// Fil en attente d'une cible (depuis le menu contextuel).
+    pending_wire: Option<usize>,
+    link_dialog: Option<LinkDialog>,
+    /// Dernier type choisi pour un nouveau lien.
+    last_kind: Option<Option<String>>,
     /// Projection de chaque nœud (dernière image) ; `None` : hors champ.
     proj: Vec<Option<Projected>>,
     /// Ordre de dessin (du plus loin au plus proche en 3D).
@@ -162,6 +222,10 @@ impl Default for GraphView {
             last_rect: None,
             proj: Vec::new(),
             order: Vec::new(),
+            menu_edge: None,
+            pending_wire: None,
+            link_dialog: None,
+            last_kind: None,
         }
     }
 }
@@ -188,6 +252,7 @@ impl GraphView {
             self.mode = mode;
             self.auto_fit = true;
             self.drag = None;
+            self.pending_wire = None;
         }
     }
 
@@ -244,6 +309,8 @@ impl GraphView {
                         color: def.map_or(Color32::from_gray(140), |d| c32(d.color)),
                         kind: link.kind,
                         offset: 0.0,
+                        note: link.note,
+                        in_body: link.in_body,
                     });
                 }
             }
@@ -359,6 +426,9 @@ impl GraphView {
             }
             self.layout = layout;
             self.drag = None;
+            self.pending_wire = None;
+            self.menu_node = None;
+            self.menu_edge = None;
         } else {
             if self.layout.z_target != z_targets {
                 self.layout.z_target = z_targets;
@@ -524,6 +594,7 @@ impl GraphView {
         self.sync(project);
 
         self.canvas(ui, project, selected, &mut outcome);
+        self.link_dialog_ui(ui.ctx(), project, &mut outcome);
         outcome
     }
 
@@ -648,12 +719,15 @@ impl GraphView {
         let hovered_node = resp.hover_pos().and_then(|s| pick_at(self, s));
 
         if resp.drag_started()
-            && let Some(start) = resp.interact_pointer_pos()
+            && let Some(start) = ui
+                .input(|i| i.pointer.press_origin())
+                .or(resp.interact_pointer_pos())
         {
-            let (primary, shift) = ui.input(|i| {
+            let (primary, shift, command) = ui.input(|i| {
                 (
                     i.pointer.button_down(PointerButton::Primary),
                     i.modifiers.shift,
+                    i.modifiers.command,
                 )
             });
             let node = if primary && !shift {
@@ -661,7 +735,9 @@ impl GraphView {
             } else {
                 None
             };
+            self.pending_wire = None;
             self.drag = Some(match node {
+                Some(i) if command => Drag::Wire(i, start),
                 Some(i) => {
                     self.layout.pinned[i] = true;
                     self.layout.set_alpha_target(0.3);
@@ -689,6 +765,7 @@ impl GraphView {
                     };
                 }
                 (Some(Drag::Orbit), _) => self.orbit.orbit(d),
+                (Some(Drag::Wire(i, _)), Some(ptr)) => self.drag = Some(Drag::Wire(i, ptr)),
                 _ => match self.mode {
                     Mode::Flat => self.camera.pan(d),
                     Mode::Space => self.orbit.pan(d, rect.height()),
@@ -698,6 +775,12 @@ impl GraphView {
             ui.ctx().request_repaint();
         }
         if resp.drag_stopped() {
+            if let Some(Drag::Wire(from, end)) = self.drag
+                && let Some(to) = pick_at(self, resp.interact_pointer_pos().unwrap_or(end))
+                && to != from
+            {
+                self.open_create_dialog(from, to);
+            }
             if let Some(Drag::Node(i, _)) = self.drag {
                 let q = self.layout.pos[i];
                 let z = if space {
@@ -728,20 +811,6 @@ impl GraphView {
                 self.auto_fit = false;
                 self.project_nodes(rect);
             }
-        }
-
-        if resp.double_clicked() {
-            if let Some(i) = hovered_node {
-                outcome.open_editor = Some(self.ids[i].clone());
-            }
-        } else if resp.clicked() {
-            match hovered_node {
-                Some(i) => outcome.select = Some(self.ids[i].clone()),
-                None => outcome.deselect = true,
-            }
-        }
-        if resp.secondary_clicked() {
-            self.menu_node = hovered_node;
         }
 
         // --- Voisinage ---
@@ -783,6 +852,31 @@ impl GraphView {
             });
             hovered_edge = pick_segment(segs, v(ptr), 5.0);
         }
+
+        let mut cancel_wire = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut create_link = None;
+        let mut edit_link = None;
+        if resp.double_clicked() {
+            if let Some(i) = hovered_node {
+                outcome.open_editor = Some(self.ids[i].clone());
+            }
+        } else if resp.clicked() {
+            if let Some(from) = self.pending_wire {
+                // Fil lancé depuis le menu : le clic choisit la cible.
+                cancel_wire = true;
+                if let Some(to) = hovered_node.filter(|&t| t != from) {
+                    create_link = Some((from, to));
+                }
+            } else {
+                match (hovered_node, hovered_edge) {
+                    (Some(i), _) => outcome.select = Some(self.ids[i].clone()),
+                    (None, Some(k)) => edit_link = Some(k),
+                    (None, None) => outcome.deselect = true,
+                }
+            }
+        }
+        let secondary = resp.secondary_clicked();
+        cancel_wire |= secondary;
         for (k, e) in self.edges.iter().enumerate() {
             let (Some(sa), Some(sb)) = (screen(e.a), screen(e.b)) else {
                 continue;
@@ -901,25 +995,97 @@ impl GraphView {
             }
         }
 
-        if space {
-            painter.text(
-                rect.left_bottom() + egui::vec2(8.0, -6.0),
-                egui::Align2::LEFT_BOTTOM,
-                "Glisser : tourner · Maj+glisser ou clic droit glissé : déplacer · molette : zoom",
-                FontId::proportional(11.0),
-                visuals.weak_text_color(),
-            );
+        // --- Fil en cours (création de lien) ---
+        let wire_from = match self.drag {
+            Some(Drag::Wire(i, _)) => Some(i),
+            _ => self.pending_wire,
+        };
+        if let Some(from) = wire_from
+            && let Some(src) = self.proj[from]
+            && let Some(ptr) = ui.input(|i| i.pointer.latest_pos())
+        {
+            let target = hovered_node.filter(|&t| t != from);
+            let color = visuals.selection.stroke.color;
+            let end = target
+                .and_then(|t| self.proj[t])
+                .map_or(v(ptr), |pr| pr.screen);
+            painter.line_segment([p(src.screen), p(end)], Stroke::new(2.0, color));
+            let r = target
+                .and_then(|t| self.proj[t].map(|pr| self.screen_radius(t, &pr)))
+                .unwrap_or(0.0);
+            draw_arrow(&painter, src.screen, end, r, color, 2.0);
+            if let Some(t) = target
+                && let Some(pr) = self.proj[t]
+            {
+                let r = self.screen_radius(t, &pr);
+                painter.circle_stroke(p(pr.screen), r + 4.0, Stroke::new(2.0, color));
+            }
+            ui.ctx().request_repaint();
+        }
+
+        let hint = if wire_from.is_some() {
+            "Relâcher ou cliquer sur la fiche cible · Échap : annuler"
+        } else if space {
+            "Glisser : tourner · Maj+glisser ou clic droit glissé : déplacer · molette : zoom · Ctrl+glisser d'une fiche à l'autre : lier"
+        } else {
+            "Glisser le fond : déplacer · molette : zoom · Ctrl+glisser d'une fiche à l'autre : lier · clic sur un lien : le modifier"
+        };
+        painter.text(
+            rect.left_bottom() + egui::vec2(8.0, -6.0),
+            egui::Align2::LEFT_BOTTOM,
+            hint,
+            FontId::proportional(11.0),
+            visuals.weak_text_color(),
+        );
+
+        if cancel_wire {
+            self.pending_wire = None;
+        }
+        if secondary {
+            self.menu_node = hovered_node;
+            self.menu_edge = if hovered_node.is_none() {
+                hovered_edge
+            } else {
+                None
+            };
+        }
+        if let Some((from, to)) = create_link {
+            self.open_create_dialog(from, to);
+        }
+        if let Some(k) = edit_link {
+            self.open_edit_dialog(k);
         }
 
         // --- Menu contextuel ---
         let menu_node = self.menu_node;
+        let menu_edge = self.menu_edge;
         let mut close_menu = false;
         resp.context_menu(|ui| {
             let Some(i) = menu_node else {
-                ui.weak("Clic droit sur une fiche");
+                if let Some(k) = menu_edge.filter(|&k| k < self.edges.len()) {
+                    if ui.button("Modifier le lien…").clicked() {
+                        self.open_edit_dialog(k);
+                        ui.close();
+                    }
+                    if ui.button("Supprimer le lien").clicked() {
+                        let e = &self.edges[k];
+                        outcome.link_ops.push(LinkOp::Remove {
+                            from: self.ids[e.a].clone(),
+                            to: self.ids[e.b].clone(),
+                            kind: e.kind.clone(),
+                        });
+                        ui.close();
+                    }
+                } else {
+                    ui.weak("Clic droit sur une fiche ou un lien");
+                }
                 return;
             };
             let id = self.ids[i].clone();
+            if ui.button("Créer un lien depuis cette fiche…").clicked() {
+                self.pending_wire = Some(i);
+                close_menu = true;
+            }
             if ui.button("Ouvrir dans l'éditeur").clicked() {
                 outcome.open_editor = Some(id.clone());
                 close_menu = true;
@@ -967,10 +1133,184 @@ impl GraphView {
                     .unwrap_or_else(|| "lien".to_owned());
                 let arrow = if e.directed { "»" } else { "—" };
                 let text = format!("{} {arrow} {kind} {arrow} {}", title(e.a), title(e.b));
+                let note = e.note.clone();
                 resp.on_hover_ui_at_pointer(|ui| {
                     ui.label(RichText::new(text).color(e.color));
+                    if let Some(n) = note {
+                        ui.label(RichText::new(n).italics());
+                    }
+                    ui.label(
+                        RichText::new("Clic : modifier · clic droit : supprimer")
+                            .small()
+                            .weak(),
+                    );
                 });
             }
+        }
+    }
+
+    fn open_create_dialog(&mut self, from: usize, to: usize) {
+        let kind = self.last_kind.clone().unwrap_or(None);
+        self.link_dialog = Some(LinkDialog {
+            from: self.ids[from].clone(),
+            to: self.ids[to].clone(),
+            existing: None,
+            kind,
+            note: String::new(),
+            in_body: false,
+            focus: true,
+        });
+    }
+
+    fn open_edit_dialog(&mut self, k: usize) {
+        let Some(e) = self.edges.get(k) else {
+            return;
+        };
+        self.link_dialog = Some(LinkDialog {
+            from: self.ids[e.a].clone(),
+            to: self.ids[e.b].clone(),
+            existing: Some(e.kind.clone()),
+            kind: e.kind.clone(),
+            note: e.note.clone().unwrap_or_default(),
+            in_body: e.in_body,
+            focus: true,
+        });
+    }
+
+    /// Le dialogue de lien est-il ouvert ?
+    #[cfg(test)]
+    pub fn link_dialog_open(&self) -> bool {
+        self.link_dialog.is_some()
+    }
+
+    fn link_dialog_ui(
+        &mut self,
+        ctx: &egui::Context,
+        project: &Project,
+        outcome: &mut GraphOutcome,
+    ) {
+        let Some(d) = &mut self.link_dialog else {
+            return;
+        };
+        let title = |id: &NoteId| {
+            project
+                .note(id)
+                .map_or_else(|| "?".to_owned(), |n| n.meta.title.clone())
+        };
+        let pack = project.pack();
+        let mut close = false;
+        let mut confirm = false;
+        let mut remove = false;
+        let resp = egui::Modal::new(egui::Id::unique("graph_link_dialog")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading(if d.existing.is_some() {
+                "Modifier le lien"
+            } else {
+                "Nouveau lien"
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(title(&d.from));
+                ui.label("»");
+                ui.strong(title(&d.to));
+                if d.existing.is_none() && ui.small_button("Inverser").clicked() {
+                    std::mem::swap(&mut d.from, &mut d.to);
+                }
+            });
+            ui.add_space(4.0);
+            let label_of = |k: &Option<String>| match k {
+                None => "Sans type".to_owned(),
+                Some(k) => pack.link_type(k).map_or(k.clone(), |t| t.label.clone()),
+            };
+            egui::ComboBox::new("graph_link_type", "Type")
+                .selected_text(label_of(&d.kind))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut d.kind, None, "Sans type");
+                    for lt in &pack.link_types {
+                        ui.selectable_value(
+                            &mut d.kind,
+                            Some(lt.id.clone()),
+                            RichText::new(&lt.label).color(c32(lt.color)),
+                        );
+                    }
+                });
+            let note = ui.add_sized(
+                [360.0, 22.0],
+                egui::TextEdit::singleline(&mut d.note).hint_text("Note (facultative)"),
+            );
+            if std::mem::take(&mut d.focus) {
+                note.request_focus();
+            }
+            if note.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                confirm = true;
+            }
+            if d.existing.is_some() && d.in_body {
+                ui.label(
+                    RichText::new(format!(
+                        "Ce lien est écrit dans le texte de « {} » : changer son type modifie \
+                         aussi le texte ; le supprimer garde le mot, sans les crochets.",
+                        title(&d.from)
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let ok = if d.existing.is_some() {
+                    "Enregistrer"
+                } else {
+                    "Créer le lien"
+                };
+                if ui.button(ok).clicked() {
+                    confirm = true;
+                }
+                if d.existing.is_some()
+                    && ui
+                        .button(RichText::new("Supprimer").color(ui.visuals().error_fg_color))
+                        .clicked()
+                {
+                    remove = true;
+                }
+                if ui.button("Annuler").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if resp.should_close() {
+            close = true;
+        }
+        let note = Some(d.note.trim().to_owned()).filter(|n| !n.is_empty());
+        if confirm {
+            let op = match &d.existing {
+                None => {
+                    self.last_kind = Some(d.kind.clone());
+                    LinkOp::Add {
+                        from: d.from.clone(),
+                        to: d.to.clone(),
+                        kind: d.kind.clone(),
+                        note,
+                    }
+                }
+                Some(old) => LinkOp::Update {
+                    from: d.from.clone(),
+                    to: d.to.clone(),
+                    old_kind: old.clone(),
+                    kind: d.kind.clone(),
+                    note,
+                },
+            };
+            outcome.link_ops.push(op);
+            close = true;
+        } else if remove && let Some(old) = &d.existing {
+            outcome.link_ops.push(LinkOp::Remove {
+                from: d.from.clone(),
+                to: d.to.clone(),
+                kind: old.clone(),
+            });
+            close = true;
+        }
+        if close {
+            self.link_dialog = None;
         }
     }
 
@@ -1192,8 +1532,10 @@ fn note_preview(ui: &mut egui::Ui, project: &Project, id: &NoteId, z_field: Opti
     }
     ui.separator();
     ui.label(
-        RichText::new("Clic : sélectionner · double-clic : ouvrir · glisser : épingler")
-            .small()
-            .weak(),
+        RichText::new(
+            "Clic : sélectionner · double-clic : ouvrir · glisser : épingler · Ctrl+glisser : lier",
+        )
+        .small()
+        .weak(),
     );
 }

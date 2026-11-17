@@ -133,6 +133,17 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
   `z` existant est conservé. Mesuré à 2003 nœuds / 5002 liens (release) :
   ~3 ms d'image + ~3,5 ms de tessellation → painter suffisant, pas de wgpu
   personnalisé pour l'instant.
+- **Liens à la souris** (`enigma_core::link_edit` + `Project::{add,update,remove}_link`) :
+  création toujours dans l'en-tête ; changement de type appliqué à
+  l'en-tête **et** aux `[[Titre|type]]` du corps ; une note sur un lien du
+  corps ajoute une entrée d'en-tête ; suppression = entrées d'en-tête
+  retirées et `[[Titre|type]]` remplacé par `Titre` (la phrase reste).
+  Dans le graphe : Ctrl+glisser d'un nœud à l'autre (ou menu « Créer un
+  lien depuis cette fiche… » puis clic), clic sur une arête = dialogue de
+  modification, clic droit = supprimer. La fiche source est sélectionnée
+  avant la modification pour que Ctrl+Z l'annule. Début de glisser : utiliser
+  `pointer.press_origin()` (egui signale le glisser après le seuil de
+  déplacement, le pointeur a déjà bougé).
 - **Tests kittest** : pas de temps fixé à 1/60 s (le défaut, 0,25 s, rend
   les double-clics impossibles) ; `run()` ne termine pas tant que la
   simulation tourne : utiliser `run_steps(n)`. Mesure de la vue graphe :
@@ -168,7 +179,7 @@ jalons suivants n'est codé avant validation.
   création de pack, filtres combinables.
 - [x] **4. Graphe 2D** — nœuds en secteurs multi-catégories, arêtes typées,
   layout en forces, épinglage, filtres, voisinage, aperçu au survol.
-- [ ] **5. Graphe 3D** — caméra orbitale, perspective, billboards, mêmes
+- [x] **5. Graphe 3D** — caméra orbitale, perspective, billboards, mêmes
   filtres, bascule 2D/3D, axe Z optionnel sur un champ, 60 FPS à 2000 nœuds /
   5000 liens (proposer wgpu custom avant de migrer).
 - [ ] **6. Liens à la souris** — tirer un fil, choisir le type, note, éditer /
