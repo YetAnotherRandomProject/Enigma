@@ -203,5 +203,5 @@ jalons suivants n'est codé avant validation.
   5000 liens (proposer wgpu custom avant de migrer).
 - [x] **6. Liens à la souris** — tirer un fil, choisir le type, note, éditer /
   supprimer depuis le graphe.
-- [ ] **7. Confort** — palette Ctrl+P, raccourcis configurables, thèmes,
+- [x] **7. Confort** — palette Ctrl+P, raccourcis configurables, thèmes,
   export image, tableau d'enquête libre.
