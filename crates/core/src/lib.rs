@@ -10,6 +10,7 @@
 pub mod filter;
 pub mod history;
 pub mod id;
+pub mod link_edit;
 pub mod links;
 pub mod markdown;
 pub mod note;

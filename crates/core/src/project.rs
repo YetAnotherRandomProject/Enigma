@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::filter::NoteFilter;
 use crate::id::NoteId;
+use crate::link_edit;
 use crate::links::{LinkEnd, LinkIndex, RawTarget, ResolvedLink, merge};
 use crate::markdown;
 use crate::note::{Note, NoteMeta, NoteSerializeError};
@@ -67,6 +68,8 @@ pub enum ProjectError {
     TitleTaken(String),
     #[error("fiche introuvable")]
     UnknownNote,
+    #[error("une fiche ne peut pas être liée à elle-même")]
+    SelfLink,
     #[error(transparent)]
     Serialize(#[from] NoteSerializeError),
     #[error("configuration du projet : {0}")]
@@ -375,6 +378,82 @@ impl Project {
             e.note.body = body;
             e.dirty = true;
             self.reindex_links(id);
+        }
+        Ok(())
+    }
+
+    /// Ajoute un lien `from` → `to` dans l'en-tête de `from` (voir
+    /// [`link_edit::add_link`]).
+    pub fn add_link(
+        &mut self,
+        from: &NoteId,
+        to: &NoteId,
+        kind: Option<String>,
+        note: Option<String>,
+    ) -> Result<(), ProjectError> {
+        if from == to {
+            return Err(ProjectError::SelfLink);
+        }
+        if !self.notes.contains_key(to) {
+            return Err(ProjectError::UnknownNote);
+        }
+        let mut meta = self
+            .note(from)
+            .ok_or(ProjectError::UnknownNote)?
+            .meta
+            .clone();
+        link_edit::add_link(&mut meta, to, kind, note);
+        self.set_meta(from, meta)
+    }
+
+    /// Change le type et la note du lien `from` → `to` de type `old_kind`,
+    /// dans l'en-tête comme dans le corps.
+    pub fn update_link(
+        &mut self,
+        from: &NoteId,
+        to: &NoteId,
+        old_kind: Option<&str>,
+        new_kind: Option<String>,
+        note: Option<String>,
+    ) -> Result<(), ProjectError> {
+        let n = self.note(from).ok_or(ProjectError::UnknownNote)?;
+        let mut meta = n.meta.clone();
+        let body = link_edit::update_link(
+            &mut meta,
+            &n.body,
+            to,
+            |t| self.resolve_title(t) == Some(to),
+            old_kind,
+            new_kind,
+            note,
+        );
+        self.set_meta(from, meta)?;
+        if let Some(body) = body {
+            self.set_body(from, body)?;
+        }
+        Ok(())
+    }
+
+    /// Supprime le lien `from` → `to` de type `kind` : entrées d'en-tête
+    /// retirées, liens du corps remplacés par leur texte.
+    pub fn remove_link(
+        &mut self,
+        from: &NoteId,
+        to: &NoteId,
+        kind: Option<&str>,
+    ) -> Result<(), ProjectError> {
+        let n = self.note(from).ok_or(ProjectError::UnknownNote)?;
+        let mut meta = n.meta.clone();
+        let body = link_edit::remove_link(
+            &mut meta,
+            &n.body,
+            to,
+            |t| self.resolve_title(t) == Some(to),
+            kind,
+        );
+        self.set_meta(from, meta)?;
+        if let Some(body) = body {
+            self.set_body(from, body)?;
         }
         Ok(())
     }
@@ -1023,6 +1102,54 @@ mod tests {
             "pas réécrit tant qu'il n'est pas modifié"
         );
         assert_eq!(p.pack().id, "", "aucun pack configuré");
+    }
+
+    #[test]
+    fn add_update_remove_links_through_project() {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = open(d.path());
+        let a = p
+            .create_note("Salle", vec![], "Voir [[Coffre|ouvre]].".into())
+            .unwrap();
+        let c = p.create_note("Coffre", vec![], String::new()).unwrap();
+        assert!(matches!(
+            p.add_link(&a, &a, None, None),
+            Err(ProjectError::SelfLink)
+        ));
+
+        p.add_link(&a, &c, Some("indique".into()), Some("par le carnet".into()))
+            .unwrap();
+        let kinds = |p: &Project| -> Vec<Option<String>> {
+            p.outgoing_links(&a).into_iter().map(|l| l.kind).collect()
+        };
+        assert_eq!(kinds(&p), [Some("indique".into()), Some("ouvre".into())]);
+        assert_eq!(p.backlinks(&c).len(), 2);
+
+        // « ouvre » (corps) devient « contredit » avec une note.
+        p.update_link(
+            &a,
+            &c,
+            Some("ouvre"),
+            Some("contredit".into()),
+            Some("n".into()),
+        )
+        .unwrap();
+        assert_eq!(p.note(&a).unwrap().body, "Voir [[Coffre|contredit]].");
+        let l = p
+            .outgoing_links(&a)
+            .into_iter()
+            .find(|l| l.kind.as_deref() == Some("contredit"))
+            .unwrap();
+        assert!(l.in_body && l.in_meta);
+        assert_eq!(l.note.as_deref(), Some("n"));
+
+        p.remove_link(&a, &c, Some("contredit")).unwrap();
+        assert_eq!(p.note(&a).unwrap().body, "Voir Coffre.");
+        assert_eq!(kinds(&p), [Some("indique".into())]);
+        p.remove_link(&a, &c, Some("indique")).unwrap();
+        assert!(p.outgoing_links(&a).is_empty());
+        assert!(p.backlinks(&c).is_empty());
+        assert!(p.dirty_ids().contains(&a));
     }
 
     #[test]
