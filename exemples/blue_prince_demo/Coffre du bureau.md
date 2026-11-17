@@ -3,6 +3,7 @@ id: 01JDEMO0000000000000000002
 title: Coffre du bureau
 categories: [objet, code]
 status: confirme
+fields: { jour_decouverte: 5 }
 ---
 Coffre à **4 chiffres**, trouvé dans le bureau.
 

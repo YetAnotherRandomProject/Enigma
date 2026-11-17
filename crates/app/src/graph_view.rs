@@ -1,23 +1,47 @@
-//! Vue graphe 2D : nœuds multi-catégories, arêtes typées, disposition en
-//! forces interactive, filtres, voisinage, aperçu au survol, épinglage.
+//! Vue graphe 2D / 3D : nœuds multi-catégories, arêtes typées, disposition
+//! en forces interactive, filtres, voisinage, aperçu au survol, épinglage.
+//!
+//! Les deux modes partagent la même simulation (en 2D, `z` reste nul) et le
+//! même pipeline de rendu : chaque nœud est projeté à l'écran (position,
+//! profondeur, échelle), puis arêtes et nœuds sont dessinés avec le painter
+//! d'egui — en 3D du plus loin au plus proche, en billboards dont la taille
+//! dépend de la distance.
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke};
+use eframe::egui::{
+    self, Color32, FontId, PointerButton, Pos2, Rect, RichText, Sense, Shape, Stroke,
+};
 use enigma_core::filter::NoteFilter;
 use enigma_core::links::LinkEnd;
+use enigma_core::pack::FieldKind;
 use enigma_core::{NoteId, Pos, Project};
-use enigma_graph::pick::{neighborhood, pick_node, pick_segment};
-use enigma_graph::{Camera2D, Layout, LayoutParams, Vec2, initial_position};
+use enigma_graph::pick::{neighborhood, pick_front, pick_segment};
+use enigma_graph::{
+    Camera2D, Layout, LayoutParams, OrbitCamera, Projected, Vec2, Vec3, initial_depth,
+    initial_position,
+};
 
 use crate::colors::c32;
 use crate::filter_ui;
 
-/// Nombre maximal d'étiquettes dessinées par image.
+/// Nombre maximal d'étiquettes dessinées par image (2D).
 const MAX_LABELS: usize = 250;
-/// En dessous de ce zoom, seules les étiquettes importantes sont dessinées.
+/// Nombre maximal d'étiquettes en 3D (les plus proches).
+const MAX_LABELS_3D: usize = 80;
+/// En dessous de ce zoom (2D), seules les étiquettes importantes sont dessinées.
 const LABEL_ZOOM: f32 = 0.55;
+/// Rayon apparent minimal (px) pour qu'un nœud ait une étiquette en 3D.
+const LABEL_MIN_RADIUS_3D: f32 = 6.0;
+
+/// Mode d'affichage du graphe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Mode {
+    #[default]
+    Flat,
+    Space,
+}
 
 /// Arête affichée (plusieurs types entre deux fiches = plusieurs arêtes).
 #[derive(Clone, Debug, PartialEq)]
@@ -44,7 +68,45 @@ pub struct GraphOutcome {
     pub pins: Vec<(NoteId, Option<Pos>)>,
 }
 
-type StructureKey = (u64, u64, NoteFilter, Vec<Option<String>>, bool);
+/// Échelle de l'axe Z lié à un champ numérique.
+#[derive(Clone, Debug, PartialEq)]
+struct ZAxis {
+    label: String,
+    min: f64,
+    max: f64,
+    /// Valeurs entières à graduer (si peu nombreuses), sinon min et max.
+    ticks: Vec<f64>,
+    span: f32,
+}
+
+impl ZAxis {
+    fn z_of(&self, value: f64) -> f32 {
+        if self.max > self.min {
+            (((value - self.min) / (self.max - self.min)) as f32 - 0.5) * self.span
+        } else {
+            0.0
+        }
+    }
+}
+
+type StructureKey = (
+    u64,
+    u64,
+    NoteFilter,
+    Vec<Option<String>>,
+    bool,
+    Mode,
+    Option<String>,
+);
+
+/// Glisser en cours.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Drag {
+    /// Un nœud, à cette profondeur (3D).
+    Node(usize, f32),
+    Pan,
+    Orbit,
+}
 
 pub struct GraphView {
     ids: Vec<NoteId>,
@@ -60,11 +122,20 @@ pub struct GraphView {
     /// Profondeur du voisinage mis en évidence.
     pub depth: u32,
     pub show_filters: bool,
+    pub mode: Mode,
+    /// Champ numérique porté par l'axe Z (3D), `None` : profondeur libre.
+    pub z_field: Option<String>,
+    z_axis: Option<ZAxis>,
     camera: Camera2D,
+    orbit: OrbitCamera,
     auto_fit: bool,
-    dragging: Option<usize>,
+    drag: Option<Drag>,
     menu_node: Option<usize>,
     last_rect: Option<Rect>,
+    /// Projection de chaque nœud (dernière image) ; `None` : hors champ.
+    proj: Vec<Option<Projected>>,
+    /// Ordre de dessin (du plus loin au plus proche en 3D).
+    order: Vec<usize>,
 }
 
 impl Default for GraphView {
@@ -80,11 +151,17 @@ impl Default for GraphView {
             hide_isolated: false,
             depth: 1,
             show_filters: false,
+            mode: Mode::Flat,
+            z_field: None,
+            z_axis: None,
             camera: Camera2D::default(),
+            orbit: OrbitCamera::default(),
             auto_fit: true,
-            dragging: None,
+            drag: None,
             menu_node: None,
             last_rect: None,
+            proj: Vec::new(),
+            order: Vec::new(),
         }
     }
 }
@@ -104,6 +181,16 @@ fn seed(id: &NoteId) -> u64 {
 }
 
 impl GraphView {
+    /// Bascule 2D / 3D (la sélection, gérée par l'espace de travail, est
+    /// conservée) ; la vue se recadre.
+    pub fn set_mode(&mut self, mode: Mode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.auto_fit = true;
+            self.drag = None;
+        }
+    }
+
     /// Reconstruit nœuds et arêtes si le projet ou les filtres ont changé.
     /// La disposition n'est relancée que si la structure change.
     fn sync(&mut self, project: &Project) {
@@ -113,9 +200,15 @@ impl GraphView {
             self.filter.clone(),
             self.hidden_link_types.clone(),
             self.hide_isolated,
+            self.mode,
+            self.z_field.clone(),
         );
         if self.key.as_ref() == Some(&key) {
             return;
+        }
+        if self.key.as_ref().is_some_and(|k| k.6 != key.6) {
+            // Nouvel axe Z : l'étendue change, on recadre.
+            self.auto_fit = true;
         }
         self.key = Some(key);
         let mut node_filter = self.filter.clone();
@@ -181,25 +274,47 @@ impl GraphView {
         let pairs: Vec<(usize, usize)> = edges.iter().map(|e| (e.a, e.b)).collect();
         let old_pairs: Vec<(usize, usize)> = self.edges.iter().map(|e| (e.a, e.b)).collect();
         let structure_changed = ids != self.ids || pairs != old_pairs;
+        let flat = self.mode == Mode::Flat;
+        let n = ids.len();
 
         // Épinglages lus dans les fiches.
-        let pins: Vec<Option<Pos>> = ids
+        let pins: Vec<Option<Vec3>> = ids
             .iter()
             .map(|id| {
                 project
                     .note(id)
                     .and_then(|n| n.meta.pos)
                     .filter(|pos| pos.pinned)
+                    .map(|pos| Vec3::new(pos.x, pos.y, if flat { 0.0 } else { pos.z }))
             })
             .collect();
 
+        // Axe Z lié à un champ.
+        self.z_axis = self
+            .z_field
+            .as_deref()
+            .and_then(|f| z_axis(project, &ids, f));
+        let z_targets: Vec<Option<f32>> = match (&self.z_axis, self.z_field.as_deref()) {
+            (Some(axis), Some(field)) => ids
+                .iter()
+                .map(|id| {
+                    project
+                        .note(id)
+                        .and_then(|n| n.meta.fields.get(field))
+                        .and_then(|v| v.as_f64())
+                        .map(|v| axis.z_of(v))
+                })
+                .collect(),
+            _ => vec![None; n],
+        };
+        let start_z = |ids: &[NoteId], i: usize| initial_depth(seed(&ids[i]), ids.len());
+
         if structure_changed {
             let first = self.ids.is_empty();
-            let n = ids.len();
             let mut positions = Vec::with_capacity(n);
             for (i, id) in ids.iter().enumerate() {
                 let pos = if let Some(pin) = pins[i] {
-                    Vec2::new(pin.x, pin.y)
+                    pin
                 } else if let Some(&old) = self.index.get(id) {
                     self.layout.pos[old]
                 } else {
@@ -215,14 +330,24 @@ impl GraphView {
                         self.index.get(&ids[other]).map(|&o| self.layout.pos[o])
                     });
                     let jitter = initial_position(seed(id), 1) * 0.5;
-                    neighbor.map_or_else(|| initial_position(seed(id), n), |q| q + jitter)
+                    let fresh = || {
+                        let mut q = initial_position(seed(id), n);
+                        q.z = start_z(&ids, i);
+                        q
+                    };
+                    neighbor.map_or_else(fresh, |q| q + jitter)
                 };
                 positions.push(pos);
             }
-            let mut layout = Layout::new(positions, &pairs, LayoutParams::default());
+            let mut layout = if flat {
+                Layout::new(positions, &pairs, LayoutParams::default())
+            } else {
+                Layout::new_3d(positions, &pairs, LayoutParams::default())
+            };
             for (i, pin) in pins.iter().enumerate() {
                 layout.pinned[i] = pin.is_some();
             }
+            layout.z_target = z_targets;
             if first {
                 // Premier affichage : quelques pas tout de suite (budget borné).
                 let steps = (60_000 / n.max(1)).clamp(20, 300);
@@ -233,16 +358,24 @@ impl GraphView {
                 layout.reheat(0.3);
             }
             self.layout = layout;
-            self.dragging = None;
+            self.drag = None;
         } else {
+            if self.layout.z_target != z_targets {
+                self.layout.z_target = z_targets;
+                self.layout.reheat(0.3);
+            }
+            if self.layout.is_flat() != flat {
+                let ids_ref = &ids;
+                self.layout.set_flat(flat, |i| start_z(ids_ref, i));
+            }
             for (i, pin) in pins.iter().enumerate() {
-                if self.dragging == Some(i) {
+                if matches!(self.drag, Some(Drag::Node(d, _)) if d == i) {
                     continue;
                 }
                 match pin {
                     Some(pos) => {
                         self.layout.pinned[i] = true;
-                        self.layout.pos[i] = Vec2::new(pos.x, pos.y);
+                        self.layout.pos[i] = *pos;
                     }
                     None if self.layout.pinned[i] => {
                         self.layout.pinned[i] = false;
@@ -265,14 +398,32 @@ impl GraphView {
         (7.0 + 2.5 * (self.layout.degree(i) as f32).sqrt()).min(22.0)
     }
 
+    /// Rayon apparent (px) d'un nœud projeté.
+    fn screen_radius(&self, i: usize, pr: &Projected) -> f32 {
+        let r = self.radius(i) * pr.scale;
+        match self.mode {
+            Mode::Flat => r.max(3.0),
+            // Billboards : taille selon la distance, bornée de près.
+            Mode::Space => r.clamp(2.0, self.radius(i) * 2.0),
+        }
+    }
+
     /// Position à l'écran d'une fiche (dernière image affichée).
     #[cfg(test)]
     pub fn screen_pos(&self, id: &NoteId) -> Option<Pos2> {
-        let rect = self.last_rect?;
         let &i = self.index.get(id)?;
-        Some(p(self
-            .camera
-            .to_screen(self.layout.pos[i], v(rect.center()))))
+        self.proj.get(i).copied().flatten().map(|pr| p(pr.screen))
+    }
+
+    /// Position de la fiche dans la disposition.
+    #[cfg(test)]
+    pub fn world_pos(&self, id: &NoteId) -> Option<Vec3> {
+        self.index.get(id).map(|&i| self.layout.pos[i])
+    }
+
+    #[cfg(test)]
+    pub fn orbit_camera(&self) -> OrbitCamera {
+        self.orbit
     }
 
     /// La simulation est-elle encore en mouvement ?
@@ -308,6 +459,13 @@ impl GraphView {
         let mut outcome = GraphOutcome::default();
 
         ui.horizontal_wrapped(|ui| {
+            let mut mode = self.mode;
+            ui.selectable_value(&mut mode, Mode::Flat, "2D")
+                .on_hover_text("Graphe à plat");
+            ui.selectable_value(&mut mode, Mode::Space, "3D")
+                .on_hover_text("Graphe en 3D (caméra orbitale)");
+            self.set_mode(mode);
+            ui.separator();
             let n = self.filter.active_count()
                 + usize::from(!self.hidden_link_types.is_empty())
                 + usize::from(self.hide_isolated);
@@ -321,6 +479,10 @@ impl GraphView {
             ui.label("Voisinage");
             ui.add(egui::Slider::new(&mut self.depth, 1..=5).suffix(" niv."))
                 .on_hover_text("Profondeur mise en évidence autour de la fiche sélectionnée");
+            if self.mode == Mode::Space {
+                ui.separator();
+                self.z_axis_ui(ui, project);
+            }
             ui.separator();
             if ui.button("Recentrer").clicked() {
                 self.auto_fit = true;
@@ -357,12 +519,72 @@ impl GraphView {
                     self.hide_isolated = false;
                 }
             });
-            // Les filtres ont pu changer : on resynchronise avant de dessiner.
-            self.sync(project);
         }
+        // Mode, axe Z ou filtres ont pu changer : on resynchronise avant de dessiner.
+        self.sync(project);
 
         self.canvas(ui, project, selected, &mut outcome);
         outcome
+    }
+
+    /// Choix du champ numérique porté par l'axe Z.
+    fn z_axis_ui(&mut self, ui: &mut egui::Ui, project: &Project) {
+        let fields: Vec<(String, String)> = project
+            .pack()
+            .fields
+            .iter()
+            .filter(|f| f.kind == FieldKind::Number)
+            .map(|f| (f.id.clone(), f.label.clone()))
+            .collect();
+        let current = self
+            .z_field
+            .as_deref()
+            .and_then(|id| fields.iter().find(|(f, _)| f == id))
+            .map_or_else(|| "Libre".to_owned(), |(_, l)| l.clone());
+        egui::ComboBox::new("graph_z_axis", "Axe Z")
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.z_field, None, "Libre");
+                for (id, label) in &fields {
+                    ui.selectable_value(&mut self.z_field, Some(id.clone()), label);
+                }
+            })
+            .response
+            .on_hover_text("Profondeur libre, ou donnée par un champ numérique des fiches");
+        if let Some(axis) = &self.z_axis {
+            ui.weak(format!("de {} à {}", fmt_num(axis.min), fmt_num(axis.max)));
+        } else if self.z_field.is_some() {
+            ui.weak("aucune valeur");
+        }
+    }
+
+    /// Projette tous les nœuds et calcule l'ordre de dessin.
+    fn project_nodes(&mut self, rect: Rect) {
+        let vc = v(rect.center());
+        self.proj.clear();
+        match self.mode {
+            Mode::Flat => {
+                self.proj.extend(self.layout.pos.iter().map(|q| {
+                    Some(Projected {
+                        screen: self.camera.to_screen(q.xy(), vc),
+                        depth: 0.0,
+                        scale: self.camera.zoom,
+                    })
+                }));
+                self.order.clear();
+                self.order.extend(0..self.ids.len());
+            }
+            Mode::Space => {
+                let projector = self.orbit.projector(vc, rect.height());
+                self.proj
+                    .extend(self.layout.pos.iter().map(|q| projector.project(*q)));
+                self.order.clear();
+                self.order
+                    .extend((0..self.ids.len()).filter(|&i| self.proj[i].is_some()));
+                let depth = |i: usize| self.proj[i].map_or(0.0, |pr| pr.depth);
+                self.order.sort_by(|&a, &b| depth(b).total_cmp(&depth(a)));
+            }
+        }
     }
 
     fn canvas(
@@ -380,6 +602,8 @@ impl GraphView {
         painter.rect_filled(rect, 0.0, visuals.extreme_bg_color);
 
         if self.ids.is_empty() {
+            self.proj.clear();
+            self.order.clear();
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -389,6 +613,7 @@ impl GraphView {
             );
             return;
         }
+        let space = self.mode == Mode::Space;
 
         // Simulation.
         if self.layout.is_running() {
@@ -396,59 +621,97 @@ impl GraphView {
             ui.ctx().request_repaint();
         }
         if self.auto_fit {
-            self.camera.fit(
-                self.layout.pos.iter().copied(),
-                v(rect.size().to_pos2()),
-                40.0,
-            );
+            let size = v(rect.size().to_pos2());
+            match self.mode {
+                Mode::Flat => self
+                    .camera
+                    .fit(self.layout.pos.iter().map(|q| q.xy()), size, 40.0),
+                Mode::Space => self.orbit.fit(self.layout.pos.iter().copied(), size, 40.0),
+            }
             if !self.layout.is_running() {
                 self.auto_fit = false;
             }
         }
+        self.project_nodes(rect);
 
         // --- Interactions ---
-        let pointer_world = resp.hover_pos().map(|s| self.camera.to_world(v(s), vc));
-        let tol = 4.0 / self.camera.zoom;
-        let hovered_node = pointer_world
-            .and_then(|w| pick_node(&self.layout.pos, w, tol, |i| self.radius(i), |_| true));
+        let pick_at = |this: &Self, s: Pos2| {
+            pick_front(
+                this.order.iter().filter_map(|&i| {
+                    let pr = this.proj[i]?;
+                    Some((i, pr.screen, this.screen_radius(i, &pr), pr.depth))
+                }),
+                v(s),
+                4.0,
+            )
+        };
+        let hovered_node = resp.hover_pos().and_then(|s| pick_at(self, s));
 
         if resp.drag_started()
             && let Some(start) = resp.interact_pointer_pos()
         {
-            let w = self.camera.to_world(v(start), vc);
-            self.dragging = pick_node(&self.layout.pos, w, tol, |i| self.radius(i), |_| true);
-            if let Some(i) = self.dragging {
-                self.layout.pinned[i] = true;
-                self.layout.set_alpha_target(0.3);
-                self.layout.reheat(0.3);
-            }
+            let (primary, shift) = ui.input(|i| {
+                (
+                    i.pointer.button_down(PointerButton::Primary),
+                    i.modifiers.shift,
+                )
+            });
+            let node = if primary && !shift {
+                pick_at(self, start)
+            } else {
+                None
+            };
+            self.drag = Some(match node {
+                Some(i) => {
+                    self.layout.pinned[i] = true;
+                    self.layout.set_alpha_target(0.3);
+                    self.layout.reheat(0.3);
+                    Drag::Node(i, self.proj[i].map_or(0.0, |pr| pr.depth))
+                }
+                None if space && primary && !shift => Drag::Orbit,
+                None => Drag::Pan,
+            });
             self.auto_fit = false;
         }
         if resp.dragged() {
-            match (self.dragging, resp.interact_pointer_pos()) {
-                (Some(i), Some(ptr)) => {
-                    self.layout.pos[i] = self.camera.to_world(v(ptr), vc);
+            let d = v(resp.drag_delta().to_pos2());
+            match (self.drag, resp.interact_pointer_pos()) {
+                (Some(Drag::Node(i, depth)), Some(ptr)) => {
+                    self.layout.pos[i] = match self.mode {
+                        Mode::Flat => Vec3::flat(self.camera.to_world(v(ptr), vc)),
+                        Mode::Space => {
+                            let mut q = self.orbit.unproject(v(ptr), depth, vc, rect.height());
+                            if let Some(z) = self.layout.z_target[i] {
+                                q.z = z;
+                            }
+                            q
+                        }
+                    };
                 }
-                _ => {
-                    let d = resp.drag_delta();
-                    self.camera.pan(Vec2::new(d.x, d.y));
-                }
+                (Some(Drag::Orbit), _) => self.orbit.orbit(d),
+                _ => match self.mode {
+                    Mode::Flat => self.camera.pan(d),
+                    Mode::Space => self.orbit.pan(d, rect.height()),
+                },
             }
+            self.project_nodes(rect);
             ui.ctx().request_repaint();
         }
         if resp.drag_stopped() {
-            if let Some(i) = self.dragging.take() {
+            if let Some(Drag::Node(i, _)) = self.drag {
                 let q = self.layout.pos[i];
-                outcome.pins.push((
-                    self.ids[i].clone(),
-                    Some(Pos {
-                        x: q.x,
-                        y: q.y,
-                        z: 0.0,
-                        pinned: true,
-                    }),
-                ));
+                let z = if space {
+                    q.z
+                } else {
+                    // En 2D, on garde la profondeur déjà enregistrée.
+                    project
+                        .note(&self.ids[i])
+                        .and_then(|n| n.meta.pos)
+                        .map_or(0.0, |pos| pos.z)
+                };
+                outcome.pins.push((self.ids[i].clone(), Some(pin_at(q, z))));
             }
+            self.drag = None;
             self.layout.set_alpha_target(0.0);
         }
 
@@ -458,8 +721,12 @@ impl GraphView {
             if (factor - 1.0).abs() > 1e-4
                 && let Some(ptr) = resp.hover_pos()
             {
-                self.camera.zoom_at(v(ptr), vc, factor);
+                match self.mode {
+                    Mode::Flat => self.camera.zoom_at(v(ptr), vc, factor),
+                    Mode::Space => self.orbit.dolly(1.0 / factor),
+                }
                 self.auto_fit = false;
+                self.project_nodes(rect);
             }
         }
 
@@ -483,32 +750,53 @@ impl GraphView {
         let depths = sel.map(|s| neighborhood(self.ids.len(), &pairs, s, self.depth));
         let lit = |i: usize| depths.as_ref().is_none_or(|d| d[i].is_some());
 
+        // Brouillard (3D) : les nœuds lointains s'estompent.
+        let (near, far) = self
+            .order
+            .iter()
+            .filter_map(|&i| self.proj[i].map(|pr| pr.depth))
+            .fold((f32::MAX, f32::MIN), |(lo, hi), d| (lo.min(d), hi.max(d)));
+        let fog = |i: usize| -> f32 {
+            match self.proj[i] {
+                _ if Some(i) == sel => 1.0,
+                Some(pr) if space && far > near => 1.0 - 0.5 * (pr.depth - near) / (far - near),
+                _ => 1.0,
+            }
+        };
+
+        // --- Axe Z ---
+        if space && let Some(axis) = &self.z_axis {
+            self.draw_z_axis(&painter, rect, axis, &visuals);
+        }
+
         // --- Arêtes ---
-        let to_s = |i: usize| self.camera.to_screen(self.layout.pos[i], vc);
+        let screen = |i: usize| self.proj[i].map(|pr| pr.screen);
         let view = rect.expand(40.0);
         let mut hovered_edge = None;
         if hovered_node.is_none()
+            && self.drag.is_none()
             && let Some(ptr) = resp.hover_pos()
         {
-            let segs = self.edges.iter().enumerate().map(|(k, e)| {
-                (
-                    k,
-                    edge_points(e, to_s(e.a), to_s(e.b)).0,
-                    edge_points(e, to_s(e.a), to_s(e.b)).1,
-                )
+            let segs = self.edges.iter().enumerate().filter_map(|(k, e)| {
+                let (a, b) = edge_points(e, screen(e.a)?, screen(e.b)?);
+                Some((k, a, b))
             });
             hovered_edge = pick_segment(segs, v(ptr), 5.0);
         }
         for (k, e) in self.edges.iter().enumerate() {
-            let (a, b) = edge_points(e, to_s(e.a), to_s(e.b));
+            let (Some(sa), Some(sb)) = (screen(e.a), screen(e.b)) else {
+                continue;
+            };
+            let (a, b) = edge_points(e, sa, sb);
             if !view.contains(p(a)) && !view.contains(p(b)) && !segment_crosses(rect, a, b) {
                 continue;
             }
             let on = lit(e.a) && lit(e.b);
+            let fade = (fog(e.a) + fog(e.b)) * 0.5;
             let mut color = if on {
-                e.color
+                e.color.gamma_multiply(fade)
             } else {
-                e.color.gamma_multiply(0.12)
+                e.color.gamma_multiply(0.12 * fade)
             };
             let mut width = 1.4;
             if hovered_edge == Some(k) {
@@ -516,25 +804,45 @@ impl GraphView {
                 color = e.color;
             }
             painter.line_segment([p(a), p(b)], Stroke::new(width, color));
-            if e.directed {
-                let r = self.radius(e.b) * self.camera.zoom.max(0.0);
-                draw_arrow(&painter, a, b, r.max(3.0), color, width);
+            if e.directed
+                && let Some(pr) = self.proj[e.b]
+            {
+                let r = self.screen_radius(e.b, &pr);
+                draw_arrow(&painter, a, b, r, color, width);
+            }
+        }
+
+        // --- Étiquettes autorisées en 3D : les plus proches, assez grandes ---
+        let mut label_ok = vec![!space; self.ids.len()];
+        if space {
+            let mut count = 0;
+            for &i in self.order.iter().rev() {
+                if count >= MAX_LABELS_3D {
+                    break;
+                }
+                let Some(pr) = self.proj[i] else { continue };
+                if self.screen_radius(i, &pr) >= LABEL_MIN_RADIUS_3D && rect.contains(p(pr.screen))
+                {
+                    label_ok[i] = true;
+                    count += 1;
+                }
             }
         }
 
         // --- Nœuds ---
         let pack = project.pack();
         let mut labels = 0;
-        for i in 0..self.ids.len() {
-            let s = to_s(i);
-            let r = (self.radius(i) * self.camera.zoom).max(3.0);
+        for &i in &self.order {
+            let Some(pr) = self.proj[i] else { continue };
+            let s = pr.screen;
+            let r = self.screen_radius(i, &pr);
             if !rect.expand(r + 2.0).contains(p(s)) {
                 continue;
             }
             let Some(note) = project.note(&self.ids[i]) else {
                 continue;
             };
-            let dim = if lit(i) { 1.0 } else { 0.18 };
+            let dim = if lit(i) { 1.0 } else { 0.18 } * fog(i);
             let colors: Vec<Color32> = note
                 .meta
                 .categories
@@ -559,7 +867,7 @@ impl GraphView {
                 .and_then(|st| pack.status(st))
                 .map(|st| c32(st.color));
             let border = match status_color {
-                Some(c) => Stroke::new((r * 0.22).clamp(1.5, 3.5), c.gamma_multiply(dim)),
+                Some(c) => Stroke::new((r * 0.22).clamp(1.0, 3.5), c.gamma_multiply(dim)),
                 None => Stroke::new(1.0, visuals.weak_text_color().gamma_multiply(dim)),
             };
             painter.circle_stroke(p(s), r, border);
@@ -580,7 +888,8 @@ impl GraphView {
             let important = Some(i) == sel
                 || hovered_node == Some(i)
                 || depths.as_ref().is_some_and(|d| d[i] == Some(1));
-            if (self.camera.zoom >= LABEL_ZOOM && dim == 1.0 && labels < MAX_LABELS) || important {
+            let zoom_ok = space || self.camera.zoom >= LABEL_ZOOM;
+            if (zoom_ok && label_ok[i] && lit(i) && labels < MAX_LABELS) || important {
                 labels += 1;
                 painter.text(
                     Pos2::new(s.x, s.y + r + 3.0),
@@ -590,6 +899,16 @@ impl GraphView {
                     visuals.text_color().gamma_multiply(dim.max(0.5)),
                 );
             }
+        }
+
+        if space {
+            painter.text(
+                rect.left_bottom() + egui::vec2(8.0, -6.0),
+                egui::Align2::LEFT_BOTTOM,
+                "Glisser : tourner · Maj+glisser ou clic droit glissé : déplacer · molette : zoom",
+                FontId::proportional(11.0),
+                visuals.weak_text_color(),
+            );
         }
 
         // --- Menu contextuel ---
@@ -612,15 +931,7 @@ impl GraphView {
                 }
             } else if ui.button("Épingler ici").clicked() {
                 let q = self.layout.pos[i];
-                outcome.pins.push((
-                    id,
-                    Some(Pos {
-                        x: q.x,
-                        y: q.y,
-                        z: 0.0,
-                        pinned: true,
-                    }),
-                ));
+                outcome.pins.push((id, Some(pin_at(q, q.z))));
                 close_menu = true;
             }
             if close_menu {
@@ -629,10 +940,13 @@ impl GraphView {
         });
 
         // --- Aperçus au survol ---
-        if self.dragging.is_none() {
+        if self.drag.is_none() {
             if let Some(i) = hovered_node {
                 let id = self.ids[i].clone();
-                resp.on_hover_ui_at_pointer(|ui| note_preview(ui, project, &id));
+                let z_field = self.z_field.clone().filter(|_| space);
+                resp.on_hover_ui_at_pointer(|ui| {
+                    note_preview(ui, project, &id, z_field.as_deref())
+                });
             } else if let Some(k) = hovered_edge {
                 let e = &self.edges[k];
                 let title = |i: usize| {
@@ -659,6 +973,85 @@ impl GraphView {
             }
         }
     }
+
+    /// Axe Z gradué (au centre de la disposition), derrière les nœuds.
+    fn draw_z_axis(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        axis: &ZAxis,
+        visuals: &egui::Visuals,
+    ) {
+        let projector = self.orbit.projector(v(rect.center()), rect.height());
+        let at = |z: f32| projector.project(Vec3::new(0.0, 0.0, z));
+        let color = visuals.weak_text_color().gamma_multiply(0.6);
+        if let (Some(a), Some(b)) = (at(axis.z_of(axis.min)), at(axis.z_of(axis.max))) {
+            painter.line_segment([p(a.screen), p(b.screen)], Stroke::new(1.0, color));
+        }
+        for &t in &axis.ticks {
+            if let Some(pr) = at(axis.z_of(t)) {
+                painter.circle_filled(p(pr.screen), 2.0, color);
+                painter.text(
+                    p(pr.screen) + egui::vec2(5.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{} {}", axis.label, fmt_num(t)),
+                    FontId::proportional(10.0),
+                    color,
+                );
+            }
+        }
+    }
+}
+
+/// Position épinglée à enregistrer dans la fiche.
+fn pin_at(q: Vec3, z: f32) -> Pos {
+    Pos {
+        x: q.x,
+        y: q.y,
+        z,
+        pinned: true,
+    }
+}
+
+fn fmt_num(x: f64) -> String {
+    if x.fract() == 0.0 && x.abs() < 1e15 {
+        format!("{}", x as i64)
+    } else {
+        format!("{x:.2}")
+    }
+}
+
+/// Échelle de l'axe Z pour un champ : bornes des valeurs des fiches
+/// affichées, graduations et étendue (liée au nombre de fiches).
+fn z_axis(project: &Project, ids: &[NoteId], field: &str) -> Option<ZAxis> {
+    let values: Vec<f64> = ids
+        .iter()
+        .filter_map(|id| project.note(id)?.meta.fields.get(field)?.as_f64())
+        .filter(|x| x.is_finite())
+        .collect();
+    let min = values.iter().copied().reduce(f64::min)?;
+    let max = values.iter().copied().reduce(f64::max)?;
+    let integers = values.iter().all(|x| x.fract() == 0.0);
+    let ticks = if integers && max - min <= 30.0 {
+        (min as i64..=max as i64).map(|x| x as f64).collect()
+    } else if max > min {
+        vec![min, max]
+    } else {
+        vec![min]
+    };
+    let label = project
+        .pack()
+        .fields
+        .iter()
+        .find(|f| f.id == field)
+        .map_or_else(|| field.to_owned(), |f| f.label.clone());
+    Some(ZAxis {
+        label,
+        min,
+        max,
+        ticks,
+        span: (60.0 * (ids.len() as f32).sqrt()).clamp(300.0, 1500.0),
+    })
 }
 
 /// Décalage des arêtes parallèles entre une même paire de fiches.
@@ -730,7 +1123,9 @@ fn draw_pie(painter: &egui::Painter, center: Pos2, r: f32, colors: &[Color32], e
         _ => {
             let n = colors.len();
             let per = std::f32::consts::TAU / n as f32;
-            let segments = (48 / n).max(6);
+            // Moins de segments pour les petits disques (3D lointaine).
+            let segments = ((r * 1.5) as usize).clamp(8, 48) / n;
+            let segments = segments.max(3);
             for (k, color) in colors.iter().enumerate() {
                 let a0 = -std::f32::consts::FRAC_PI_2 + per * k as f32;
                 let mut pts = Vec::with_capacity(segments + 2);
@@ -746,7 +1141,7 @@ fn draw_pie(painter: &egui::Painter, center: Pos2, r: f32, colors: &[Color32], e
 }
 
 /// Aperçu d'une fiche au survol.
-fn note_preview(ui: &mut egui::Ui, project: &Project, id: &NoteId) {
+fn note_preview(ui: &mut egui::Ui, project: &Project, id: &NoteId, z_field: Option<&str>) {
     let Some(note) = project.note(id) else {
         return;
     };
@@ -769,6 +1164,20 @@ fn note_preview(ui: &mut egui::Ui, project: &Project, id: &NoteId) {
             ui.label(RichText::new(format!("• {label}")).color(color).small());
         }
     });
+    if let Some(field) = z_field {
+        let label = pack
+            .fields
+            .iter()
+            .find(|f| f.id == field)
+            .map_or(field, |f| f.label.as_str());
+        let value = note
+            .meta
+            .fields
+            .get(field)
+            .and_then(|v| v.as_f64())
+            .map_or_else(|| "—".to_owned(), fmt_num);
+        ui.label(RichText::new(format!("{label} : {value}")).small());
+    }
     let excerpt: String = note
         .body
         .lines()

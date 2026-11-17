@@ -122,6 +122,17 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
   sélection (panneau latéral) ; double-clic : éditeur ; glisser : épingle
   (`pos` écrit dans la fiche). En vue graphe le panneau latéral reste
   toujours affiché (sinon le canevas se redimensionne sous le curseur).
+- **Graphe 3D** : une seule simulation (`Layout`, positions `Vec3`, octree
+  Barnes-Hut) ; en mode plan `z` reste nul, en 3D `z_target` impose la
+  profondeur (axe Z lié à un champ numérique). Rendu commun : chaque nœud
+  est projeté (`Projected` : écran, profondeur, échelle), puis dessiné au
+  painter egui du plus loin au plus proche, avec brouillard et étiquettes
+  limitées aux 80 plus proches. Caméra `OrbitCamera` : `y` du monde vers le
+  bas (vue de face = vue 2D). Glisser le fond : orbite ; Maj+glisser ou
+  clic droit glissé : déplacement. Épingler en 3D enregistre `z` ; en 2D le
+  `z` existant est conservé. Mesuré à 2003 nœuds / 5002 liens (release) :
+  ~3 ms d'image + ~3,5 ms de tessellation → painter suffisant, pas de wgpu
+  personnalisé pour l'instant.
 - **Tests kittest** : pas de temps fixé à 1/60 s (le défaut, 0,25 s, rend
   les double-clics impossibles) ; `run()` ne termine pas tant que la
   simulation tourne : utiliser `run_steps(n)`. Mesure de la vue graphe :
@@ -155,7 +166,7 @@ jalons suivants n'est codé avant validation.
   liens sortants / rétroliens / cassés, index incrémental (1000+ fiches).
 - [x] **3. Packs de jeu et filtres** — modèles, couleurs/icônes, changement et
   création de pack, filtres combinables.
-- [ ] **4. Graphe 2D** — nœuds en secteurs multi-catégories, arêtes typées,
+- [x] **4. Graphe 2D** — nœuds en secteurs multi-catégories, arêtes typées,
   layout en forces, épinglage, filtres, voisinage, aperçu au survol.
 - [ ] **5. Graphe 3D** — caméra orbitale, perspective, billboards, mêmes
   filtres, bascule 2D/3D, axe Z optionnel sur un champ, 60 FPS à 2000 nœuds /

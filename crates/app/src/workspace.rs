@@ -1498,6 +1498,137 @@ id: "
         assert_eq!(ws.editor.as_ref().map(|e| &e.id), Some(&salle));
     }
 
+    #[test]
+    fn graph_view_3d_toggle_orbit_z_axis_and_pin() {
+        use crate::graph_view::Mode;
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::G);
+        harness.run_steps(5);
+        harness.get_by_label("3D").click();
+        harness.run_steps(600);
+        {
+            let ws = harness.state().ws.as_ref().unwrap();
+            assert_eq!(ws.graph.mode, Mode::Space);
+            assert!(!ws.graph.is_animating(), "la disposition 3D se stabilise");
+            let zs: Vec<f32> = ["Coffre du bureau", "Majordome", "Salle des Archives"]
+                .iter()
+                .map(|t| ws.graph.world_pos(&note_id(&harness, t)).unwrap().z)
+                .collect();
+            assert!(
+                zs.iter().any(|z| z.abs() > 1.0),
+                "profondeur utilisée : {zs:?}"
+            );
+        }
+        snapshot(&mut harness, "12_graphe_3d");
+
+        // Clic en 3D : sélection ; la bascule en 2D la conserve.
+        let coffre = note_id(&harness, "Coffre du bureau");
+        let pos = node_pos(&harness, "Coffre du bureau");
+        click_at(&mut harness, pos);
+        assert_eq!(
+            harness
+                .state()
+                .ws
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .map(|e| &e.id),
+            Some(&coffre)
+        );
+        harness.get_by_label("2D").click();
+        harness.run_steps(5);
+        {
+            let ws = harness.state().ws.as_ref().unwrap();
+            assert_eq!(ws.graph.mode, Mode::Flat);
+            assert_eq!(ws.editor.as_ref().map(|e| &e.id), Some(&coffre));
+            assert_eq!(ws.graph.world_pos(&coffre).unwrap().z, 0.0, "à plat");
+        }
+        harness.get_by_label("3D").click();
+        harness.run_steps(400);
+
+        // Glisser le fond : la caméra tourne autour du graphe.
+        let yaw = harness
+            .state()
+            .ws
+            .as_ref()
+            .unwrap()
+            .graph
+            .orbit_camera()
+            .yaw;
+        let nodes: Vec<egui::Pos2> = ["Coffre du bureau", "Majordome", "Salle des Archives"]
+            .iter()
+            .map(|t| node_pos(&harness, t))
+            .collect();
+        let empty = [
+            egui::pos2(320.0, 650.0),
+            egui::pos2(880.0, 650.0),
+            egui::pos2(320.0, 200.0),
+            egui::pos2(880.0, 200.0),
+        ]
+        .into_iter()
+        .find(|q| nodes.iter().all(|n| (*n - *q).length() > 60.0))
+        .unwrap();
+        harness.hover_at(empty);
+        harness.run_steps(1);
+        harness.drag_at(empty);
+        harness.run_steps(1);
+        for k in 1..=5 {
+            harness.hover_at(empty + egui::vec2(12.0 * k as f32, 0.0));
+            harness.run_steps(1);
+        }
+        harness.drop_at(empty + egui::vec2(60.0, 0.0));
+        harness.run_steps(2);
+        let cam = harness.state().ws.as_ref().unwrap().graph.orbit_camera();
+        assert!(
+            (cam.yaw - yaw).abs() > 0.1,
+            "rotation : {} -> {}",
+            yaw,
+            cam.yaw
+        );
+
+        // Axe Z sur « jour de découverte » : Salle (3) et Coffre (5) aux deux
+        // extrémités, Majordome (sans valeur) libre.
+        harness.state_mut().ws.as_mut().unwrap().graph.z_field = Some("jour_decouverte".to_owned());
+        harness.run_steps(400);
+        {
+            let ws = harness.state().ws.as_ref().unwrap();
+            let z = |t: &str| ws.graph.world_pos(&note_id(&harness, t)).unwrap().z;
+            let (salle, coffre_z) = (z("Salle des Archives"), z("Coffre du bureau"));
+            assert!(salle < 0.0 && coffre_z > 0.0, "{salle} / {coffre_z}");
+            assert!((salle + coffre_z).abs() < 1e-3, "axe centré");
+        }
+        snapshot(&mut harness, "13_axe_z");
+
+        // Glisser un nœud en 3D : épinglé, profondeur enregistrée.
+        let from = node_pos(&harness, "Majordome");
+        let to = from + egui::vec2(-70.0, 40.0);
+        harness.hover_at(from);
+        harness.run_steps(1);
+        harness.drag_at(from);
+        harness.run_steps(1);
+        for k in 1..=6 {
+            harness.hover_at(from + (to - from) * (k as f32 / 6.0));
+            harness.run_steps(1);
+        }
+        harness.drop_at(to);
+        harness.run_steps(5);
+        flush(&mut harness);
+        let majordome = std::fs::read_to_string(dir.path().join("Majordome.md")).unwrap();
+        assert!(majordome.contains("pinned: true"), "{majordome}");
+        let after = node_pos(&harness, "Majordome");
+        assert!(
+            (after - to).length() < 3.0,
+            "le nœud reste sous le pointeur"
+        );
+        let id = note_id(&harness, "Majordome");
+        let ws = harness.state().ws.as_ref().unwrap();
+        let saved = ws.project.note(&id).unwrap().meta.pos.unwrap();
+        let world = ws.graph.world_pos(&id).unwrap();
+        assert!((saved.z - world.z).abs() < 1e-3 && saved.z != 0.0);
+    }
+
     /// Mesure (ignorée par défaut) : coût d'une image de la vue graphe avec
     /// 2000 fiches et ~5000 liens. Lancer avec
     /// `cargo test --release -p enigma-app graph_frame_time -- --ignored --nocapture`.
@@ -1555,5 +1686,40 @@ id: "
         let t = std::time::Instant::now();
         harness.run_steps(60);
         eprintln!("image au repos : {:?}", t.elapsed() / 60);
+
+        // Même chose en 3D.
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .graph
+            .set_mode(crate::graph_view::Mode::Space);
+        harness.run_steps(1);
+        let t = std::time::Instant::now();
+        harness.run_steps(60);
+        eprintln!("3D, image pendant la simulation : {:?}", t.elapsed() / 60);
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .graph_stop_for_bench();
+        let t = std::time::Instant::now();
+        harness.run_steps(60);
+        eprintln!("3D, image au repos : {:?}", t.elapsed() / 60);
+        // Tessellation (formes egui -> triangles pour le GPU) d'une image 3D,
+        // faite par eframe après chaque image.
+        let shapes = harness.output().shapes.clone();
+        let t = std::time::Instant::now();
+        let mesh = harness.ctx.tessellate(shapes, 1.0);
+        let vertices: usize = mesh
+            .iter()
+            .map(|m| match &m.primitive {
+                egui::epaint::Primitive::Mesh(m) => m.vertices.len(),
+                egui::epaint::Primitive::Callback(_) => 0,
+            })
+            .sum();
+        eprintln!("3D, tessellation : {:?} ({vertices} sommets)", t.elapsed());
     }
 }
