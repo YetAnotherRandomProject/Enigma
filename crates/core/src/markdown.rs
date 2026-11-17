@@ -155,6 +155,131 @@ pub fn wiki_links(text: &str) -> Vec<WikiLink> {
     scan_wiki_links(text, &in_code)
 }
 
+/// Lien `[[...` en cours de saisie (pas encore refermé) sous le curseur.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Completion {
+    /// Après `[[` : titre partiel. `start` : octet juste après `[[`.
+    Title { start: usize, query: String },
+    /// Après `[[Titre|` : type partiel. `start` : octet juste après `|`.
+    LinkType {
+        start: usize,
+        target: String,
+        query: String,
+    },
+}
+
+impl Completion {
+    /// Début du texte que le choix remplacera (jusqu'au curseur).
+    pub fn start(&self) -> usize {
+        match self {
+            Completion::Title { start, .. } | Completion::LinkType { start, .. } => *start,
+        }
+    }
+
+    /// Texte partiel déjà tapé.
+    pub fn query(&self) -> &str {
+        match self {
+            Completion::Title { query, .. } | Completion::LinkType { query, .. } => query,
+        }
+    }
+}
+
+/// Détecte un lien `[[...` non refermé entre le début de la ligne et le
+/// curseur (`cursor` en octets), hors code.
+pub fn completion_at(text: &str, cursor: usize) -> Option<Completion> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let line_start = text[..cursor].rfind('\n').map_or(0, |i| i + 1);
+    let before = &text[line_start..cursor];
+    let open = before.rfind("[[")?;
+    let inner = &before[open + 2..];
+    if inner.contains('[') || inner.contains(']') {
+        return None;
+    }
+    let abs_open = line_start + open;
+    if in_code_at(text, abs_open) {
+        return None;
+    }
+    match inner.find('|') {
+        Some(p) => {
+            let query = &inner[p + 1..];
+            if query.contains('|') {
+                return None;
+            }
+            Some(Completion::LinkType {
+                start: abs_open + 2 + p + 1,
+                target: inner[..p].trim().to_owned(),
+                query: query.trim_start().to_owned(),
+            })
+        }
+        None => Some(Completion::Title {
+            start: abs_open + 2,
+            query: inner.trim_start().to_owned(),
+        }),
+    }
+}
+
+/// Applique un choix d'auto-complétion : remplace le texte partiel par
+/// `choice` et referme le lien si besoin. Avec `then_type` (titre seulement),
+/// insère `|` pour enchaîner sur le choix du type.
+/// Renvoie le nouveau texte et la position du curseur (en octets).
+pub fn apply_completion(
+    text: &str,
+    cursor: usize,
+    completion: &Completion,
+    choice: &str,
+    then_type: bool,
+) -> (String, usize) {
+    let start = completion.start().min(cursor);
+    let rest = &text[cursor..];
+    let mut out = String::with_capacity(text.len() + choice.len() + 3);
+    out.push_str(&text[..start]);
+    out.push_str(choice);
+    let after_choice = out.len();
+    let new_cursor;
+    match completion {
+        Completion::Title { .. } if then_type => {
+            if rest.starts_with('|') {
+                new_cursor = after_choice + 1;
+            } else if rest.starts_with("]]") {
+                out.push('|');
+                new_cursor = out.len();
+            } else {
+                out.push_str("|]]");
+                new_cursor = after_choice + 1;
+            }
+        }
+        Completion::Title { .. } if rest.starts_with('|') => new_cursor = after_choice,
+        _ => {
+            if rest.starts_with("]]") {
+                new_cursor = after_choice + 2;
+            } else {
+                out.push_str("]]");
+                new_cursor = out.len();
+            }
+        }
+    }
+    out.push_str(rest);
+    (out, new_cursor)
+}
+
+fn in_code_at(text: &str, pos: usize) -> bool {
+    Parser::new_ext(text, options())
+        .into_offset_iter()
+        .any(|(event, range)| {
+            matches!(event, Event::Start(Tag::CodeBlock(_)) | Event::Code(_))
+                && range.contains(&pos)
+        })
+}
+
+/// Lien `[[...]]` qui contient la position `byte`, s'il y en a un.
+pub fn wiki_link_at(text: &str, byte: usize) -> Option<WikiLink> {
+    wiki_links(text)
+        .into_iter()
+        .find(|l| l.range.start <= byte && byte <= l.range.end)
+}
+
 /// Remplace la cible des liens `[[ancien]]` (insensible à la casse) par
 /// `new_title`, en conservant le type éventuel. `None` si rien n'a changé.
 pub fn rewrite_wiki_targets(text: &str, old_title: &str, new_title: &str) -> Option<String> {
@@ -393,5 +518,118 @@ mod tests {
     fn empty_text() {
         let a = analyze("");
         assert!(a.spans.is_empty() && a.links.is_empty());
+    }
+
+    fn at_end(text: &str) -> Option<Completion> {
+        completion_at(text, text.len())
+    }
+
+    #[test]
+    fn completion_title_and_type() {
+        assert_eq!(
+            at_end("Voir [[Cof"),
+            Some(Completion::Title {
+                start: 7,
+                query: "Cof".into()
+            })
+        );
+        assert_eq!(
+            at_end("[["),
+            Some(Completion::Title {
+                start: 2,
+                query: String::new()
+            })
+        );
+        assert_eq!(
+            at_end("x [[Coffre|ou"),
+            Some(Completion::LinkType {
+                start: 11,
+                target: "Coffre".into(),
+                query: "ou".into()
+            })
+        );
+    }
+
+    #[test]
+    fn completion_none_when_closed_or_in_code_or_other_line() {
+        assert_eq!(at_end("[[Coffre]] puis"), None);
+        assert_eq!(
+            at_end(
+                "[[Coffre
+suite"
+            ),
+            None
+        );
+        // Un accent grave non refermé n'est pas du code (CommonMark).
+        assert!(at_end("`[[Cof").is_some());
+        assert_eq!(at_end("`x` `[[Cof`"), None);
+        assert_eq!(
+            at_end(
+                "```
+[[Cof"
+            ),
+            None
+        );
+        assert_eq!(at_end("a [[b|c|d"), None);
+        assert_eq!(
+            completion_at("é", 1),
+            None,
+            "pas une frontière de caractère"
+        );
+        // Le curseur au milieu d'un lien existant compte aussi.
+        assert_eq!(
+            completion_at("[[Cof]]", 5),
+            Some(Completion::Title {
+                start: 2,
+                query: "Cof".into()
+            })
+        );
+    }
+
+    fn apply(text: &str, cursor: usize, choice: &str, then_type: bool) -> (String, usize) {
+        let c = completion_at(text, cursor).unwrap();
+        apply_completion(text, cursor, &c, choice, then_type)
+    }
+
+    #[test]
+    fn apply_title_closes_link() {
+        let (t, c) = apply("Voir [[cof", 10, "Coffre", false);
+        assert_eq!(t, "Voir [[Coffre]]");
+        assert_eq!(c, t.len());
+        // « ]] » déjà présent : pas de doublon, curseur après.
+        let (t, c) = apply("[[cof]] fin", 5, "Coffre", false);
+        assert_eq!(t, "[[Coffre]] fin");
+        assert_eq!(&t[c..], " fin");
+    }
+
+    #[test]
+    fn apply_title_then_type() {
+        let (t, c) = apply("[[cof", 5, "Coffre", true);
+        assert_eq!(t, "[[Coffre|]]");
+        assert_eq!(&t[..c], "[[Coffre|");
+        assert!(matches!(
+            completion_at(&t, c),
+            Some(Completion::LinkType { .. })
+        ));
+        let (t, c) = apply("[[cof]]", 5, "Coffre", true);
+        assert_eq!(t, "[[Coffre|]]");
+        assert_eq!(&t[..c], "[[Coffre|");
+    }
+
+    #[test]
+    fn apply_type() {
+        let (t, c) = apply("[[Coffre|ou", 11, "ouvre", false);
+        assert_eq!(t, "[[Coffre|ouvre]]");
+        assert_eq!(c, t.len());
+        let (t, c) = apply("[[Coffre|]] x", 9, "indique", false);
+        assert_eq!(t, "[[Coffre|indique]] x");
+        assert_eq!(&t[c..], " x");
+    }
+
+    #[test]
+    fn link_at_position() {
+        let text = "a [[B|ouvre]] c";
+        assert_eq!(wiki_link_at(text, 5).unwrap().target, "B");
+        assert!(wiki_link_at(text, 0).is_none());
     }
 }

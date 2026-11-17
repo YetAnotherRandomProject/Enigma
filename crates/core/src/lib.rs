@@ -9,6 +9,7 @@
 
 pub mod history;
 pub mod id;
+pub mod links;
 pub mod markdown;
 pub mod note;
 pub mod pack;

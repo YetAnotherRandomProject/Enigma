@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::id::NoteId;
+use crate::links::{LinkEnd, LinkIndex, RawTarget, ResolvedLink, merge};
 use crate::markdown;
 use crate::note::{Note, NoteMeta, NoteSerializeError};
 use crate::pack::{DiscoveredPack, Pack, discover_packs};
@@ -136,6 +137,7 @@ pub struct Project {
     by_path: HashMap<PathBuf, NoteId>,
     titles: HashMap<String, Vec<NoteId>>,
     issues: BTreeMap<PathBuf, String>,
+    links: LinkIndex,
     generation: u64,
 }
 
@@ -159,6 +161,7 @@ impl Project {
             by_path: HashMap::new(),
             titles: HashMap::new(),
             issues: BTreeMap::new(),
+            links: LinkIndex::default(),
             generation: 0,
         };
         project.load_config();
@@ -308,19 +311,6 @@ impl Project {
         Ok(id)
     }
 
-    /// Accès en écriture au corps d'une fiche. Appeler [`Project::mark_dirty`]
-    /// après une modification.
-    pub fn body_mut(&mut self, id: &NoteId) -> Option<&mut String> {
-        self.notes.get_mut(id).map(|e| &mut e.note.body)
-    }
-
-    /// Signale une modification non enregistrée.
-    pub fn mark_dirty(&mut self, id: &NoteId) {
-        if let Some(e) = self.notes.get_mut(id) {
-            e.dirty = true;
-        }
-    }
-
     /// Remplace les métadonnées d'une fiche. L'identifiant et le titre sont
     /// conservés (le titre ne change que via [`Project::rename`]).
     pub fn set_meta(&mut self, id: &NoteId, mut meta: NoteMeta) -> Result<(), ProjectError> {
@@ -328,8 +318,12 @@ impl Project {
         meta.id = e.note.meta.id.clone();
         meta.title = e.note.meta.title.clone();
         if e.note.meta != meta {
+            let links_changed = e.note.meta.links != meta.links;
             e.note.meta = meta;
             e.dirty = true;
+            if links_changed {
+                self.reindex_links(id);
+            }
         }
         Ok(())
     }
@@ -340,6 +334,7 @@ impl Project {
         if e.note.body != body {
             e.note.body = body;
             e.dirty = true;
+            self.reindex_links(id);
         }
         Ok(())
     }
@@ -449,6 +444,7 @@ impl Project {
                 {
                     e.note.body = body;
                     e.dirty = true;
+                    self.reindex_links(&other);
                     self.save(&other)?;
                     updated.push(other);
                 }
@@ -562,6 +558,7 @@ impl Project {
             e.note = parsed;
             e.disk_hash = Some(hash);
         }
+        self.reindex_links(&id);
         if title_changed {
             self.index_title(&id);
             self.generation += 1;
@@ -587,8 +584,81 @@ impl Project {
             e.dirty = false;
         }
         self.index_title(id);
+        self.reindex_links(id);
         self.generation += 1;
         Ok(())
+    }
+
+    /// Liens sortants d'une fiche (corps et en-tête fusionnés, sans doublon).
+    /// Les liens cassés ont pour extrémité [`LinkEnd::Broken`].
+    pub fn outgoing_links(&self, id: &NoteId) -> Vec<ResolvedLink> {
+        let raw = self.links.raw_outgoing(id);
+        let mut links = merge(
+            raw.iter()
+                .map(|l| (self.resolve_raw(&l.target, &l.written), l.clone())),
+        );
+        self.sort_links(&mut links);
+        links
+    }
+
+    /// Rétroliens : fiches qui pointent vers `id` (par titre ou identifiant).
+    pub fn backlinks(&self, id: &NoteId) -> Vec<ResolvedLink> {
+        let Some(entry) = self.notes.get(id) else {
+            return Vec::new();
+        };
+        // Le titre ne désigne cette fiche que s'il se résout bien vers elle.
+        let title_is_ours = self.resolve_title(&entry.title_lower) == Some(id);
+        let mut sources: Vec<&NoteId> = self.links.sources_by_id(id).collect();
+        if title_is_ours {
+            sources.extend(self.links.sources_by_title(&entry.title_lower));
+        }
+        sources.sort();
+        sources.dedup();
+
+        let mut pairs = Vec::new();
+        for source in sources {
+            for l in self.links.raw_outgoing(source) {
+                let points_here = match &l.target {
+                    RawTarget::Id(t) => t == id,
+                    RawTarget::Title(t) => title_is_ours && *t == entry.title_lower,
+                };
+                if points_here {
+                    pairs.push((LinkEnd::Note(source.clone()), l.clone()));
+                }
+            }
+        }
+        let mut links = merge(pairs);
+        self.sort_links(&mut links);
+        links
+    }
+
+    /// Nombre total de liens bruts indexés.
+    pub fn link_count(&self) -> usize {
+        self.links.len()
+    }
+
+    fn resolve_raw(&self, target: &RawTarget, written: &str) -> LinkEnd {
+        let found = match target {
+            RawTarget::Title(t) => self.titles.get(t).and_then(|ids| ids.first()).cloned(),
+            RawTarget::Id(i) => self.notes.contains_key(i).then(|| i.clone()),
+        };
+        found.map_or_else(|| LinkEnd::Broken(written.to_owned()), LinkEnd::Note)
+    }
+
+    /// Tri stable pour l'affichage : par type, puis par titre.
+    fn sort_links(&self, links: &mut [ResolvedLink]) {
+        let key = |l: &ResolvedLink| {
+            let title = match &l.other {
+                LinkEnd::Note(n) => self
+                    .notes
+                    .get(n)
+                    .map(|e| e.title_lower.clone())
+                    .unwrap_or_default(),
+                LinkEnd::Broken(s) => s.to_lowercase(),
+            };
+            (l.kind.clone(), title)
+        };
+        links.sort_by_cached_key(key);
     }
 
     /// Packs disponibles : ceux du projet (`.enigma/packs`) puis ceux de
@@ -722,10 +792,18 @@ impl Project {
         self.notes.insert(id.clone(), entry);
         self.by_path.insert(path, id.clone());
         self.index_title(&id);
+        self.reindex_links(&id);
+    }
+
+    fn reindex_links(&mut self, id: &NoteId) {
+        if let Some(e) = self.notes.get(id) {
+            self.links.update(id, &e.note.meta, &e.note.body);
+        }
     }
 
     fn remove_entry(&mut self, id: &NoteId) {
         self.unindex_title(id);
+        self.links.remove(id);
         if let Some(e) = self.notes.remove(id) {
             self.by_path.remove(&e.path);
         }
@@ -1060,5 +1138,157 @@ mod tests {
         let mut p = again;
         p.set_pack(Some("inexistant".into())).unwrap();
         assert!(p.pack_issue().unwrap().contains("introuvable"));
+    }
+
+    fn titles_of(p: &Project, links: &[ResolvedLink]) -> Vec<String> {
+        links
+            .iter()
+            .map(|l| match &l.other {
+                LinkEnd::Note(n) => p.note(n).unwrap().meta.title.clone(),
+                LinkEnd::Broken(s) => format!("!{s}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn outgoing_backlinks_and_broken() {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = open(d.path());
+        let coffre = p.create_note("Coffre", vec![], String::new()).unwrap();
+        let salle = p
+            .create_note(
+                "Salle",
+                vec![],
+                "[[coffre|ouvre]] [[Coffre]] [[Fantôme]]".into(),
+            )
+            .unwrap();
+        let mut meta = p.note(&salle).unwrap().meta.clone();
+        meta.links.push(crate::MetaLink {
+            to: coffre.clone(),
+            kind: Some("ouvre".into()),
+            note: Some("via le code".into()),
+        });
+        meta.links.push(crate::MetaLink {
+            to: NoteId::parse("INCONNU").unwrap(),
+            kind: None,
+            note: None,
+        });
+        p.set_meta(&salle, meta).unwrap();
+
+        let out = p.outgoing_links(&salle);
+        // [[coffre|ouvre]], [[Coffre]] et le lien d'en-tête fusionnés en un seul.
+        assert_eq!(titles_of(&p, &out), ["!Fantôme", "!INCONNU", "Coffre"]);
+        let to_coffre = out
+            .iter()
+            .find(|l| l.other == LinkEnd::Note(coffre.clone()))
+            .unwrap();
+        assert_eq!(to_coffre.kind.as_deref(), Some("ouvre"));
+        assert!(to_coffre.in_body && to_coffre.in_meta);
+        assert_eq!(to_coffre.note.as_deref(), Some("via le code"));
+
+        let back = p.backlinks(&coffre);
+        assert_eq!(titles_of(&p, &back), ["Salle"]);
+        assert!(p.backlinks(&salle).is_empty());
+
+        // Créer la fiche manquante répare le lien, sans réindexer « Salle ».
+        let fantome = p.create_note("fantôme", vec![], String::new()).unwrap();
+        assert_eq!(p.backlinks(&fantome).len(), 1);
+        assert!(
+            p.outgoing_links(&salle)
+                .iter()
+                .any(|l| l.other == LinkEnd::Note(fantome.clone()))
+        );
+    }
+
+    #[test]
+    fn links_follow_edits_renames_and_deletes() {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = open(d.path());
+        let a = p.create_note("A", vec![], String::new()).unwrap();
+        let b = p.create_note("B", vec![], "[[A]]".into()).unwrap();
+        assert_eq!(p.backlinks(&a).len(), 1);
+
+        p.set_body(&b, "plus de lien".into()).unwrap();
+        assert!(p.backlinks(&a).is_empty());
+        p.set_body(&b, "[[a|indique]]".into()).unwrap();
+        assert_eq!(p.backlinks(&a)[0].kind.as_deref(), Some("indique"));
+
+        // Renommage : le lien de B est réécrit et reste valide.
+        p.rename(&a, "Alpha").unwrap();
+        assert_eq!(p.note(&b).unwrap().body, "[[Alpha|indique]]");
+        assert_eq!(p.backlinks(&a).len(), 1);
+
+        // Suppression de la cible : le lien devient cassé.
+        p.delete(&a).unwrap();
+        assert_eq!(
+            p.outgoing_links(&b)[0].other,
+            LinkEnd::Broken("Alpha".into())
+        );
+        // Suppression de la source : plus de rétrolien orphelin dans l'index.
+        p.delete(&b).unwrap();
+        assert_eq!(p.link_count(), 0);
+    }
+
+    #[test]
+    fn links_reloaded_from_external_change() {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = open(d.path());
+        let a = p.create_note("A", vec![], String::new()).unwrap();
+        let b = p.create_note("B", vec![], String::new()).unwrap();
+        let path = p.entry(&b).unwrap().path.clone();
+        let mut n = p.note(&b).unwrap().clone();
+        n.body = "[[A]]".into();
+        std::fs::write(&path, n.serialize().unwrap()).unwrap();
+        p.on_file_changed(&path);
+        assert_eq!(p.backlinks(&a).len(), 1);
+    }
+
+    /// 2000 fiches, ~10 000 liens : construction et mise à jour incrémentale.
+    #[test]
+    fn link_index_scales() {
+        let d = tempfile::tempdir().unwrap();
+        let n = 2000;
+        for i in 0..n {
+            let links: String = (1..=5)
+                .map(|k| format!("[[Fiche {}|indique]] ", (i + k * 7) % n))
+                .collect();
+            std::fs::write(
+                d.path().join(format!("Fiche {i}.md")),
+                format!(
+                    "---
+id: N{i}
+title: Fiche {i}
+---
+{links}
+"
+                ),
+            )
+            .unwrap();
+        }
+        let t = std::time::Instant::now();
+        let mut p = open(d.path());
+        let open_time = t.elapsed();
+        assert_eq!(p.len(), n);
+        assert_eq!(p.link_count(), n * 5);
+
+        let target = NoteId::parse("N0").unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            assert_eq!(p.backlinks(&target).len(), 5);
+        }
+        let back_time = t.elapsed() / 100;
+
+        let source = NoteId::parse("N1").unwrap();
+        let body = p.note(&source).unwrap().body.clone();
+        let t = std::time::Instant::now();
+        for i in 0..100 {
+            p.set_body(&source, format!("{body} {i}")).unwrap();
+        }
+        let update_time = t.elapsed() / 100;
+        eprintln!("ouverture {open_time:?}, rétroliens {back_time:?}, mise à jour {update_time:?}");
+        // Bornes très larges (machines lentes, mode debug) : on vérifie
+        // seulement qu'aucune opération ne parcourt tout le projet.
+        assert!(back_time < std::time::Duration::from_millis(20));
+        assert!(update_time < std::time::Duration::from_millis(20));
     }
 }
