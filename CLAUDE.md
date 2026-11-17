@@ -86,6 +86,32 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
 - Décision de conception non évidente → exposer les options et recommander,
   ne pas choisir silencieusement.
 
+## Notes techniques (pièges connus)
+- **Rendu Windows** : DX12 est forcé par défaut (`main.rs`), car des couches
+  Vulkan tierces (overlays, ReShade…) font planter la création de l'instance
+  Vulkan (0xC0000005). `WGPU_BACKEND=vulkan|dx12|gl` reste prioritaire.
+- **Polices** : egui n'embarque pas de gras ; le gras et les titres utilisent
+  la couleur « forte » du thème. Emoji : feature egui `monochrome_emoji_fonts`
+  (+ `system_fonts` d'eframe en repli). Les glyphes absents des polices
+  embarquées (ex. `●`, `＋`, `🧑`) font paniquer les tests d'interface :
+  préférer `•`, `+`, `👤`.
+- **Historique** : Ctrl+Z/Y sont consommés avant les widgets ; l'undo interne
+  du `TextEdit` d'egui n'est jamais utilisé (pile maison par fiche,
+  `enigma_core::history`).
+- **Fichiers sans en-tête** : jamais réécrits tant qu'ils ne sont pas modifiés.
+- **Écho de nos écritures** : `Project` garde l'empreinte du dernier contenu
+  écrit/lu ; `on_file_changed` ignore les événements identiques.
+
+## Tests
+- `cargo test --workspace` : logique (core) + tests d'interface sans fenêtre
+  (`egui_kittest`, dans `crates/app/src/workspace.rs`), sur une copie de
+  `exemples/blue_prince_demo`.
+- Captures PNG des tests d'interface :
+  `ENIGMA_SNAPSHOT_DIR=<dossier> WGPU_BACKEND=dx12 cargo test -p enigma-app -- --test-threads=1`
+  (le rendu GPU en parallèle plante sur certains pilotes).
+- Lancer sur la démo : `cargo run -p enigma-app -- exemples/blue_prince_demo`
+  (attention : modifie les fichiers de la démo ; travailler sur une copie).
+
 ## Méthode
 Un jalon à la fois. Fin de jalon : tout compile, tests verts, résumé de ce qui
 marche + comment tester, puis **arrêt en attendant le feu vert**. Rien des
