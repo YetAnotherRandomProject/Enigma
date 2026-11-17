@@ -5,6 +5,7 @@
 
 mod app;
 mod board_view;
+mod bundled_packs;
 mod colors;
 mod commands;
 mod completion;
@@ -18,6 +19,7 @@ mod pack_editor;
 mod palette;
 mod paths;
 mod shortcuts_ui;
+mod update;
 mod watcher;
 mod workspace;
 

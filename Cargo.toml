@@ -25,12 +25,25 @@ rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 serde_yaml_ng = "0.10.0"
+# Mise à jour automatique : empreinte des fichiers téléchargés.
+sha2 = "0.11.1"
+# Mise à jour automatique : remplacement de l'exécutable en cours (Windows compris).
+self-replace = "1.5.1"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ulid = "3.0.0"
+# Mise à jour automatique : requêtes HTTPS vers l'API et les fichiers GitHub (rustls, sans OpenSSL).
+ureq = "3.5.2"
 walkdir = "2.5.0"
+
+# Exécutable publié plus petit et plus rapide (téléchargé par la mise à jour
+# automatique) : optimisation à l'édition de liens, symboles retirés.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
