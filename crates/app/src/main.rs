@@ -5,6 +5,7 @@
 
 mod app;
 mod colors;
+mod completion;
 mod editor;
 mod highlight;
 mod notices;

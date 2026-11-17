@@ -93,11 +93,18 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
 - **Polices** : egui n'embarque pas de gras ; le gras et les titres utilisent
   la couleur « forte » du thème. Emoji : feature egui `monochrome_emoji_fonts`
   (+ `system_fonts` d'eframe en repli). Les glyphes absents des polices
-  embarquées (ex. `●`, `＋`, `🧑`) font paniquer les tests d'interface :
-  préférer `•`, `+`, `👤`.
+  embarquées (ex. `●`, `＋`, `→`, `🧑`) font paniquer les tests d'interface :
+  préférer `•`, `+`, `»`, `👤`.
 - **Historique** : Ctrl+Z/Y sont consommés avant les widgets ; l'undo interne
   du `TextEdit` d'egui n'est jamais utilisé (pile maison par fiche,
   `enigma_core::history`).
+- **Index de liens** (`enigma_core::links`) : liens bruts par fiche + index
+  inverses titre/id. Fusion corps + en-tête : même cible et même type → un
+  seul lien ; un lien sans type est absorbé par un lien typé vers la même
+  fiche. Deux types différents vers la même fiche = deux liens.
+- **Auto-complétion** : les touches ↑/↓/Entrée/Tab/Échap sont consommées
+  avant le `TextEdit` ; Échap n'est capturé par son `EventFilter` que
+  lorsque les suggestions sont ouvertes (sinon egui retire le focus avant).
 - **Fichiers sans en-tête** : jamais réécrits tant qu'ils ne sont pas modifiés.
 - **Écho de nos écritures** : `Project` garde l'empreinte du dernier contenu
   écrit/lu ; `on_file_changed` ignore les événements identiques.
@@ -118,7 +125,7 @@ marche + comment tester, puis **arrêt en attendant le feu vert**. Rien des
 jalons suivants n'est codé avant validation.
 
 ## Jalons
-- [ ] **1. Fondations et éditeur** — workspace, CI locale, ouverture de dossier,
+- [x] **1. Fondations et éditeur** — workspace, CI locale, ouverture de dossier,
   liste des fiches avec recherche, création/suppression/renommage ; éditeur avec
   en-tête masqué, pastilles de catégories, sélecteur de statut, champs dans un
   panneau latéral ; mise en forme pendant la frappe (layouter) ; sauvegarde

@@ -6,10 +6,12 @@ use std::collections::BTreeMap;
 
 use eframe::egui::{self, Color32, FontId, RichText, Stroke};
 use enigma_core::history::{EditKind, History};
+use enigma_core::markdown;
 use enigma_core::pack::FieldKind;
 use enigma_core::{FieldValue, NoteId, NoteMeta, Project};
 
 use crate::colors::{c32, text_on};
+use crate::completion::{self, ItemKind, Nav, Popup};
 use crate::highlight::Highlighter;
 use crate::notices::Notices;
 
@@ -33,6 +35,22 @@ pub struct Editor {
     highlighter: Highlighter,
     /// Demande de focus sur le titre (renommage depuis la liste).
     pub focus_title: bool,
+    /// Suggestions de liens affichées.
+    popup: Option<Popup>,
+    /// Rectangle de la fenêtre de suggestions à la frame précédente.
+    popup_rect: Option<egui::Rect>,
+    /// Début (octet) d'une saisie de lien dont les suggestions ont été fermées.
+    dismissed: Option<usize>,
+    /// Position du curseur (en caractères) à appliquer à la prochaine frame.
+    pending_cursor: Option<usize>,
+}
+
+/// Résultat de l'affichage du corps.
+#[derive(Default)]
+pub struct BodyOutcome {
+    pub edited: bool,
+    /// Fiche à ouvrir (Ctrl+clic sur un lien).
+    pub open: Option<NoteId>,
 }
 
 impl Editor {
@@ -50,6 +68,10 @@ impl Editor {
             field_bufs: BTreeMap::new(),
             highlighter: Highlighter::default(),
             focus_title: false,
+            popup: None,
+            popup_rect: None,
+            dismissed: None,
+            pending_cursor: None,
         };
         editor.refresh_field_bufs();
         Some(editor)
@@ -287,9 +309,57 @@ impl Editor {
         edited
     }
 
-    /// Corps Markdown mis en forme pendant la frappe.
-    pub fn body_ui(&mut self, ui: &mut egui::Ui, project: &mut Project, now_ms: u64) -> bool {
-        let changed = {
+    /// Corps Markdown mis en forme pendant la frappe, avec suggestions de
+    /// liens et Ctrl+clic pour suivre un lien.
+    pub fn body_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        project: &mut Project,
+        now_ms: u64,
+        notices: &mut Notices,
+    ) -> BodyOutcome {
+        let mut outcome = BodyOutcome::default();
+        let te_id = egui::Id::unique(("body", self.id.as_str()));
+        let focused = ui.memory(|m| m.has_focus(te_id));
+
+        // 1. Touches de navigation, consommées avant le TextEdit.
+        if focused && self.popup.is_some() {
+            let nav = ui.input_mut(|i| {
+                use egui::{Key, Modifiers};
+                if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                    Some(Nav::Down)
+                } else if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                    Some(Nav::Up)
+                } else if i.consume_key(Modifiers::NONE, Key::Enter) {
+                    Some(Nav::Accept)
+                } else if i.consume_key(Modifiers::NONE, Key::Tab) {
+                    Some(Nav::AcceptThenType)
+                } else if i.consume_key(Modifiers::NONE, Key::Escape) {
+                    Some(Nav::Dismiss)
+                } else {
+                    None
+                }
+            });
+            if let Some(nav) = nav {
+                outcome.edited |= self.navigate(nav, project, now_ms, notices);
+            }
+        }
+
+        // 2. Position du curseur après une insertion.
+        if let Some(ci) = self.pending_cursor.take() {
+            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
+                let cursor = egui::text::CCursor::new(ci);
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(cursor)));
+                state.store(ui.ctx(), te_id);
+            }
+            ui.memory_mut(|m| m.request_focus(te_id));
+        }
+
+        // 3. Le texte.
+        let popup_open = self.popup.is_some();
+        let output = {
             let project_ref: &Project = project;
             let visuals = ui.visuals().clone();
             let highlighter = &mut self.highlighter;
@@ -302,36 +372,222 @@ impl Editor {
                 .id_salt("body_scroll")
                 .auto_shrink(false)
                 .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.body)
-                            .id_salt(("body", self.id.as_str()))
-                            .layouter(&mut layouter)
-                            .desired_width(f32::INFINITY)
-                            .min_size(ui.available_size())
-                            .frame(egui::Frame::NONE)
-                            .lock_focus(true)
-                            .hint_text("Écrivez ici… Markdown et liens [[Autre fiche]] acceptés."),
-                    )
-                    .changed()
+                    egui::TextEdit::multiline(&mut self.body)
+                        .id(te_id)
+                        .layouter(&mut layouter)
+                        .desired_width(f32::INFINITY)
+                        .min_size(ui.available_size())
+                        .frame(egui::Frame::NONE)
+                        // Tab indente ; Échap ferme les suggestions sans
+                        // faire perdre le focus quand elles sont ouvertes.
+                        .event_filter(egui::EventFilter {
+                            tab: true,
+                            horizontal_arrows: true,
+                            vertical_arrows: true,
+                            escape: popup_open,
+                        })
+                        .hint_text(
+                            "Écrivez ici… Markdown accepté. Tapez [[ pour lier une fiche, \
+                             Ctrl+clic sur un lien pour l'ouvrir.",
+                        )
+                        .show(ui)
                 })
                 .inner
         };
-        if !changed {
-            return false;
+
+        if output.response.changed() {
+            self.commit_body(project, EditKind::Typing, now_ms);
+            outcome.edited = true;
         }
+
+        // 4. Ctrl+clic sur un lien.
+        let cursor_byte = output
+            .cursor_range
+            .filter(|r| r.primary.index == r.secondary.index)
+            .map(|r| char_to_byte(&self.body, r.primary.index.0));
+        if output.response.clicked()
+            && ui.input(|i| i.modifiers.command)
+            && let Some(link) = cursor_byte.and_then(|b| markdown::wiki_link_at(&self.body, b))
+        {
+            outcome.open = match project.resolve_title(&link.target) {
+                Some(id) => Some(id.clone()),
+                None => match project.create_note(&link.target, Vec::new(), String::new()) {
+                    Ok(id) => {
+                        notices.info(format!("Fiche « {} » créée.", link.target));
+                        Some(id)
+                    }
+                    Err(e) => {
+                        notices.error(format!("Création impossible : {e}"));
+                        None
+                    }
+                },
+            };
+        }
+
+        // 5. Suggestions.
+        let has_focus = output.response.has_focus();
+        let pointer_on_popup = self
+            .popup_rect
+            .zip(ui.input(|i| i.pointer.hover_pos()))
+            .is_some_and(|(r, p)| r.contains(p));
+        if has_focus {
+            self.update_popup(project, cursor_byte, &output);
+        } else if !pointer_on_popup {
+            self.popup = None;
+        }
+
+        // 6. Fenêtre de suggestions (clic souris).
+        self.popup_rect = None;
+        if let Some(popup) = &self.popup {
+            let (clicked, rect) = popup.show(ui.ctx());
+            self.popup_rect = Some(rect);
+            if let Some(i) = clicked {
+                if let Some(p) = &mut self.popup {
+                    p.selected = i;
+                }
+                outcome.edited |= self.navigate(Nav::Accept, project, now_ms, notices);
+                ui.ctx().request_repaint();
+            }
+        }
+        outcome
+    }
+
+    /// Enregistre le tampon courant comme nouvel état (historique + projet).
+    fn commit_body(&mut self, project: &mut Project, kind: EditKind, now_ms: u64) {
         let old_body = std::mem::replace(&mut self.snap.body, self.body.clone());
         self.history.record(
             Snapshot {
                 meta: self.snap.meta.clone(),
                 body: old_body,
             },
-            EditKind::Typing,
+            kind,
             now_ms,
         );
         if let Err(e) = project.set_body(&self.id, self.body.clone()) {
             tracing::warn!("modification du texte : {e}");
         }
-        true
+    }
+
+    fn update_popup(
+        &mut self,
+        project: &Project,
+        cursor_byte: Option<usize>,
+        output: &egui::text_edit::TextEditOutput,
+    ) {
+        let context =
+            cursor_byte.and_then(|b| markdown::completion_at(&self.body, b).map(|c| (b, c)));
+        let Some((byte, context)) = context else {
+            self.popup = None;
+            self.dismissed = None;
+            return;
+        };
+        if self.dismissed == Some(context.start()) {
+            self.popup = None;
+            return;
+        }
+        self.dismissed = None;
+        // Suggestions recalculées seulement si la saisie ou le projet changent.
+        let generation = project.generation();
+        let items = match &self.popup {
+            Some(p) if p.context == context && p.generation == generation => p.items.clone(),
+            _ => completion::items_for(&context, project),
+        };
+        if items.is_empty() {
+            self.popup = None;
+            return;
+        }
+        let selected = match &self.popup {
+            Some(p) if p.context.start() == context.start() => p.selected.min(items.len() - 1),
+            _ => 0,
+        };
+        let anchor = output
+            .cursor_range
+            .map(|r| {
+                output.galley_pos
+                    + output
+                        .galley
+                        .pos_from_cursor(r.primary)
+                        .left_bottom()
+                        .to_vec2()
+            })
+            .unwrap_or(output.galley_pos);
+        self.popup = Some(Popup {
+            context,
+            cursor_byte: byte,
+            items,
+            selected,
+            anchor: anchor + egui::vec2(0.0, 2.0),
+            generation,
+        });
+    }
+
+    /// Applique une action de navigation ; renvoie `true` si le texte a changé.
+    fn navigate(
+        &mut self,
+        nav: Nav,
+        project: &mut Project,
+        now_ms: u64,
+        notices: &mut Notices,
+    ) -> bool {
+        let Some(popup) = &mut self.popup else {
+            return false;
+        };
+        let n = popup.items.len();
+        match nav {
+            Nav::Down => {
+                popup.selected = (popup.selected + 1) % n;
+                false
+            }
+            Nav::Up => {
+                popup.selected = (popup.selected + n - 1) % n;
+                false
+            }
+            Nav::Dismiss => {
+                self.dismissed = Some(popup.context.start());
+                self.popup = None;
+                false
+            }
+            Nav::Accept | Nav::AcceptThenType => {
+                let Some(popup) = self.popup.take() else {
+                    return false;
+                };
+                let Some(item) = popup.items.get(popup.selected) else {
+                    return false;
+                };
+                let choice = match &item.kind {
+                    ItemKind::Note(id) => match project.note(id) {
+                        Some(n) => n.meta.title.clone(),
+                        None => return false,
+                    },
+                    ItemKind::Create(title) => {
+                        match project.create_note(title, Vec::new(), String::new()) {
+                            Ok(_) => {
+                                notices.info(format!("Fiche « {title} » créée."));
+                                title.clone()
+                            }
+                            Err(e) => {
+                                notices.error(format!("Création impossible : {e}"));
+                                return false;
+                            }
+                        }
+                    }
+                    ItemKind::LinkType(id) => id.clone(),
+                };
+                let then_type = nav == Nav::AcceptThenType && !project.pack().link_types.is_empty();
+                let (text, cursor) = markdown::apply_completion(
+                    &self.body,
+                    popup.cursor_byte.min(self.body.len()),
+                    &popup.context,
+                    &choice,
+                    then_type,
+                );
+                self.body = text;
+                self.history.break_group();
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                self.pending_cursor = Some(self.body[..cursor].chars().count());
+                true
+            }
+        }
     }
 
     /// Panneau latéral : champs personnalisés du pack et informations.
@@ -437,6 +693,13 @@ impl Editor {
             None => false,
         }
     }
+}
+
+/// Convertit un index de caractère (egui) en position d'octet.
+fn char_to_byte(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(b, _)| b)
 }
 
 /// `Ok(None)` : champ vidé (à retirer) ; `Err` : valeur invalide.

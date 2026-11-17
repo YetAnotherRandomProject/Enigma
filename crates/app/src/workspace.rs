@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, KeyboardShortcut, Modifiers, RichText, Sense};
+use enigma_core::links::{LinkEnd, ResolvedLink};
 use enigma_core::project::FileChange;
 use enigma_core::{NoteId, Project};
 
@@ -207,13 +208,22 @@ impl Workspace {
                 .default_size(240.0)
                 .min_size(160.0)
                 .show(ui, |ui| {
-                    let edited = match &mut self.editor {
-                        Some(ed) => ed.fields_ui(ui, &mut self.project, now_ms),
-                        None => false,
-                    };
-                    if edited {
-                        self.mark_edited();
-                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("side_scroll")
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            let edited = match &mut self.editor {
+                                Some(ed) => ed.fields_ui(ui, &mut self.project, now_ms),
+                                None => false,
+                            };
+                            if edited {
+                                self.mark_edited();
+                            }
+                            ui.add_space(12.0);
+                            if let Some(target) = self.links_ui(ui, notices) {
+                                self.select(&target, notices);
+                            }
+                        });
                 });
         }
 
@@ -442,7 +452,7 @@ impl Workspace {
             return;
         };
 
-        let mut edited = editor.header_ui(ui, &mut self.project, now_ms, notices);
+        let edited = editor.header_ui(ui, &mut self.project, now_ms, notices);
 
         if self
             .project
@@ -477,10 +487,90 @@ impl Workspace {
         }
 
         ui.separator();
-        edited |= editor.body_ui(ui, &mut self.project, now_ms);
-        if edited {
+        let body = editor.body_ui(ui, &mut self.project, now_ms, notices);
+        if edited || body.edited {
             self.mark_edited();
         }
+        if let Some(target) = body.open {
+            self.select(&target, notices);
+        }
+    }
+
+    /// Panneau « Liens » : sortants, rétroliens et liens cassés de la fiche
+    /// ouverte. Renvoie la fiche à ouvrir si l'on a cliqué sur un lien.
+    fn links_ui(&mut self, ui: &mut egui::Ui, notices: &mut Notices) -> Option<NoteId> {
+        let id = self.editor.as_ref()?.id.clone();
+        let (broken, outgoing): (Vec<ResolvedLink>, Vec<ResolvedLink>) = self
+            .project
+            .outgoing_links(&id)
+            .into_iter()
+            .partition(|l| matches!(l.other, LinkEnd::Broken(_)));
+        let backlinks = self.project.backlinks(&id);
+        let mut open = None;
+        let mut create: Option<String> = None;
+
+        ui.heading("Liens");
+        let sections = [
+            ("Sortants", &outgoing, "»"),
+            ("Rétroliens", &backlinks, "«"),
+        ];
+        for (title, links, arrow) in sections {
+            egui::CollapsingHeader::new(format!("{title} ({})", links.len()))
+                .id_salt(title)
+                .default_open(true)
+                .show(ui, |ui| {
+                    if links.is_empty() {
+                        ui.weak("Aucun");
+                    }
+                    for link in links {
+                        if let Some(target) = link_row(ui, &self.project, link, arrow) {
+                            open = Some(target);
+                        }
+                    }
+                });
+        }
+        if !broken.is_empty() {
+            egui::CollapsingHeader::new(
+                RichText::new(format!("Cassés ({})", broken.len()))
+                    .color(ui.visuals().error_fg_color),
+            )
+            .id_salt("broken")
+            .default_open(true)
+            .show(ui, |ui| {
+                for link in &broken {
+                    let LinkEnd::Broken(target) = &link.other else {
+                        continue;
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        type_chip(ui, &self.project, link.kind.as_deref());
+                        ui.colored_label(ui.visuals().error_fg_color, target);
+                        let creatable = link.in_body && Project::validate_title(target).is_ok();
+                        if creatable {
+                            if ui
+                                .small_button("Créer")
+                                .on_hover_text("Créer cette fiche et l'ouvrir")
+                                .clicked()
+                            {
+                                create = Some(target.clone());
+                            }
+                        } else if link.in_meta {
+                            ui.weak("(identifiant inconnu dans l'en-tête)");
+                        }
+                    });
+                }
+            });
+        }
+
+        if let Some(title) = create {
+            match self.project.create_note(&title, Vec::new(), String::new()) {
+                Ok(new_id) => {
+                    notices.info(format!("Fiche « {title} » créée."));
+                    open = Some(new_id);
+                }
+                Err(e) => notices.error(format!("Création impossible : {e}")),
+            }
+        }
+        open
     }
 
     fn dialog_ui(&mut self, ctx: &egui::Context, notices: &mut Notices) {
@@ -583,6 +673,57 @@ impl Workspace {
             self.dialog = None;
         }
     }
+}
+
+/// Étiquette colorée du type de lien.
+fn type_chip(ui: &mut egui::Ui, project: &Project, kind: Option<&str>) {
+    let (label, color) = match kind {
+        None => ("lien".to_owned(), ui.visuals().weak_text_color()),
+        Some(k) => match project.pack().link_type(k) {
+            Some(t) => (t.label.clone(), c32(t.color)),
+            None => (format!("{k} ?"), ui.visuals().weak_text_color()),
+        },
+    };
+    ui.label(RichText::new(label).color(color).small());
+}
+
+/// Une ligne du panneau « Liens ». Renvoie la fiche cliquée.
+fn link_row(
+    ui: &mut egui::Ui,
+    project: &Project,
+    link: &ResolvedLink,
+    arrow: &str,
+) -> Option<NoteId> {
+    let LinkEnd::Note(target) = &link.other else {
+        return None;
+    };
+    let title = project
+        .note(target)
+        .map(|n| n.meta.title.clone())
+        .unwrap_or_default();
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        type_chip(ui, project, link.kind.as_deref());
+        ui.weak(arrow);
+        let mut resp = ui.link(title);
+        let mut hover = Vec::new();
+        if link.in_body {
+            hover.push("dans le texte".to_owned());
+        }
+        if link.in_meta {
+            hover.push("dans l'en-tête".to_owned());
+        }
+        if let Some(note) = &link.note {
+            hover.push(format!("note : {note}"));
+        }
+        if !hover.is_empty() {
+            resp = resp.on_hover_text(hover.join("\n"));
+        }
+        if resp.clicked() {
+            clicked = Some(target.clone());
+        }
+    });
+    clicked
 }
 
 /// Une ligne de la liste : pastilles de couleur des catégories et titre.
@@ -837,5 +978,116 @@ id: "
         }
         assert!(reloaded, "la modification externe n'a pas été rechargée");
         snapshot(&mut harness, "4_renomme_recharge");
+    }
+
+    fn body_text(harness: &Harness<'_, State>) -> String {
+        harness
+            .state()
+            .ws
+            .as_ref()
+            .and_then(|ws| ws.editor.as_ref())
+            .map(|e| e.body().to_owned())
+            .unwrap_or_default()
+    }
+
+    fn open_title(harness: &Harness<'_, State>) -> String {
+        let ws = harness.state().ws.as_ref().unwrap();
+        let id = &ws.editor.as_ref().unwrap().id;
+        ws.project.note(id).unwrap().meta.title.clone()
+    }
+
+    #[test]
+    fn link_completion_and_links_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        harness.get_by_label("Salle des Archives").click();
+        harness.run();
+        harness.get_by_role(Role::MultilineTextInput).focus();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
+        harness.run();
+
+        // [[cof → Tab : titre inséré, puis suggestions de type.
+        harness
+            .get_by_role(Role::MultilineTextInput)
+            .type_text("\nPiste : [[cof");
+        harness.run();
+        snapshot(&mut harness, "5_suggestions_titre");
+        harness.key_press(egui::Key::Tab);
+        harness.run();
+        assert!(
+            body_text(&harness).ends_with("[[Coffre du bureau|]]"),
+            "{}",
+            body_text(&harness)
+        );
+        harness
+            .get_by_role(Role::MultilineTextInput)
+            .type_text("ou");
+        harness.run();
+        snapshot(&mut harness, "6_suggestions_type");
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(
+            body_text(&harness).ends_with("Piste : [[Coffre du bureau|ouvre]]"),
+            "{}",
+            body_text(&harness)
+        );
+
+        // Création à la volée.
+        harness
+            .get_by_role(Role::MultilineTextInput)
+            .type_text(" et [[Nouvelle piste");
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(body_text(&harness).ends_with("et [[Nouvelle piste]]"));
+        assert!(
+            harness
+                .state()
+                .ws
+                .as_ref()
+                .unwrap()
+                .project
+                .resolve_title("Nouvelle piste")
+                .is_some()
+        );
+
+        // Échap ferme les suggestions sans rien insérer.
+        harness
+            .get_by_role(Role::MultilineTextInput)
+            .type_text(" [[maj");
+        harness.run();
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(body_text(&harness).ends_with(" [[maj"));
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(
+            body_text(&harness).ends_with(" [[maj\n"),
+            "Entrée normale après Échap : {:?}",
+            body_text(&harness)
+        );
+
+        // Panneau Liens : clic sur un lien sortant, puis rétrolien.
+        snapshot(&mut harness, "7_panneau_liens");
+        let is_link = |label: &'static str| {
+            move |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+                n.role() == Role::Link && n.label().as_deref() == Some(label)
+            }
+        };
+        // Deux relations vers le coffre (« ouvre » et « indique ») : deux lignes.
+        let coffre_links: Vec<_> = harness.get_all_by(is_link("Coffre du bureau")).collect();
+        assert_eq!(coffre_links.len(), 2);
+        coffre_links[0].click();
+        harness.run();
+        assert_eq!(open_title(&harness), "Coffre du bureau");
+        harness.get_by_label("Rétroliens (2)");
+        let back: Vec<_> = harness.get_all_by(is_link("Salle des Archives")).collect();
+        assert_eq!(back.len(), 2);
+        back[0].click();
+        harness.run();
+        assert_eq!(open_title(&harness), "Salle des Archives");
+        // Le lien cassé de la démo est listé.
+        harness.get_by_label("Cassés (1)");
     }
 }
