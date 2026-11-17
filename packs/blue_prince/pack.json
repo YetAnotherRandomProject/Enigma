@@ -5,7 +5,7 @@
   "description": "Manoir de 45 pièces : pièces, personnages, indices, objets et codes.",
   "categories": [
     { "id": "piece", "label": "Pièce", "color": "#4aa3ff", "icon": "🚪" },
-    { "id": "personnage", "label": "Personnage", "color": "#ff7a59", "icon": "🧑" },
+    { "id": "personnage", "label": "Personnage", "color": "#ff7a59", "icon": "👤" },
     { "id": "indice", "label": "Indice", "color": "#ffd23f", "icon": "🔎" },
     { "id": "objet", "label": "Objet", "color": "#6ee7a8", "icon": "🎒" },
     { "id": "code", "label": "Code / Énigme", "color": "#c084fc", "icon": "🔐" }

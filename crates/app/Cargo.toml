@@ -15,7 +15,7 @@ enigma-core.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 eframe.workspace = true
-notify.workspace = true
+egui.workspace = true
 notify-debouncer-full.workspace = true
 rfd.workspace = true
 serde.workspace = true
@@ -25,3 +25,7 @@ tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
+tempfile = "3.27.0"
