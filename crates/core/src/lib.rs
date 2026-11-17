@@ -6,11 +6,13 @@
 //! - [`project`] : un dossier de fiches chargé en mémoire, avec ses index.
 //! - [`history`] : pile annuler/refaire générique.
 //! - [`storage`] : écriture atomique et noms de fichiers sûrs.
+//! - [`container`] : fichier projet `.enigma` (format maison).
 //! - [`board`] : tableau d'enquête (cartes placées à la main).
 //! - [`shortcut`] : raccourcis clavier configurables.
 //! - [`fuzzy`] : recherche approximative (palette de commandes).
 
 pub mod board;
+pub mod container;
 pub mod filter;
 pub mod fuzzy;
 pub mod history;
