@@ -25,6 +25,7 @@ use enigma_graph::{
 
 use crate::colors::c32;
 use crate::filter_ui;
+use crate::graph_export::Svg;
 
 /// Nombre maximal d'étiquettes dessinées par image (2D).
 const MAX_LABELS: usize = 250;
@@ -1178,7 +1179,6 @@ impl GraphView {
     }
 
     /// Le dialogue de lien est-il ouvert ?
-    #[cfg(test)]
     pub fn link_dialog_open(&self) -> bool {
         self.link_dialog.is_some()
     }
@@ -1314,6 +1314,100 @@ impl GraphView {
         }
     }
 
+    /// Recadre la vue sur tout le graphe.
+    pub fn recenter(&mut self) {
+        self.auto_fit = true;
+    }
+
+    /// Zone du canevas lors de la dernière image.
+    pub fn canvas_rect(&self) -> Option<Rect> {
+        self.last_rect
+    }
+
+    /// Le graphe a-t-il été affiché (projection disponible) ?
+    pub fn has_frame(&self) -> bool {
+        !self.ids.is_empty() && self.proj.len() == self.ids.len()
+    }
+
+    /// Tout le graphe en SVG, avec la caméra de la dernière image (même
+    /// orientation en 3D) ; toutes les étiquettes sont incluses et rien
+    /// n'est estompé. `None` si le graphe n'a pas encore été affiché.
+    pub fn export_svg(&self, project: &Project, visuals: &egui::Visuals) -> Option<String> {
+        if !self.has_frame() {
+            return None;
+        }
+        let pack = project.pack();
+        let title = |i: usize| {
+            project
+                .note(&self.ids[i])
+                .map(|n| n.meta.title.clone())
+                .unwrap_or_default()
+        };
+        let mut bbox = Rect::NOTHING;
+        for &i in &self.order {
+            let Some(pr) = self.proj[i] else { continue };
+            let r = self.screen_radius(i, &pr);
+            let c = p(pr.screen);
+            bbox = bbox.union(Rect::from_center_size(c, egui::vec2(2.0 * r, 2.0 * r)));
+            let half = title(i).chars().count() as f32 * 3.4;
+            bbox = bbox.union(Rect::from_min_max(
+                Pos2::new(c.x - half, c.y),
+                Pos2::new(c.x + half, c.y + r + 3.0 + 16.0),
+            ));
+        }
+        let mut svg = Svg::new();
+        let xy = |q: Vec2| (q.x, q.y);
+        for e in &self.edges {
+            let (Some(pa), Some(pb)) = (self.proj[e.a], self.proj[e.b]) else {
+                continue;
+            };
+            let (a, b) = edge_points(e, pa.screen, pb.screen);
+            svg.line(xy(a), xy(b), 1.4, e.color);
+            if e.directed
+                && let Some(pts) = arrow_points(a, b, self.screen_radius(e.b, &pb), 1.4)
+            {
+                svg.polygon(&pts.map(xy), e.color);
+            }
+        }
+        for &i in &self.order {
+            let Some(pr) = self.proj[i] else { continue };
+            let Some(note) = project.note(&self.ids[i]) else {
+                continue;
+            };
+            let r = self.screen_radius(i, &pr);
+            let c = xy(pr.screen);
+            let colors: Vec<Color32> = note
+                .meta
+                .categories
+                .iter()
+                .map(|c| pack.category(c).map_or(Color32::GRAY, |d| c32(d.color)))
+                .collect();
+            if colors.is_empty() {
+                svg.circle(c, r, Some(Color32::from_gray(110)), None);
+            } else {
+                svg.pie(c, r, &colors);
+            }
+            let status = note
+                .meta
+                .status
+                .as_deref()
+                .and_then(|st| pack.status(st))
+                .map(|st| c32(st.color));
+            let border = match status {
+                Some(col) => ((r * 0.22).clamp(1.0, 3.5), col),
+                None => (1.0, visuals.weak_text_color()),
+            };
+            svg.circle(c, r, None, Some(border));
+            svg.text(
+                (c.0, c.1 + r + 3.0),
+                12.0,
+                visuals.text_color(),
+                &note.meta.title,
+            );
+        }
+        Some(svg.finish(bbox.expand(30.0), visuals.extreme_bg_color))
+    }
+
     /// Axe Z gradué (au centre de la disposition), derrière les nœuds.
     fn draw_z_axis(
         &self,
@@ -1428,6 +1522,19 @@ fn segment_crosses(rect: Rect, a: Vec2, b: Vec2) -> bool {
     bb.intersects(rect)
 }
 
+/// Triangle de la pointe de flèche (s'arrête au bord du nœud cible).
+fn arrow_points(from: Vec2, to: Vec2, target_radius: f32, width: f32) -> Option<[Vec2; 3]> {
+    let dir = (to - from).normalized();
+    if dir == Vec2::ZERO {
+        return None;
+    }
+    let size = 6.0 + width * 1.5;
+    let tip = to - dir * target_radius;
+    let base = tip - dir * size;
+    let side = dir.perp() * (size * 0.5);
+    Some([tip, base + side, base - side])
+}
+
 fn draw_arrow(
     painter: &egui::Painter,
     from: Vec2,
@@ -1436,19 +1543,13 @@ fn draw_arrow(
     color: Color32,
     width: f32,
 ) {
-    let dir = (to - from).normalized();
-    if dir == Vec2::ZERO {
-        return;
+    if let Some(pts) = arrow_points(from, to, target_radius, width) {
+        painter.add(Shape::convex_polygon(
+            pts.iter().map(|q| p(*q)).collect(),
+            color,
+            Stroke::NONE,
+        ));
     }
-    let size = 6.0 + width * 1.5;
-    let tip = to - dir * target_radius;
-    let base = tip - dir * size;
-    let side = dir.perp() * (size * 0.5);
-    painter.add(Shape::convex_polygon(
-        vec![p(tip), p(base + side), p(base - side)],
-        color,
-        Stroke::NONE,
-    ));
 }
 
 /// Disque découpé en parts égales, une par couleur.

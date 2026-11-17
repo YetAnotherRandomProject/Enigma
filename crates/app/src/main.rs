@@ -4,15 +4,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod board_view;
 mod colors;
+mod commands;
 mod completion;
 mod editor;
 mod filter_ui;
+mod graph_export;
 mod graph_view;
 mod highlight;
 mod notices;
 mod pack_editor;
+mod palette;
 mod paths;
+mod shortcuts_ui;
 mod watcher;
 mod workspace;
 

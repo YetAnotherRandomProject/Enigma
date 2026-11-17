@@ -4,10 +4,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use eframe::egui;
+use enigma_core::shortcut::Keymap;
 
+use crate::commands::{self, Command};
 use crate::notices::Notices;
 use crate::paths;
-use crate::workspace::Workspace;
+use crate::workspace::{AppRequest, Workspace};
 
 const RECENT_KEY: &str = "recent_projects";
 const MAX_RECENT: usize = 8;
@@ -18,6 +20,9 @@ pub struct EnigmaApp {
     notices: Notices,
     pack_roots: Vec<PathBuf>,
     start: Instant,
+    keymap: Keymap,
+    /// Fichier des raccourcis (`None` : illisible, donc jamais écrasé).
+    keymap_path: Option<PathBuf>,
 }
 
 impl EnigmaApp {
@@ -26,12 +31,26 @@ impl EnigmaApp {
             .storage
             .and_then(|s| eframe::get_value(s, RECENT_KEY))
             .unwrap_or_default();
+        let mut notices = Notices::default();
+        let keymap_path = paths::keymap_path();
+        let (keymap, keymap_path) = match keymap_path.as_deref().map(Keymap::load) {
+            Some(Ok(k)) => (k, keymap_path),
+            Some(Err(e)) => {
+                notices.error(format!(
+                    "Raccourcis : {e} (valeurs par défaut, fichier laissé intact)"
+                ));
+                (Keymap::default(), None)
+            }
+            None => (Keymap::default(), None),
+        };
         let mut app = EnigmaApp {
             recent,
             workspace: None,
-            notices: Notices::default(),
+            notices,
             pack_roots: paths::pack_roots(),
             start: Instant::now(),
+            keymap,
+            keymap_path,
         };
         // Dossier passé en argument (`enigma <dossier>`), sinon le dernier
         // projet ouvert s'il existe encore.
@@ -46,9 +65,12 @@ impl EnigmaApp {
     fn open_project(&mut self, root: PathBuf, ctx: &egui::Context) {
         if let Some(ws) = &mut self.workspace {
             ws.flush(&mut self.notices);
+            // Raccourcis éventuellement modifiés dans ce projet.
+            self.keymap = ws.keymap().clone();
         }
         match Workspace::open(&root, &self.pack_roots, ctx, &mut self.notices) {
-            Ok(ws) => {
+            Ok(mut ws) => {
+                ws.set_keymap(self.keymap.clone(), self.keymap_path.clone());
                 let name = root
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -98,6 +120,42 @@ impl EnigmaApp {
                     }
                 });
             });
+            let mut run = None;
+            ui.menu_button("Affichage", |ui| {
+                for cmd in [
+                    Command::ThemeLight,
+                    Command::ThemeDark,
+                    Command::ThemeSystem,
+                ] {
+                    if ui.button(cmd.label()).clicked() {
+                        run = Some(cmd);
+                        ui.close();
+                    }
+                }
+                if self.workspace.is_some() {
+                    ui.separator();
+                    for cmd in [Command::Palette, Command::Shortcuts] {
+                        let keys = self
+                            .workspace
+                            .as_ref()
+                            .map(|ws| cmd.bindings_text(ws.keymap()))
+                            .unwrap_or_default();
+                        if ui
+                            .add(egui::Button::new(cmd.label()).shortcut_text(keys))
+                            .clicked()
+                        {
+                            run = Some(cmd);
+                            ui.close();
+                        }
+                    }
+                }
+            });
+            if let Some(cmd) = run {
+                match &mut self.workspace {
+                    Some(ws) => ws.run_command(cmd, &ctx, &mut self.notices),
+                    None => commands::apply_theme(&ctx, cmd),
+                }
+            }
             if let Some(ws) = &mut self.workspace {
                 ui.separator();
                 ws.pack_selector_ui(ui, &mut self.notices);
@@ -152,10 +210,19 @@ impl eframe::App for EnigmaApp {
         if !self.notices.is_empty() {
             egui::Panel::bottom("notices").show(ui, |ui| self.notices.ui(ui));
         }
+        let mut requests = Vec::new();
         match &mut self.workspace {
-            Some(ws) => ws.ui(ui, &mut self.notices, now_ms),
+            Some(ws) => {
+                ws.ui(ui, &mut self.notices, now_ms);
+                requests = ws.take_requests();
+            }
             None => {
                 egui::CentralPanel::default_margins().show(ui, |ui| self.welcome(ui));
+            }
+        }
+        for req in requests {
+            match req {
+                AppRequest::OpenProject => self.pick_folder(&ui.ctx().clone()),
             }
         }
     }

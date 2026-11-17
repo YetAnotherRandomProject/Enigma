@@ -28,3 +28,10 @@ pub fn pack_roots() -> Vec<PathBuf> {
     roots.retain(|r| seen.insert(r.clone()));
     roots
 }
+
+/// Fichier des raccourcis clavier de l'utilisateur
+/// (ex. `%APPDATA%\\Enigma Notes\\config\\raccourcis.json`).
+pub fn keymap_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "Enigma Notes")
+        .map(|d| d.config_dir().join("raccourcis.json"))
+}

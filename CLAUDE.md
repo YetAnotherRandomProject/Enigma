@@ -144,6 +144,25 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
   avant la modification pour que Ctrl+Z l'annule. Début de glisser : utiliser
   `pointer.press_origin()` (egui signale le glisser après le seuil de
   déplacement, le pointeur a déjà bougé).
+- **Commandes** (`app/commands.rs`) : chaque action a un identifiant stable,
+  un libellé et des raccourcis par défaut ; raccourcis, palette (Ctrl+P),
+  menus et boutons passent par `Workspace::run_command`. Les raccourcis sont
+  consommés avant les widgets, les plus précis d'abord (`Ctrl+Maj+Z` avant
+  `Ctrl+Z`, qu'egui accepterait aussi). Changements de l'utilisateur dans
+  `<config>/Enigma Notes/config/raccourcis.json` (`enigma_core::shortcut`,
+  seulement les différences ; fichier illisible = jamais écrasé).
+- **Thème** : `ctx.set_theme` ; la préférence est mémorisée par egui
+  (persistance d'eframe). Les couleurs viennent de `ui.visuals()`.
+- **Export du graphe** : SVG vectoriel de tout le graphe avec la caméra
+  courante (`GraphView::export_svg`, `app/graph_export.rs`) ; PNG = capture
+  d'écran (`ctx.request_screenshot`, rappel) recadrée sur le canevas,
+  encodée avec `png` (déjà dans l'arbre via epaint).
+- **Tableau d'enquête** (`enigma_core::board`, `app/board_view.rs`) :
+  positions dans `.enigma/board.json`, indépendantes de `pos` (graphe).
+  Une carte de fiche supprimée est gardée mais masquée. Fichier illisible →
+  tableau non enregistré (jamais écrasé).
+- **Modales dans kittest** : attendre quelques images (`run_steps(10)`)
+  avant de cliquer, le temps que la fenêtre se cale.
 - **Tests kittest** : pas de temps fixé à 1/60 s (le défaut, 0,25 s, rend
   les double-clics impossibles) ; `run()` ne termine pas tant que la
   simulation tourne : utiliser `run_steps(n)`. Mesure de la vue graphe :
@@ -182,7 +201,7 @@ jalons suivants n'est codé avant validation.
 - [x] **5. Graphe 3D** — caméra orbitale, perspective, billboards, mêmes
   filtres, bascule 2D/3D, axe Z optionnel sur un champ, 60 FPS à 2000 nœuds /
   5000 liens (proposer wgpu custom avant de migrer).
-- [ ] **6. Liens à la souris** — tirer un fil, choisir le type, note, éditer /
+- [x] **6. Liens à la souris** — tirer un fil, choisir le type, note, éditer /
   supprimer depuis le graphe.
 - [ ] **7. Confort** — palette Ctrl+P, raccourcis configurables, thèmes,
   export image, tableau d'enquête libre.

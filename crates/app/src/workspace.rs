@@ -4,37 +4,51 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, KeyboardShortcut, Modifiers, RichText, Sense};
+use eframe::egui::{self, Color32, RichText, Sense};
+use enigma_core::board::{BOARD_FILE, Board};
 use enigma_core::filter::NoteFilter;
 use enigma_core::links::{LinkEnd, ResolvedLink};
 use enigma_core::project::FileChange;
+use enigma_core::shortcut::Keymap;
 use enigma_core::{NoteId, Project};
 
+use crate::board_view::BoardView;
 use crate::colors::c32;
+use crate::commands::{self, Command};
 use crate::editor::Editor;
 use crate::filter_ui;
 use crate::graph_view::{GraphOutcome, GraphView, LinkOp};
 use crate::notices::Notices;
 use crate::pack_editor::{self, PackEditor};
+use crate::palette::{Palette, PaletteItem, PaletteOutcome};
+use crate::shortcuts_ui::ShortcutEditor;
 use crate::watcher::FsWatcher;
 
 /// Délai après la dernière modification avant la sauvegarde automatique.
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(1000);
 
-const UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Z);
-const REDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Y);
-const REDO_SHIFT: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), egui::Key::Z);
-const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::S);
-const NEW_NOTE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::N);
-const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::F);
-const TOGGLE_GRAPH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::G);
+/// Capture d'écran reçue (remplie par le rappel d'egui).
+type ScreenshotSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<egui::ColorImage>>>>;
+
+/// Export PNG en cours : fichier visé et capture demandée.
+struct PendingPng {
+    path: PathBuf,
+    slot: Option<ScreenshotSlot>,
+}
+
+/// Demande adressée à l'application (hors du projet ouvert).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppRequest {
+    /// Choisir et ouvrir un autre dossier de projet.
+    OpenProject,
+}
 
 /// Vue de la zone centrale.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
     Note,
     Graph,
+    Board,
 }
 
 enum Dialog {
@@ -70,6 +84,18 @@ pub struct Workspace {
     graph: GraphView,
     /// Dossier des packs de l'utilisateur (pour tous les projets).
     user_packs_dir: Option<PathBuf>,
+    keymap: Keymap,
+    /// Fichier des raccourcis (`None` : non enregistrés).
+    keymap_path: Option<PathBuf>,
+    palette: Option<Palette>,
+    shortcut_editor: Option<ShortcutEditor>,
+    board: Board,
+    /// Le fichier du tableau est illisible : on ne l'écrase pas.
+    board_broken: bool,
+    board_view: BoardView,
+    /// Export PNG en attente de la capture d'écran.
+    pending_png: Option<PendingPng>,
+    requests: Vec<AppRequest>,
 }
 
 impl Workspace {
@@ -98,6 +124,17 @@ impl Workspace {
                 project.issues().len()
             ));
         }
+        let board_path = project
+            .root()
+            .join(enigma_core::project::META_DIR)
+            .join(BOARD_FILE);
+        let (board, board_broken) = match Board::load(&board_path) {
+            Ok(b) => (b, false),
+            Err(e) => {
+                notices.error(format!("{e} (le tableau ne sera pas enregistré)"));
+                (Board::default(), true)
+            }
+        };
         let mut ws = Workspace {
             project,
             watcher,
@@ -113,6 +150,15 @@ impl Workspace {
             view: View::Note,
             graph: GraphView::default(),
             user_packs_dir: pack_roots.first().cloned(),
+            keymap: Keymap::default(),
+            keymap_path: None,
+            palette: None,
+            shortcut_editor: None,
+            board,
+            board_broken,
+            board_view: BoardView::default(),
+            pending_png: None,
+            requests: Vec::new(),
         };
         ws.refresh_packs();
         Ok(ws)
@@ -120,6 +166,231 @@ impl Workspace {
 
     pub fn root(&self) -> &Path {
         self.project.root()
+    }
+
+    /// Raccourcis de l'utilisateur et fichier où les enregistrer.
+    pub fn set_keymap(&mut self, keymap: Keymap, path: Option<PathBuf>) {
+        self.keymap = keymap;
+        self.keymap_path = path;
+    }
+
+    /// Demandes à traiter par l'application.
+    pub fn take_requests(&mut self) -> Vec<AppRequest> {
+        std::mem::take(&mut self.requests)
+    }
+
+    fn board_path(&self) -> PathBuf {
+        self.project
+            .root()
+            .join(enigma_core::project::META_DIR)
+            .join(BOARD_FILE)
+    }
+
+    fn save_board(&mut self, notices: &mut Notices) {
+        if self.board_broken {
+            notices.error(
+                "Le fichier du tableau d'enquête est illisible : modifications non enregistrées.",
+            );
+            return;
+        }
+        if let Err(e) = self.board.save(&self.board_path()) {
+            notices.error(e.to_string());
+        }
+    }
+
+    /// Une commande est-elle utilisable maintenant ?
+    fn command_available(&self, cmd: Command) -> bool {
+        match cmd {
+            Command::AddToBoard => self
+                .editor
+                .as_ref()
+                .is_some_and(|e| !self.board.contains(&e.id)),
+            Command::RemoveFromBoard => self
+                .editor
+                .as_ref()
+                .is_some_and(|e| self.board.contains(&e.id)),
+            Command::DeleteNote | Command::Undo | Command::Redo => self.editor.is_some(),
+            Command::EditPack => !self.project.pack().id.is_empty(),
+            _ => true,
+        }
+    }
+
+    /// Exécute une commande (raccourci, palette ou menu).
+    pub fn run_command(&mut self, cmd: Command, ctx: &egui::Context, notices: &mut Notices) {
+        match cmd {
+            Command::Palette => {
+                self.palette = match self.palette {
+                    Some(_) => None,
+                    None => Some(Palette::default()),
+                };
+            }
+            Command::NewNote => self.open_new_note_dialog(),
+            Command::Save => self.flush(notices),
+            Command::Undo | Command::Redo => {
+                if let Some(ed) = &mut self.editor {
+                    let changed = if cmd == Command::Undo {
+                        ed.undo(&mut self.project)
+                    } else {
+                        ed.redo(&mut self.project)
+                    };
+                    if changed {
+                        self.mark_edited();
+                    }
+                }
+            }
+            Command::Find => {
+                self.view = View::Note;
+                self.focus_search = true;
+            }
+            Command::ShowNote => self.view = View::Note,
+            Command::ShowGraph => self.view = View::Graph,
+            Command::ShowBoard => self.view = View::Board,
+            Command::ToggleGraph => {
+                self.view = match self.view {
+                    View::Graph => View::Note,
+                    View::Note | View::Board => View::Graph,
+                };
+            }
+            Command::Graph2D | Command::Graph3D => {
+                self.view = View::Graph;
+                self.graph.set_mode(if cmd == Command::Graph2D {
+                    crate::graph_view::Mode::Flat
+                } else {
+                    crate::graph_view::Mode::Space
+                });
+            }
+            Command::GraphRecenter => {
+                self.view = View::Graph;
+                self.graph.recenter();
+            }
+            Command::ExportSvg => self.export_svg(ctx, notices),
+            Command::ExportPng => self.export_png(notices),
+            Command::AddToBoard => {
+                if let Some(id) = self.editor.as_ref().map(|e| e.id.clone())
+                    && self.board_view.add_card(&mut self.board, &id)
+                {
+                    self.save_board(notices);
+                    self.view = View::Board;
+                }
+            }
+            Command::RemoveFromBoard => {
+                if let Some(id) = self.editor.as_ref().map(|e| e.id.clone())
+                    && self.board.remove(&id)
+                {
+                    self.save_board(notices);
+                }
+            }
+            Command::ToggleTheme
+            | Command::ThemeDark
+            | Command::ThemeLight
+            | Command::ThemeSystem => commands::apply_theme(ctx, cmd),
+            Command::Shortcuts => self.shortcut_editor = Some(ShortcutEditor::default()),
+            Command::EditPack => {
+                if !self.project.pack().id.is_empty() {
+                    self.pack_editor = Some(PackEditor::edit_current(
+                        &self.project,
+                        self.user_packs_dir.as_deref(),
+                    ));
+                }
+            }
+            Command::OpenProject => self.requests.push(AppRequest::OpenProject),
+            Command::DeleteNote => {
+                if let Some(ed) = &self.editor {
+                    self.dialog = Some(Dialog::ConfirmDelete(ed.id.clone()));
+                }
+            }
+        }
+    }
+
+    /// Écrit le graphe en SVG dans `path`.
+    fn write_svg(&mut self, ctx: &egui::Context, path: &Path) -> Result<(), String> {
+        let visuals = ctx.global_style().visuals.clone();
+        let svg = self
+            .graph
+            .export_svg(&self.project, &visuals)
+            .ok_or_else(|| {
+                "affichez d'abord le graphe (il est vide ou pas encore dessiné)".to_owned()
+            })?;
+        enigma_core::storage::write_atomic(path, svg.as_bytes()).map_err(|e| e.to_string())
+    }
+
+    fn export_svg(&mut self, ctx: &egui::Context, notices: &mut Notices) {
+        if !self.graph.has_frame() {
+            self.view = View::Graph;
+            notices.info("Le graphe est maintenant affiché : relancez l'export.");
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Exporter le graphe en SVG")
+            .add_filter("Image SVG", &["svg"])
+            .set_file_name("graphe.svg")
+            .save_file()
+        else {
+            return;
+        };
+        match self.write_svg(ctx, &path) {
+            Ok(()) => notices.info(format!("Graphe exporté : {}", path.display())),
+            Err(e) => notices.error(format!("Export impossible : {e}")),
+        }
+    }
+
+    fn export_png(&mut self, notices: &mut Notices) {
+        self.view = View::Graph;
+        if !self.graph.has_frame() {
+            notices.info("Le graphe est maintenant affiché : relancez l'export.");
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Exporter le graphe en PNG")
+            .add_filter("Image PNG", &["png"])
+            .set_file_name("graphe.png")
+            .save_file()
+        {
+            // La capture est demandée après la prochaine image (palette fermée).
+            self.pending_png = Some(PendingPng { path, slot: None });
+        }
+    }
+
+    /// Reçoit la capture d'écran demandée pour l'export PNG.
+    fn handle_screenshot(&mut self, ctx: &egui::Context, notices: &mut Notices) {
+        let Some(pending) = &mut self.pending_png else {
+            return;
+        };
+        let Some(slot) = &pending.slot else {
+            // Première image après la commande : la palette est fermée, on
+            // demande la capture de ce qui est affiché.
+            let slot = ScreenshotSlot::default();
+            let (target, repaint) = (slot.clone(), ctx.clone());
+            ctx.request_screenshot(move |image| {
+                if let Ok(mut s) = target.lock() {
+                    *s = Some(image);
+                }
+                repaint.request_repaint();
+            });
+            pending.slot = Some(slot);
+            return;
+        };
+        let image = slot.lock().ok().and_then(|mut s| s.take());
+        let Some(image) = image else {
+            return;
+        };
+        let path = pending.path.clone();
+        self.pending_png = None;
+        let Some(rect) = self.graph.canvas_rect() else {
+            return;
+        };
+        let ppp = ctx.pixels_per_point();
+        let px = egui::Rect::from_min_max(
+            (rect.min.to_vec2() * ppp).to_pos2(),
+            (rect.max.to_vec2() * ppp).to_pos2(),
+        );
+        let result = crate::graph_export::encode_png_region(&image, px).and_then(|bytes| {
+            enigma_core::storage::write_atomic(&path, &bytes).map_err(|e| e.to_string())
+        });
+        match result {
+            Ok(()) => notices.info(format!("Graphe exporté : {}", path.display())),
+            Err(e) => notices.error(format!("Export PNG impossible : {e}")),
+        }
     }
 
     /// Enregistre toutes les modifications en attente.
@@ -241,8 +512,21 @@ impl Workspace {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, notices: &mut Notices, now_ms: u64) {
         self.process_fs_events(notices, now_ms);
-        if self.dialog.is_none() && self.pack_editor.is_none() {
-            self.handle_shortcuts(ui.ctx(), notices);
+        self.handle_screenshot(&ui.ctx().clone(), notices);
+        let modal_open = self.dialog.is_some()
+            || self.pack_editor.is_some()
+            || self.shortcut_editor.is_some()
+            || self.graph.link_dialog_open();
+        if !modal_open {
+            // Les raccourcis sont consommés avant les widgets : l'historique
+            // interne du TextEdit d'egui n'est donc jamais utilisé.
+            let ctx = ui.ctx().clone();
+            for cmd in commands::consume_shortcuts(&ctx, &self.keymap) {
+                // Palette ouverte : seul son propre raccourci (fermer) agit.
+                if self.palette.is_none() || cmd == Command::Palette {
+                    self.run_command(cmd, &ctx, notices);
+                }
+            }
         }
         self.autosave(ui.ctx(), notices);
 
@@ -254,7 +538,7 @@ impl Workspace {
 
         // En vue graphe, le panneau reste affiché même sans sélection : sinon
         // sélectionner un nœud redimensionnerait le canevas sous le curseur.
-        if self.editor.is_some() || self.view == View::Graph {
+        if self.editor.is_some() || self.view != View::Note {
             egui::Panel::right("fields")
                 .resizable(true)
                 .default_size(240.0)
@@ -267,9 +551,16 @@ impl Workspace {
                             let edited = match &mut self.editor {
                                 Some(ed) => ed.fields_ui(ui, &mut self.project, now_ms),
                                 None => {
-                                    ui.weak(
-                                        "Cliquez sur un nœud pour afficher sa fiche ici ;                                          double-cliquez pour l'ouvrir dans l'éditeur.",
-                                    );
+                                    ui.weak(match self.view {
+                                        View::Board => {
+                                            "Cliquez sur une carte pour afficher sa fiche ici ; \
+                                             double-cliquez pour l'ouvrir dans l'éditeur."
+                                        }
+                                        _ => {
+                                            "Cliquez sur un nœud pour afficher sa fiche ici ; \
+                                             double-cliquez pour l'ouvrir dans l'éditeur."
+                                        }
+                                    });
                                     false
                                 }
                             };
@@ -287,6 +578,8 @@ impl Workspace {
         egui::CentralPanel::default_margins().show(ui, |ui| self.central_ui(ui, notices, now_ms));
 
         self.dialog_ui(ui.ctx(), notices);
+        self.palette_ui(ui.ctx(), notices);
+        self.shortcut_editor_ui(ui.ctx(), notices);
 
         if let Some(editor) = &mut self.pack_editor {
             match editor.show(ui.ctx(), &mut self.project, notices) {
@@ -346,45 +639,6 @@ impl Workspace {
         }
     }
 
-    fn handle_shortcuts(&mut self, ctx: &egui::Context, notices: &mut Notices) {
-        // Les raccourcis sont consommés avant les widgets : l'historique
-        // interne du TextEdit d'egui n'est donc jamais utilisé.
-        let (redo, undo, save, new_note, find, toggle_graph) = ctx.input_mut(|i| {
-            let redo = i.consume_shortcut(&REDO_SHIFT) || i.consume_shortcut(&REDO);
-            let undo = i.consume_shortcut(&UNDO);
-            (
-                redo,
-                undo,
-                i.consume_shortcut(&SAVE),
-                i.consume_shortcut(&NEW_NOTE),
-                i.consume_shortcut(&FIND),
-                i.consume_shortcut(&TOGGLE_GRAPH),
-            )
-        });
-        if toggle_graph {
-            self.view = match self.view {
-                View::Note => View::Graph,
-                View::Graph => View::Note,
-            };
-        }
-        if let Some(ed) = &mut self.editor {
-            let changed =
-                (undo && ed.undo(&mut self.project)) || (redo && ed.redo(&mut self.project));
-            if changed {
-                self.mark_edited();
-            }
-        }
-        if save {
-            self.flush(notices);
-        }
-        if new_note {
-            self.open_new_note_dialog();
-        }
-        if find {
-            self.focus_search = true;
-        }
-    }
-
     fn autosave(&mut self, ctx: &egui::Context, notices: &mut Notices) {
         let Some(t) = self.last_edit else {
             return;
@@ -395,6 +649,62 @@ impl Workspace {
         } else {
             ctx.request_repaint_after(AUTOSAVE_DELAY - elapsed);
         }
+    }
+
+    fn palette_ui(&mut self, ctx: &egui::Context, notices: &mut Notices) {
+        let Some(mut palette) = self.palette.take() else {
+            return;
+        };
+        let outcome = palette.show(ctx, &self.project, &self.keymap, |c| {
+            self.command_available(c)
+        });
+        match outcome {
+            PaletteOutcome::Open => self.palette = Some(palette),
+            PaletteOutcome::Closed => {}
+            PaletteOutcome::Run(PaletteItem::Command(cmd)) => self.run_command(cmd, ctx, notices),
+            PaletteOutcome::Run(PaletteItem::Note(id)) => {
+                self.select(&id, notices);
+                if self.view != View::Board {
+                    self.view = View::Note;
+                }
+            }
+        }
+    }
+
+    fn shortcut_editor_ui(&mut self, ctx: &egui::Context, notices: &mut Notices) {
+        let Some(editor) = &mut self.shortcut_editor else {
+            return;
+        };
+        let file = self.keymap_path.as_ref().map(|p| p.display().to_string());
+        let out = editor.show(ctx, &mut self.keymap, file.as_deref());
+        if out.changed
+            && let Some(path) = &self.keymap_path
+            && let Err(e) = self.keymap.save(path)
+        {
+            notices.error(format!("Raccourcis non enregistrés : {e}"));
+        }
+        if !out.open {
+            self.shortcut_editor = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn board(&self) -> &Board {
+        &self.board
+    }
+
+    #[cfg(test)]
+    pub fn board_view(&self) -> &BoardView {
+        &self.board_view
+    }
+
+    #[cfg(test)]
+    pub fn palette_open(&self) -> bool {
+        self.palette.is_some()
+    }
+
+    pub fn keymap(&self) -> &Keymap {
+        &self.keymap
     }
 
     fn open_new_note_dialog(&mut self) {
@@ -551,13 +861,64 @@ impl Workspace {
     }
 
     fn central_ui(&mut self, ui: &mut egui::Ui, notices: &mut Notices, now_ms: u64) {
+        let hint = |cmd: Command| {
+            let keys = cmd.bindings_text(&self.keymap);
+            if keys.is_empty() {
+                String::new()
+            } else {
+                format!(" ({keys})")
+            }
+        };
+        let (h_graph, h_board, h_palette) = (
+            hint(Command::ToggleGraph),
+            hint(Command::ShowBoard),
+            hint(Command::Palette),
+        );
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.view, View::Note, "Fiche")
-                .on_hover_text("Éditeur de la fiche (Ctrl+G pour basculer)");
+                .on_hover_text("Éditeur de la fiche");
             ui.selectable_value(&mut self.view, View::Graph, "Graphe")
-                .on_hover_text("Graphe des fiches (Ctrl+G pour basculer)");
+                .on_hover_text(format!("Graphe des fiches{h_graph}"));
+            ui.selectable_value(&mut self.view, View::Board, "Tableau")
+                .on_hover_text(format!(
+                    "Tableau d'enquête : fiches posées à la main{h_board}"
+                ));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("Commandes")
+                    .on_hover_text(format!("Palette de commandes{h_palette}"))
+                    .clicked()
+                {
+                    self.palette = Some(Palette::default());
+                }
+            });
         });
         ui.separator();
+        if self.view == View::Board {
+            let selected = self.editor.as_ref().map(|e| e.id.clone());
+            let out = self.board_view.ui(
+                ui,
+                &self.project,
+                &mut self.board,
+                selected.as_ref(),
+                &self.list,
+            );
+            if out.changed {
+                self.save_board(notices);
+            }
+            if let Some(id) = out.select {
+                self.select(&id, notices);
+            }
+            if let Some(id) = out.open_editor {
+                self.select(&id, notices);
+                self.view = View::Note;
+            }
+            if out.deselect {
+                self.flush(notices);
+                self.editor = None;
+            }
+            return;
+        }
         if self.view == View::Graph {
             let selected = self.editor.as_ref().map(|e| e.id.clone());
             let outcome = self.graph.ui(ui, &self.project, selected.as_ref());
@@ -1827,6 +2188,232 @@ id: "
         let saved = ws.project.note(&id).unwrap().meta.pos.unwrap();
         let world = ws.graph.world_pos(&id).unwrap();
         assert!((saved.z - world.z).abs() < 1e-3 && saved.z != 0.0);
+    }
+
+    fn palette_input(harness: &mut Harness<'_, State>, text: &str) {
+        const HINT: &str = "Commande ou titre de fiche…";
+        harness
+            .get_by(|n| n.role() == Role::TextInput && n.placeholder() == Some(HINT))
+            .focus();
+        harness.run_steps(1);
+        harness
+            .get_by(|n| n.role() == Role::TextInput && n.placeholder() == Some(HINT))
+            .type_text(text);
+        harness.run_steps(2);
+    }
+
+    #[test]
+    fn palette_runs_commands_and_opens_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::P);
+        harness.run_steps(2);
+        assert!(harness.state().ws.as_ref().unwrap().palette_open());
+        palette_input(&mut harness, "majord");
+        snapshot(&mut harness, "16_palette");
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(2);
+        {
+            let ws = harness.state().ws.as_ref().unwrap();
+            assert!(!ws.palette_open());
+            assert_eq!(
+                ws.editor.as_ref().map(|e| e.id.clone()),
+                ws.project.resolve_title("Majordome").cloned()
+            );
+        }
+        // Commande : graphe en 3D (choisie aux flèches).
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::P);
+        harness.run_steps(2);
+        palette_input(&mut harness, "graphe 3d");
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(2);
+        let ws = harness.state().ws.as_ref().unwrap();
+        assert_eq!(ws.view, View::Graph);
+        assert_eq!(ws.graph.mode, crate::graph_view::Mode::Space);
+        // Échap ferme sans rien faire.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::P);
+        harness.run_steps(2);
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(2);
+        assert!(!harness.state().ws.as_ref().unwrap().palette_open());
+    }
+
+    #[test]
+    fn shortcuts_are_configurable_and_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        let keymap_file = cfg.path().join("raccourcis.json");
+        let mut harness = setup(dir.path());
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            ws.set_keymap(Keymap::default(), Some(keymap_file.clone()));
+            let ctx = egui::Context::default();
+            ws.run_command(Command::Shortcuts, &ctx, &mut state.notices);
+        }
+        harness.run_steps(10);
+        snapshot(&mut harness, "17_raccourcis");
+        let row = Command::ALL
+            .iter()
+            .position(|c| *c == Command::ToggleGraph)
+            .unwrap();
+        harness
+            .get_all_by_label("Modifier")
+            .nth(row)
+            .unwrap()
+            .click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+        harness.run_steps(2);
+        assert_eq!(
+            Command::ToggleGraph.bindings_text(harness.state().ws.as_ref().unwrap().keymap()),
+            "Ctrl+K"
+        );
+        let saved = Keymap::load(&keymap_file).unwrap();
+        assert_eq!(
+            Command::ToggleGraph.bindings(&saved),
+            ["Ctrl+K".parse().unwrap()]
+        );
+        harness.get_by_label("Fermer").click();
+        harness.run_steps(2);
+        // L'ancien raccourci ne fait plus rien, le nouveau bascule.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::G);
+        harness.run_steps(2);
+        assert_eq!(harness.state().ws.as_ref().unwrap().view, View::Note);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+        harness.run_steps(2);
+        assert_eq!(harness.state().ws.as_ref().unwrap().view, View::Graph);
+    }
+
+    #[test]
+    fn theme_toggle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        let dark = harness.ctx.global_style().visuals.dark_mode;
+        harness.key_press_modifiers(
+            egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+            egui::Key::L,
+        );
+        harness.run_steps(3);
+        assert_ne!(harness.ctx.global_style().visuals.dark_mode, dark);
+        harness.state_mut().ws.as_mut().unwrap().view = View::Graph;
+        harness.run_steps(400);
+        snapshot(&mut harness, "18_theme_clair_graphe");
+    }
+
+    #[test]
+    fn board_add_move_remove_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::T);
+        harness.run_steps(2);
+        assert_eq!(harness.state().ws.as_ref().unwrap().view, View::Board);
+        harness
+            .get_by_label("Ajouter les fiches de la liste (3)")
+            .click();
+        harness.run_steps(3);
+        let board_file = dir
+            .path()
+            .join(".enigma")
+            .join(enigma_core::board::BOARD_FILE);
+        assert_eq!(Board::load(&board_file).unwrap().cards.len(), 3);
+        snapshot(&mut harness, "19_tableau");
+
+        // Glisser une carte : position enregistrée, carte sélectionnée.
+        let coffre = note_id(&harness, "Coffre du bureau");
+        let card = |h: &Harness<'_, State>| {
+            let ws = h.state().ws.as_ref().unwrap();
+            ws.board_view().card_center(ws.board(), &coffre).unwrap()
+        };
+        let before = Board::load(&board_file)
+            .unwrap()
+            .card(&coffre)
+            .unwrap()
+            .clone();
+        let from = card(&harness);
+        let to = from + egui::vec2(80.0, 140.0);
+        harness.hover_at(from);
+        harness.run_steps(1);
+        harness.drag_at(from);
+        harness.run_steps(1);
+        for k in 1..=6 {
+            harness.hover_at(from + (to - from) * (k as f32 / 6.0));
+            harness.run_steps(1);
+        }
+        harness.drop_at(to);
+        harness.run_steps(3);
+        let after = Board::load(&board_file)
+            .unwrap()
+            .card(&coffre)
+            .unwrap()
+            .clone();
+        assert!(after.y > before.y + 10.0, "{before:?} -> {after:?}");
+        assert!((card(&harness) - to).length() < 2.0);
+        assert_eq!(
+            harness
+                .state()
+                .ws
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .map(|e| &e.id),
+            Some(&coffre)
+        );
+
+        // Clic droit : retirer du tableau.
+        let at = card(&harness);
+        harness.hover_at(at);
+        harness.run_steps(1);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run_steps(3);
+        harness.get_by_label("Retirer du tableau").click();
+        harness.run_steps(3);
+        let saved = Board::load(&board_file).unwrap();
+        assert_eq!(saved.cards.len(), 2);
+        assert!(!saved.contains(&coffre));
+
+        // Commande « Ajouter la fiche au tableau » (fiche sélectionnée).
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            let ctx = egui::Context::default();
+            assert!(ws.command_available(Command::AddToBoard));
+            ws.run_command(Command::AddToBoard, &ctx, &mut state.notices);
+        }
+        assert!(Board::load(&board_file).unwrap().contains(&coffre));
+    }
+
+    #[test]
+    fn graph_svg_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        harness.state_mut().ws.as_mut().unwrap().view = View::Graph;
+        harness.run_steps(300);
+        let out = dir.path().join("export").join("graphe.svg");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        let ctx = harness.ctx.clone();
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .write_svg(&ctx, &out)
+            .unwrap();
+        let svg = std::fs::read_to_string(&out).unwrap();
+        assert!(svg.starts_with("<?xml"));
+        for title in ["Coffre du bureau", "Majordome", "Salle des Archives"] {
+            assert!(svg.contains(title), "{title}");
+        }
+        assert_eq!(svg.matches("<line").count(), 4, "4 liens");
+        assert!(svg.contains("<path"), "secteurs des catégories");
     }
 
     /// Mesure (ignorée par défaut) : coût d'une image de la vue graphe avec
