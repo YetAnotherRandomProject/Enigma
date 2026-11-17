@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, KeyboardShortcut, Modifiers, RichText, Sense};
+use enigma_core::filter::{CategoryMode, NoteFilter};
 use enigma_core::links::{LinkEnd, ResolvedLink};
 use enigma_core::project::FileChange;
 use enigma_core::{NoteId, Project};
@@ -12,6 +13,7 @@ use enigma_core::{NoteId, Project};
 use crate::colors::c32;
 use crate::editor::Editor;
 use crate::notices::Notices;
+use crate::pack_editor::{self, PackEditor};
 use crate::watcher::FsWatcher;
 
 /// Délai après la dernière modification avant la sauvegarde automatique.
@@ -28,6 +30,8 @@ const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::K
 enum Dialog {
     NewNote {
         title: String,
+        /// Identifiant du modèle du pack (`None` : fiche vide).
+        template: Option<String>,
         error: Option<String>,
         focus: bool,
     },
@@ -44,13 +48,16 @@ pub struct Workspace {
     pub project: Project,
     watcher: Option<FsWatcher>,
     packs: Vec<PackChoice>,
-    search: String,
+    filter: NoteFilter,
     list: Vec<NoteId>,
-    list_key: Option<(String, u64)>,
+    list_key: Option<(NoteFilter, u64, u64)>,
     editor: Option<Editor>,
     dialog: Option<Dialog>,
     last_edit: Option<Instant>,
     focus_search: bool,
+    pack_editor: Option<PackEditor>,
+    /// Dossier des packs de l'utilisateur (pour tous les projets).
+    user_packs_dir: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -83,13 +90,15 @@ impl Workspace {
             project,
             watcher,
             packs: Vec::new(),
-            search: String::new(),
+            filter: NoteFilter::default(),
             list: Vec::new(),
             list_key: None,
             editor: None,
             dialog: None,
             last_edit: None,
             focus_search: false,
+            pack_editor: None,
+            user_packs_dir: pack_roots.first().cloned(),
         };
         ws.refresh_packs();
         Ok(ws)
@@ -152,6 +161,7 @@ impl Workspace {
         };
         let mut chosen: Option<Option<String>> = None;
         let mut refresh = false;
+        let mut new_pack: Option<bool> = None;
         egui::ComboBox::new("pack", "")
             .selected_text(format!("Pack : {label}"))
             .show_ui(ui, |ui| {
@@ -168,10 +178,36 @@ impl Workspace {
                     }
                 }
                 ui.separator();
+                if ui.button("Nouveau pack vide…").clicked() {
+                    new_pack = Some(false);
+                }
+                if !self.project.pack().id.is_empty()
+                    && ui.button("Nouveau pack à partir de l'actuel…").clicked()
+                {
+                    new_pack = Some(true);
+                }
                 if ui.button("Actualiser la liste").clicked() {
                     refresh = true;
                 }
             });
+        if !self.project.pack().id.is_empty()
+            && ui
+                .button("Modifier le pack…")
+                .on_hover_text("Catégories, types de liens, statuts, champs et modèles")
+                .clicked()
+        {
+            self.pack_editor = Some(PackEditor::edit_current(
+                &self.project,
+                self.user_packs_dir.as_deref(),
+            ));
+        }
+        if let Some(from_current) = new_pack {
+            self.pack_editor = Some(PackEditor::new_pack(
+                &self.project,
+                self.user_packs_dir.as_deref(),
+                from_current,
+            ));
+        }
         if refresh {
             self.refresh_packs();
         }
@@ -191,7 +227,7 @@ impl Workspace {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, notices: &mut Notices, now_ms: u64) {
         self.process_fs_events(notices, now_ms);
-        if self.dialog.is_none() {
+        if self.dialog.is_none() && self.pack_editor.is_none() {
             self.handle_shortcuts(ui.ctx(), notices);
         }
         self.autosave(ui.ctx(), notices);
@@ -230,6 +266,17 @@ impl Workspace {
         egui::CentralPanel::default_margins().show(ui, |ui| self.central_ui(ui, notices, now_ms));
 
         self.dialog_ui(ui.ctx(), notices);
+
+        if let Some(editor) = &mut self.pack_editor {
+            match editor.show(ui.ctx(), &mut self.project, notices) {
+                pack_editor::Outcome::Open => {}
+                pack_editor::Outcome::Closed => self.pack_editor = None,
+                pack_editor::Outcome::Saved => {
+                    self.pack_editor = None;
+                    self.refresh_packs();
+                }
+            }
+        }
     }
 
     fn process_fs_events(&mut self, notices: &mut Notices, now_ms: u64) {
@@ -325,6 +372,7 @@ impl Workspace {
     fn open_new_note_dialog(&mut self) {
         self.dialog = Some(Dialog::NewNote {
             title: String::new(),
+            template: None,
             error: None,
             focus: true,
         });
@@ -344,7 +392,7 @@ impl Workspace {
             });
         });
         let search = ui.add(
-            egui::TextEdit::singleline(&mut self.search)
+            egui::TextEdit::singleline(&mut self.filter.text)
                 .hint_text("Rechercher par titre… (Ctrl+F)")
                 .desired_width(f32::INFINITY),
         );
@@ -352,10 +400,18 @@ impl Workspace {
             search.request_focus();
             self.focus_search = false;
         }
+        self.filters_ui(ui);
 
-        let key = (self.search.clone(), self.project.generation());
+        // La liste n'est recalculée que si le filtre, la structure du projet
+        // ou (pour les filtres qui en dépendent) le contenu changent.
+        let content = if self.filter.depends_on_content() {
+            self.project.content_version()
+        } else {
+            0
+        };
+        let key = (self.filter.clone(), self.project.generation(), content);
         if self.list_key.as_ref() != Some(&key) {
-            self.list = self.project.search(&self.search);
+            self.list = self.project.filter(&self.filter);
             self.list_key = Some(key);
         }
         // Entrée dans la recherche : ouvrir le premier résultat.
@@ -368,10 +424,11 @@ impl Workspace {
 
         ui.add_space(4.0);
         let count = self.list.len();
-        ui.weak(if self.search.trim().is_empty() {
-            format!("{count} fiche(s)")
+        let filtering = !self.filter.text.trim().is_empty() || self.filter.active_count() > 0;
+        ui.weak(if filtering {
+            format!("{count} résultat(s) sur {}", self.project.len())
         } else {
-            format!("{count} résultat(s)")
+            format!("{count} fiche(s)")
         });
 
         let issues: Vec<(PathBuf, String)> = self
@@ -438,6 +495,89 @@ impl Workspace {
         if let Some(id) = to_delete {
             self.dialog = Some(Dialog::ConfirmDelete(id));
         }
+    }
+
+    /// Filtres combinables, repliables, sous la recherche.
+    fn filters_ui(&mut self, ui: &mut egui::Ui) {
+        let n = self.filter.active_count();
+        let title = if n == 0 {
+            "Filtres".to_owned()
+        } else {
+            format!("Filtres ({n})")
+        };
+        let pack = self.project.pack().clone();
+        let f = &mut self.filter;
+        egui::CollapsingHeader::new(title)
+            .id_salt("filters")
+            .show(ui, |ui| {
+                ui.checkbox(&mut f.in_body, "Chercher aussi dans le texte");
+
+                if !pack.categories.is_empty() {
+                    small_heading(ui, "Catégories")
+                        .on_hover_text("Clic : inclure · 2e clic : exclure · 3e clic : neutre");
+                    ui.horizontal_wrapped(|ui| {
+                        for cat in &pack.categories {
+                            let state = if f.include_categories.contains(&cat.id) {
+                                Chip::On
+                            } else if f.exclude_categories.contains(&cat.id) {
+                                Chip::Excluded
+                            } else {
+                                Chip::Off
+                            };
+                            if chip(ui, &cat.label, c32(cat.color), state).clicked() {
+                                f.cycle_category(&cat.id);
+                            }
+                        }
+                    });
+                    if f.include_categories.len() >= 2 {
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut f.category_mode, CategoryMode::All, "Toutes (ET)");
+                            ui.radio_value(
+                                &mut f.category_mode,
+                                CategoryMode::Any,
+                                "Au moins une (OU)",
+                            );
+                        });
+                    }
+                }
+
+                small_heading(ui, "Statut");
+                ui.horizontal_wrapped(|ui| {
+                    let grey = ui.visuals().weak_text_color();
+                    let on = f.statuses.contains(&None);
+                    if chip(ui, "Sans statut", grey, Chip::from(on)).clicked() {
+                        NoteFilter::toggle(&mut f.statuses, None);
+                    }
+                    for st in &pack.statuses {
+                        let value = Some(st.id.clone());
+                        let on = f.statuses.contains(&value);
+                        if chip(ui, &st.label, c32(st.color), Chip::from(on)).clicked() {
+                            NoteFilter::toggle(&mut f.statuses, value);
+                        }
+                    }
+                });
+
+                small_heading(ui, "Liens présents");
+                ui.horizontal_wrapped(|ui| {
+                    let grey = ui.visuals().weak_text_color();
+                    let on = f.link_types.contains(&None);
+                    if chip(ui, "Sans type", grey, Chip::from(on)).clicked() {
+                        NoteFilter::toggle(&mut f.link_types, None);
+                    }
+                    for lt in &pack.link_types {
+                        let value = Some(lt.id.clone());
+                        let on = f.link_types.contains(&value);
+                        if chip(ui, &lt.label, c32(lt.color), Chip::from(on)).clicked() {
+                            NoteFilter::toggle(&mut f.link_types, value);
+                        }
+                    }
+                });
+                ui.checkbox(&mut f.broken_only, "Avec liens cassés");
+
+                if n > 0 && ui.button("Réinitialiser les filtres").clicked() {
+                    f.clear_criteria();
+                }
+            });
     }
 
     fn central_ui(&mut self, ui: &mut egui::Ui, notices: &mut Notices, now_ms: u64) {
@@ -583,9 +723,11 @@ impl Workspace {
         match dialog {
             Dialog::NewNote {
                 title,
+                template,
                 error,
                 focus,
             } => {
+                let templates = self.project.pack().templates.clone();
                 let resp = egui::Modal::new(egui::Id::unique("new_note")).show(ctx, |ui| {
                     ui.set_width(360.0);
                     ui.heading("Nouvelle fiche");
@@ -598,6 +740,21 @@ impl Workspace {
                         edit.request_focus();
                         *focus = false;
                     }
+                    if !templates.is_empty() {
+                        let current = template
+                            .as_deref()
+                            .and_then(|id| templates.iter().find(|t| t.id == id))
+                            .map_or("Fiche vide", |t| t.label.as_str())
+                            .to_owned();
+                        egui::ComboBox::new("template", "Modèle")
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(template, None, "Fiche vide");
+                                for t in &templates {
+                                    ui.selectable_value(template, Some(t.id.clone()), &t.label);
+                                }
+                            });
+                    }
                     if let Some(err) = error {
                         ui.colored_label(ui.visuals().error_fg_color, err.as_str());
                     }
@@ -608,7 +765,10 @@ impl Workspace {
                             close = true;
                         }
                         if create {
-                            match self.project.create_note(title, Vec::new(), String::new()) {
+                            let chosen = template
+                                .as_deref()
+                                .and_then(|id| templates.iter().find(|t| t.id == id));
+                            match self.project.create_from_template(title, chosen) {
                                 Ok(id) => created = Some(id),
                                 Err(e) => {
                                     *error = Some(e.to_string());
@@ -657,7 +817,7 @@ impl Workspace {
 
         if let Some(id) = created {
             self.dialog = None;
-            self.search.clear();
+            self.filter.text.clear();
             self.select(&id, notices);
         } else if let Some(id) = delete {
             self.dialog = None;
@@ -673,6 +833,52 @@ impl Workspace {
             self.dialog = None;
         }
     }
+}
+
+/// État d'une pastille de filtre.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chip {
+    Off,
+    On,
+    Excluded,
+}
+
+impl From<bool> for Chip {
+    fn from(on: bool) -> Self {
+        if on { Chip::On } else { Chip::Off }
+    }
+}
+
+fn small_heading(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add_space(2.0);
+    ui.label(RichText::new(text).small().weak())
+}
+
+/// Pastille de filtre : contour (neutre), remplie (incluse), barrée (exclue).
+fn chip(ui: &mut egui::Ui, label: &str, color: Color32, state: Chip) -> egui::Response {
+    let text = match state {
+        Chip::Off => RichText::new(label).color(color),
+        Chip::On => RichText::new(label).color(crate::colors::text_on(color)),
+        Chip::Excluded => RichText::new(format!("− {label}"))
+            .color(ui.visuals().error_fg_color)
+            .strikethrough(),
+    };
+    let fill = if state == Chip::On {
+        color
+    } else {
+        Color32::TRANSPARENT
+    };
+    let stroke_color = if state == Chip::Excluded {
+        ui.visuals().error_fg_color
+    } else {
+        color
+    };
+    ui.add(
+        egui::Button::new(text.small())
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, stroke_color))
+            .corner_radius(8.0),
+    )
 }
 
 /// Étiquette colorée du type de lien.
@@ -1089,5 +1295,113 @@ id: "
         assert_eq!(open_title(&harness), "Salle des Archives");
         // Le lien cassé de la démo est listé.
         harness.get_by_label("Cassés (1)");
+    }
+
+    fn listed(harness: &Harness<'_, State>) -> Vec<String> {
+        let ws = harness.state().ws.as_ref().unwrap();
+        ws.list
+            .iter()
+            .map(|id| ws.project.note(id).unwrap().meta.title.clone())
+            .collect()
+    }
+
+    #[test]
+    fn filters_templates_and_pack_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+
+        // Filtres : inclure, exclure, neutre.
+        harness.get_by_label("Filtres").click();
+        harness.run();
+        harness.get_by_label("Pièce").click();
+        harness.run();
+        assert_eq!(listed(&harness), ["Salle des Archives"]);
+        snapshot(&mut harness, "8_filtres");
+        harness.get_by_label("Pièce").click();
+        harness.run();
+        assert_eq!(listed(&harness), ["Coffre du bureau", "Majordome"]);
+        harness.get_by_label("− Pièce").click();
+        harness.run();
+        assert_eq!(listed(&harness).len(), 3);
+
+        // Statut, type de lien, liens cassés.
+        harness.get_by_label("Confirmé").click();
+        harness.run();
+        assert_eq!(listed(&harness), ["Coffre du bureau"]);
+        harness.get_by_label("Réinitialiser les filtres").click();
+        harness.run();
+        harness.get_by_label("indique").click();
+        harness.run();
+        assert_eq!(listed(&harness), ["Coffre du bureau", "Salle des Archives"]);
+        harness.get_by_label("Réinitialiser les filtres").click();
+        harness.get_by_label("Avec liens cassés").click();
+        harness.run();
+        assert_eq!(listed(&harness), ["Salle des Archives"]);
+        harness.get_by_label("Avec liens cassés").click();
+        harness.run();
+
+        // Nouvelle fiche à partir d'un modèle.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        harness.run();
+        harness
+            .get_by(|n| n.role() == Role::TextInput && n.placeholder() == Some("Titre"))
+            .type_text("Serre");
+        harness.get_by_label("Modèle").click();
+        harness.run();
+        harness.get_by_label("Nouvelle pièce").click();
+        harness.run();
+        harness.get_by_label("Créer").click();
+        harness.run();
+        {
+            let ws = harness.state().ws.as_ref().unwrap();
+            let id = ws.project.resolve_title("Serre").unwrap();
+            let note = ws.project.note(id).unwrap();
+            assert_eq!(note.meta.categories, ["piece"]);
+            assert!(note.body.starts_with("## Description"), "{}", note.body);
+        }
+
+        // Éditeur de pack : ajout d'une catégorie, enregistrée en copie locale.
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            ws.pack_editor = Some(PackEditor::edit_current(&ws.project, None));
+        }
+        harness.run();
+        harness.get_by_label("+ Ajouter une catégorie").click();
+        harness.run();
+        let field = |placeholder: &'static str| {
+            move |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+                n.role() == Role::TextInput
+                    && n.placeholder() == Some(placeholder)
+                    && n.value().as_deref() == Some("")
+            }
+        };
+        harness.get_by(field("id")).focus();
+        harness.run();
+        harness.get_by(field("id")).type_text("lieu");
+        harness.run();
+        harness.get_by(field("libellé")).focus();
+        harness.run();
+        harness.get_by(field("libellé")).type_text("Lieu");
+        harness.run();
+        snapshot(&mut harness, "9_editeur_pack");
+        harness.get_by_label("Enregistrer").click();
+        harness.run();
+        let ws = harness.state().ws.as_ref().unwrap();
+        assert!(ws.pack_editor.is_none());
+        assert_eq!(
+            ws.project.pack().category("lieu").map(|c| c.label.as_str()),
+            Some("Lieu")
+        );
+        let local = dir.path().join(".enigma/packs/blue_prince/pack.json");
+        assert!(local.exists());
+        // L'original fourni avec l'application n'est pas modifié.
+        let original =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/blue_prince/pack.json");
+        assert!(
+            !std::fs::read_to_string(original)
+                .unwrap()
+                .contains("\"lieu\"")
+        );
     }
 }

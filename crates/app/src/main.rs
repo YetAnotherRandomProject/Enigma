@@ -9,6 +9,7 @@ mod completion;
 mod editor;
 mod highlight;
 mod notices;
+mod pack_editor;
 mod paths;
 mod watcher;
 mod workspace;

@@ -105,6 +105,17 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
 - **Auto-complétion** : les touches ↑/↓/Entrée/Tab/Échap sont consommées
   avant le `TextEdit` ; Échap n'est capturé par son `EventFilter` que
   lorsque les suggestions sont ouvertes (sinon egui retire le focus avant).
+- **Filtres** (`enigma_core::filter`) : ET entre critères, OU à l'intérieur
+  (statuts, types de liens) ; catégories : toutes/au moins une + exclusion.
+  La liste n'est recalculée que si le filtre, `generation` ou (filtres
+  dépendant du contenu) `content_version` changent.
+- **Édition de packs** : un pack du projet ou du dossier utilisateur est
+  modifié sur place ; un pack fourni avec l'application est enregistré en
+  copie dans `.enigma/packs/<id>` (prioritaire), l'original n'est jamais
+  modifié. Les identifiants existants sont verrouillés.
+- **egui** : dans une `Grid`, forcer la largeur d'un `TextEdit` avec
+  `ui.add_sized` (sinon la colonne reste étroite). Dans les tests kittest,
+  donner le focus (`.focus()` + `run()`) avant `type_text`.
 - **Fichiers sans en-tête** : jamais réécrits tant qu'ils ne sont pas modifiés.
 - **Écho de nos écritures** : `Project` garde l'empreinte du dernier contenu
   écrit/lu ; `on_file_changed` ignore les événements identiques.
@@ -130,7 +141,7 @@ jalons suivants n'est codé avant validation.
   en-tête masqué, pastilles de catégories, sélecteur de statut, champs dans un
   panneau latéral ; mise en forme pendant la frappe (layouter) ; sauvegarde
   auto, annuler/refaire, modifications externes (`notify`).
-- [ ] **2. Liens et rétroliens** — auto-complétion `[[` puis `|type`, panneau
+- [x] **2. Liens et rétroliens** — auto-complétion `[[` puis `|type`, panneau
   liens sortants / rétroliens / cassés, index incrémental (1000+ fiches).
 - [ ] **3. Packs de jeu et filtres** — modèles, couleurs/icônes, changement et
   création de pack, filtres combinables.
