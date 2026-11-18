@@ -3943,6 +3943,52 @@ mod ui_tests {
     }
 
     #[test]
+    fn template_categories_wrap_without_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            let user = ws.user_packs_dir.clone();
+            ws.project
+                .update_pack(user.as_deref(), |p| {
+                    for n in [
+                        "Cuisine",
+                        "Bibliothèque",
+                        "Salle à manger",
+                        "Mémo",
+                        "Cave",
+                        "Jardin d'hiver",
+                    ] {
+                        p.add_category(n, enigma_core::Color::parse("#4aa3ff").unwrap());
+                    }
+                    p.templates.push(enigma_core::pack::Template {
+                        id: "memo".into(),
+                        label: "Mémo".into(),
+                        ..Default::default()
+                    });
+                })
+                .unwrap();
+            ws.pack_editor = Some(PackEditor::edit_current(&ws.project, None));
+        }
+        harness.run_steps(8);
+        harness.get_by_label("Modèles").click();
+        harness.run_steps(8);
+        harness.get_all_by_label("Mémo").last().unwrap().click();
+        harness.run_steps(8);
+        snapshot(&mut harness, "54_modeles");
+        let bottom = harness
+            .get_all_by_role(Role::CheckBox)
+            .map(|c| c.rect().bottom())
+            .fold(0.0_f32, f32::max);
+        let statut = harness.get_by_label("Statut").rect().top();
+        assert!(
+            statut >= bottom,
+            "« Statut » ({statut}) recouvre les catégories ({bottom})"
+        );
+    }
+
+    #[test]
     fn rename_from_title_and_external_reload() {
         let dir = tempfile::tempdir().unwrap();
         let mut harness = setup(dir.path());

@@ -572,41 +572,47 @@ impl PackEditor {
                                 egui::TextEdit::singleline(&mut t.label).hint_text("libellé"),
                             );
                             ui.end_row();
-                            ui.label("Catégories");
-                            ui.horizontal_wrapped(|ui| {
-                                for c in &categories {
-                                    let mut on = t.categories.contains(&c.id);
-                                    let label = if c.label.is_empty() { &c.id } else { &c.label };
-                                    if ui.checkbox(&mut on, label.as_str()).changed() {
-                                        enigma_core::filter::NoteFilter::toggle(
-                                            &mut t.categories,
-                                            c.id.clone(),
-                                        );
-                                    }
+                        });
+                    // Hors de la grille : une ligne qui revient à la ligne dans
+                    // une cellule de grille n'agrandit pas la cellule, et la
+                    // suite se superpose.
+                    ui.add_space(4.0);
+                    ui.label("Catégories");
+                    ui.horizontal_wrapped(|ui| {
+                        for c in &categories {
+                            let mut on = t.categories.contains(&c.id);
+                            let label = if c.label.is_empty() { &c.id } else { &c.label };
+                            if ui.checkbox(&mut on, label.as_str()).changed() {
+                                enigma_core::filter::NoteFilter::toggle(
+                                    &mut t.categories,
+                                    c.id.clone(),
+                                );
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Statut");
+                        let current = t
+                            .status
+                            .as_deref()
+                            .and_then(|s| statuses.iter().find(|x| x.id == s))
+                            .map_or("Aucun", |s| s.label.as_str())
+                            .to_owned();
+                        egui::ComboBox::new(("template_status", i), "")
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut t.status, None, "Aucun");
+                                for s in &statuses {
+                                    ui.selectable_value(
+                                        &mut t.status,
+                                        Some(s.id.clone()),
+                                        &s.label,
+                                    );
                                 }
                             });
-                            ui.end_row();
-                            ui.label("Statut");
-                            let current = t
-                                .status
-                                .as_deref()
-                                .and_then(|s| statuses.iter().find(|x| x.id == s))
-                                .map_or("Aucun", |s| s.label.as_str())
-                                .to_owned();
-                            egui::ComboBox::new(("template_status", i), "")
-                                .selected_text(current)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut t.status, None, "Aucun");
-                                    for s in &statuses {
-                                        ui.selectable_value(
-                                            &mut t.status,
-                                            Some(s.id.clone()),
-                                            &s.label,
-                                        );
-                                    }
-                                });
-                            ui.end_row();
-                        });
+                    });
+                    ui.add_space(4.0);
                     ui.label("Corps");
                     ui.add(
                         egui::TextEdit::multiline(&mut t.body)

@@ -2376,18 +2376,18 @@ impl Editor {
                             let key = format!("{}#nouveau", def.id);
                             ui.vertical(|ui| {
                                 let mut remove = None;
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    for (i, it) in items.iter().enumerate() {
-                                        if ui
-                                            .add(egui::Button::new(format!("{it} ×")).small())
-                                            .on_hover_text("Retirer")
-                                            .clicked()
-                                        {
-                                            remove = Some(i);
-                                        }
+                                // Une valeur par ligne : une ligne qui revient à la
+                                // ligne dans une grille se superpose à la suite.
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                for (i, it) in items.iter().enumerate() {
+                                    if ui
+                                        .add(egui::Button::new(format!("{it} ×")).small())
+                                        .on_hover_text("Retirer")
+                                        .clicked()
+                                    {
+                                        remove = Some(i);
                                     }
-                                });
+                                }
                                 let buf = self.field_bufs.entry(key).or_default();
                                 let r = ui.add(
                                     egui::TextEdit::singleline(buf)
