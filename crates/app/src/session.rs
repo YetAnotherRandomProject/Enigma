@@ -289,6 +289,7 @@ mod tests {
             state.session =
                 Session::convert_folder(&demo, &file, &work, &packs, &ctx, &mut state.notices);
             assert!(state.session.is_some(), "conversion");
+            state.session.as_mut().unwrap().ws.group_by_category = false;
         }
         assert!(file.is_file());
         harness.run_steps(8);

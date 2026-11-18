@@ -68,6 +68,19 @@ enum Dialog {
     ConfirmDelete(NoteId),
 }
 
+/// Ligne de la liste des fiches (en-tête de catégorie ou fiche).
+#[derive(Clone, Debug, PartialEq)]
+enum ListRow {
+    Header {
+        key: String,
+        label: String,
+        color: Option<Color32>,
+        count: usize,
+        open: bool,
+    },
+    Note(NoteId),
+}
+
 /// Pack proposé dans le sélecteur.
 struct PackChoice {
     id: String,
@@ -81,6 +94,8 @@ pub struct Workspace {
     filter: NoteFilter,
     list: Vec<NoteId>,
     list_key: Option<(NoteFilter, u64, u64)>,
+    /// Incrémenté à chaque recalcul de la liste.
+    list_version: u64,
     editor: Option<Editor>,
     dialog: Option<Dialog>,
     last_edit: Option<Instant>,
@@ -109,6 +124,13 @@ pub struct Workspace {
     pub reading: bool,
     /// Horloge de la dernière image (historique de l'éditeur).
     now_ms: u64,
+    /// Liste rangée par catégorie (une fiche peut apparaître plusieurs fois).
+    pub group_by_category: bool,
+    /// Groupes repliés (clé : `cat:<id>` ou `none`).
+    collapsed: std::collections::HashSet<String>,
+    /// Lignes affichées et leur clé de cache.
+    rows: Vec<ListRow>,
+    rows_key: Option<(u64, bool, Vec<String>)>,
 }
 
 impl Workspace {
@@ -155,6 +177,7 @@ impl Workspace {
             filter: NoteFilter::default(),
             list: Vec::new(),
             list_key: None,
+            list_version: 0,
             editor: None,
             dialog: None,
             last_edit: None,
@@ -175,6 +198,10 @@ impl Workspace {
             disk_changed: false,
             reading: false,
             now_ms: 0,
+            group_by_category: true,
+            collapsed: std::collections::HashSet::new(),
+            rows: Vec::new(),
+            rows_key: None,
         };
         ws.refresh_packs();
         Ok(ws)
@@ -971,7 +998,9 @@ impl Workspace {
         if self.list_key.as_ref() != Some(&key) {
             self.list = self.project.filter(&self.filter);
             self.list_key = Some(key);
+            self.list_version += 1;
         }
+        self.refresh_rows();
         // Entrée dans la recherche : ouvrir le premier résultat.
         if search.lost_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter))
@@ -983,11 +1012,25 @@ impl Workspace {
         ui.add_space(4.0);
         let count = self.list.len();
         let filtering = !self.filter.text.trim().is_empty() || self.filter.active_count() > 0;
-        ui.weak(if filtering {
-            format!("{count} résultat(s) sur {}", self.project.len())
-        } else {
-            format!("{count} fiche(s)")
+        ui.horizontal(|ui| {
+            ui.weak(if filtering {
+                format!("{count} résultat(s) sur {}", self.project.len())
+            } else {
+                format!("{count} fiche(s)")
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.toggle_value(
+                    &mut self.group_by_category,
+                    RichText::new("Par catégorie").small(),
+                )
+                .on_hover_text(
+                    "Ranger la liste par catégorie (une fiche à plusieurs catégories \
+                         apparaît dans chacune)",
+                );
+            });
         });
+        self.refresh_rows();
+        let count = self.rows.len();
 
         let issues: Vec<(PathBuf, String)> = self
             .project
@@ -1001,15 +1044,38 @@ impl Workspace {
         let mut to_select = None;
         let mut to_rename = None;
         let mut to_delete = None;
+        let mut to_toggle: Option<String> = None;
         let selected = self.editor.as_ref().map(|e| e.id.clone());
         egui::ScrollArea::vertical()
             .id_salt("notes_scroll")
             .auto_shrink(false)
             .max_height((ui.available_height() - bottom_reserved).max(row_h))
             .show_rows(ui, row_h, count, |ui, range| {
-                for id in &self.list[range] {
-                    let resp =
-                        note_row(ui, &self.project, id, selected.as_ref() == Some(id), row_h);
+                for row in &self.rows[range] {
+                    let id = match row {
+                        ListRow::Header {
+                            key,
+                            label,
+                            color,
+                            count,
+                            open,
+                        } => {
+                            if header_row(ui, label, *color, *count, *open, row_h).clicked() {
+                                to_toggle = Some(key.clone());
+                            }
+                            continue;
+                        }
+                        ListRow::Note(id) => id,
+                    };
+                    let indent = if self.group_by_category { 12.0 } else { 0.0 };
+                    let resp = note_row(
+                        ui,
+                        &self.project,
+                        id,
+                        selected.as_ref() == Some(id),
+                        row_h,
+                        indent,
+                    );
                     if resp.clicked() {
                         to_select = Some(id.clone());
                     }
@@ -1041,6 +1107,11 @@ impl Workspace {
             });
         }
 
+        if let Some(key) = to_toggle
+            && !self.collapsed.remove(&key)
+        {
+            self.collapsed.insert(key);
+        }
         if let Some(id) = to_select {
             self.select(&id, notices);
         }
@@ -1053,6 +1124,64 @@ impl Workspace {
         if let Some(id) = to_delete {
             self.dialog = Some(Dialog::ConfirmDelete(id));
         }
+    }
+
+    /// Recalcule les lignes de la liste si la liste, le rangement ou les
+    /// groupes repliés ont changé.
+    fn refresh_rows(&mut self) {
+        let mut collapsed: Vec<String> = self.collapsed.iter().cloned().collect();
+        collapsed.sort();
+        let key = (
+            self.list_version ^ (self.project.content_version() << 20),
+            self.group_by_category,
+            collapsed,
+        );
+        if self.rows_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.rows_key = Some(key);
+        if !self.group_by_category {
+            self.rows = self.list.iter().cloned().map(ListRow::Note).collect();
+            return;
+        }
+        let pack = self.project.pack();
+        let order: Vec<String> = pack.categories.iter().map(|c| c.id.clone()).collect();
+        let groups = enigma_core::filter::group_by_category(
+            &self.list,
+            |id| {
+                self.project
+                    .note(id)
+                    .map(|n| n.meta.categories.clone())
+                    .unwrap_or_default()
+            },
+            &order,
+        );
+        let mut rows = Vec::new();
+        for g in groups {
+            let key = g
+                .category
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |c| format!("cat:{c}"));
+            let (label, color) = match &g.category {
+                Some(c) => match pack.category(c) {
+                    Some(def) => (def.label.clone(), Some(c32(def.color))),
+                    None => (c.clone(), None),
+                },
+                None => ("Sans catégorie".to_owned(), None),
+            };
+            let open = !self.collapsed.contains(&key);
+            rows.push(ListRow::Header {
+                key,
+                label,
+                color,
+                count: g.notes.len(),
+                open,
+            });
+            if open {
+                rows.extend(g.notes.into_iter().map(ListRow::Note));
+            }
+        }
+        self.rows = rows;
     }
 
     /// Filtres combinables, repliables, sous la recherche.
@@ -1547,12 +1676,68 @@ fn link_row(
 }
 
 /// Une ligne de la liste : pastilles de couleur des catégories et titre.
+/// En-tête de groupe de la liste (catégorie), cliquable pour replier.
+fn header_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    color: Option<Color32>,
+    count: usize,
+    open: bool,
+    h: f32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Groupe {label}"))
+    });
+    let visuals = ui.visuals();
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, 4.0, visuals.widgets.hovered.weak_bg_fill);
+    }
+    let cy = rect.center().y;
+    let x = rect.left() + 6.0;
+    // Triangle : vers le bas si ouvert, vers la droite si replié.
+    let tri = if open {
+        vec![
+            egui::pos2(x, cy - 3.0),
+            egui::pos2(x + 8.0, cy - 3.0),
+            egui::pos2(x + 4.0, cy + 3.0),
+        ]
+    } else {
+        vec![
+            egui::pos2(x + 1.0, cy - 4.0),
+            egui::pos2(x + 7.0, cy),
+            egui::pos2(x + 1.0, cy + 4.0),
+        ]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        tri,
+        visuals.weak_text_color(),
+        egui::Stroke::NONE,
+    ));
+    let mut tx = x + 14.0;
+    if let Some(c) = color {
+        ui.painter().circle_filled(egui::pos2(tx + 4.0, cy), 4.0, c);
+        tx += 12.0;
+    }
+    let text = format!("{label}  {count}");
+    ui.painter().text(
+        egui::pos2(tx, cy),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(13.0),
+        visuals.strong_text_color(),
+    );
+    resp
+}
+
 fn note_row(
     ui: &mut egui::Ui,
     project: &Project,
     id: &NoteId,
     selected: bool,
     h: f32,
+    indent: f32,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
     let Some(entry) = project.entry(id) else {
@@ -1570,7 +1755,7 @@ fn note_row(
         ui.painter()
             .rect_filled(rect, 4.0, visuals.widgets.hovered.weak_bg_fill);
     }
-    let mut x = rect.left() + 8.0;
+    let mut x = rect.left() + 8.0 + indent;
     let cy = rect.center().y;
     let pack = project.pack();
     for cat in entry.note.meta.categories.iter().take(5) {
@@ -1683,7 +1868,10 @@ mod ui_tests {
         let ctx = harness.ctx.clone();
         {
             let state = harness.state_mut();
-            state.ws = Some(Workspace::open(dir, &packs, &ctx, &mut state.notices).unwrap());
+            let mut ws = Workspace::open(dir, &packs, &ctx, &mut state.notices).unwrap();
+            // Liste à plat : chaque fiche une seule fois (titres non ambigus).
+            ws.group_by_category = false;
+            state.ws = Some(ws);
         }
         harness.run_steps(8);
         harness
@@ -2563,6 +2751,34 @@ id: "
         harness.get_by_label("Citation").click();
         harness.run_steps(4);
         assert!(body(&harness).starts_with("> "), "{}", body(&harness));
+    }
+
+    #[test]
+    fn list_grouped_by_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        harness.state_mut().ws.as_mut().unwrap().group_by_category = true;
+        harness.run_steps(4);
+        // Salle des Archives : pièce + indice → deux fois ; Majordome : sans catégorie.
+        assert_eq!(harness.query_all_by_label("Salle des Archives").count(), 2);
+        assert_eq!(harness.query_all_by_label("Coffre du bureau").count(), 2);
+        assert!(harness.query_by_label("Groupe Sans catégorie").is_some());
+        snapshot(&mut harness, "24_liste_par_categorie");
+        // Replier « Pièce » : la Salle n'y apparaît plus qu'une fois (Indice).
+        harness.get_by_label("Groupe Pièce").click();
+        harness.run_steps(4);
+        assert_eq!(harness.query_all_by_label("Salle des Archives").count(), 1);
+        harness.get_by_label("Groupe Pièce").click();
+        harness.run_steps(4);
+        assert_eq!(harness.query_all_by_label("Salle des Archives").count(), 2);
+        // Clic sur une occurrence : sélection.
+        harness
+            .query_all_by_label("Salle des Archives")
+            .next()
+            .unwrap()
+            .click();
+        harness.run_steps(4);
+        assert!(harness.state().ws.as_ref().unwrap().editor_body().is_some());
     }
 
     #[test]

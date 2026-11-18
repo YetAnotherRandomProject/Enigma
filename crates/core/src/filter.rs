@@ -96,8 +96,104 @@ impl NoteFilter {
     }
 }
 
+/// Groupe de la liste triée par catégorie.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CategoryGroup {
+    /// Catégorie (`None` : fiches sans catégorie).
+    pub category: Option<String>,
+    pub notes: Vec<crate::NoteId>,
+}
+
+/// Range des fiches par catégorie : une fiche à plusieurs catégories
+/// apparaît dans chacune. Ordre : catégories du pack (dans leur ordre),
+/// puis catégories inconnues du pack (alphabétique), puis « sans
+/// catégorie ». L'ordre des fiches de `ids` est conservé dans chaque
+/// groupe ; les groupes vides sont omis.
+pub fn group_by_category(
+    ids: &[crate::NoteId],
+    categories_of: impl Fn(&crate::NoteId) -> Vec<String>,
+    pack_order: &[String],
+) -> Vec<CategoryGroup> {
+    use std::collections::BTreeMap;
+    let mut known: Vec<Vec<crate::NoteId>> = vec![Vec::new(); pack_order.len()];
+    let mut unknown: BTreeMap<String, Vec<crate::NoteId>> = BTreeMap::new();
+    let mut none = Vec::new();
+    for id in ids {
+        let cats = categories_of(id);
+        if cats.is_empty() {
+            none.push(id.clone());
+        }
+        let mut seen: Vec<&String> = Vec::new();
+        for c in &cats {
+            if seen.contains(&c) {
+                continue;
+            }
+            seen.push(c);
+            match pack_order.iter().position(|p| p == c) {
+                Some(i) => known[i].push(id.clone()),
+                None => unknown.entry(c.clone()).or_default().push(id.clone()),
+            }
+        }
+    }
+    let mut out: Vec<CategoryGroup> = pack_order
+        .iter()
+        .zip(known)
+        .filter(|(_, n)| !n.is_empty())
+        .map(|(c, notes)| CategoryGroup {
+            category: Some(c.clone()),
+            notes,
+        })
+        .collect();
+    out.extend(unknown.into_iter().map(|(c, notes)| CategoryGroup {
+        category: Some(c),
+        notes,
+    }));
+    if !none.is_empty() {
+        out.push(CategoryGroup {
+            category: None,
+            notes: none,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn groups_by_category_with_duplicates() {
+        use crate::NoteId;
+        let id = |s: &str| NoteId::parse(s).unwrap();
+        let ids = [id("A"), id("B"), id("C"), id("D")];
+        let cats = |n: &NoteId| -> Vec<String> {
+            match n.as_str() {
+                "A" => vec!["piece".into(), "code".into()],
+                "B" => vec!["code".into(), "code".into()],
+                "C" => vec!["zzz".into()],
+                _ => vec![],
+            }
+        };
+        let order = ["piece".to_owned(), "indice".to_owned(), "code".to_owned()];
+        let g = super::group_by_category(&ids, cats, &order);
+        let summary: Vec<(Option<&str>, Vec<&str>)> = g
+            .iter()
+            .map(|g| {
+                (
+                    g.category.as_deref(),
+                    g.notes.iter().map(NoteId::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (Some("piece"), vec!["A"]),
+                (Some("code"), vec!["A", "B"]),
+                (Some("zzz"), vec!["C"]),
+                (None, vec!["D"]),
+            ]
+        );
+    }
+
     use super::*;
 
     fn cats(list: &[&str]) -> Vec<String> {
