@@ -264,16 +264,9 @@ pub fn insert_inline(text: &str, sel: Range<usize>, snippet: &str) -> Edit {
 }
 
 /// Tableau Markdown vide (`cols` colonnes, `rows` lignes de données).
+/// Colonnes alignées (voir [`crate::table`]).
 pub fn table(rows: usize, cols: usize) -> String {
-    let cols = cols.max(1);
-    let header: Vec<String> = (1..=cols).map(|i| format!("Colonne {i}")).collect();
-    let mut s = format!("| {} |\n", header.join(" | "));
-    s.push_str(&format!("|{}\n", " --- |".repeat(cols)));
-    for _ in 0..rows.max(1) {
-        s.push_str(&format!("|{}\n", "   |".repeat(cols)));
-    }
-    s.pop();
-    s
+    crate::table::Table::empty(rows.max(1), cols).to_markdown()
 }
 
 #[cfg(test)]
@@ -343,7 +336,7 @@ mod tests {
         let tab = table(2, 3);
         assert_eq!(
             tab,
-            "| Colonne 1 | Colonne 2 | Colonne 3 |\n| --- | --- | --- |\n|   |   |   |\n|   |   |   |"
+            "| Colonne 1 | Colonne 2 | Colonne 3 |\n| --------- | --------- | --------- |\n|           |           |           |\n|           |           |           |"
         );
         let e = insert_block("ligne", 5..5, "---", 3);
         assert_eq!(e.text, "ligne\n\n---");
