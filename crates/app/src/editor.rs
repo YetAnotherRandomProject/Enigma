@@ -81,6 +81,8 @@ pub struct Editor {
     slash_dismissed: Option<usize>,
     /// Commande « / » Modèle… choisie : ouvrir le choix des modèles.
     want_template: bool,
+    /// Distingue deux éditeurs de la même fiche (volets côte à côte).
+    salt: u64,
     /// Formulaires « + » pour enrichir le pack depuis la fiche.
     quick_category: QuickAdd,
     quick_status: QuickAdd,
@@ -477,6 +479,7 @@ impl Editor {
             slash_rect: None,
             slash_dismissed: None,
             want_template: false,
+            salt: 0,
             quick_category: QuickAdd::default(),
             quick_status: QuickAdd::default(),
             quick_field: QuickAdd::default(),
@@ -508,6 +511,10 @@ impl Editor {
     #[cfg(test)]
     pub fn body(&self) -> &str {
         &self.body
+    }
+
+    pub fn set_salt(&mut self, salt: u64) {
+        self.salt = salt;
     }
 
     /// Texte de la fiche.
@@ -769,7 +776,7 @@ impl Editor {
         notices: &mut Notices,
     ) -> BodyOutcome {
         let mut outcome = BodyOutcome::default();
-        let te_id = egui::Id::unique(("body", self.id.as_str()));
+        let te_id = egui::Id::unique(("body", self.id.as_str(), self.salt));
         let ctx = ui.ctx().clone();
         self.preview.sync(&self.body);
 

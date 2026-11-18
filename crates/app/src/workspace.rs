@@ -148,6 +148,29 @@ pub struct Workspace {
     mentions: Option<((NoteId, u64, u64), Vec<enigma_core::mentions::Mention>)>,
     /// Tags du projet (version du contenu, tag → nombre de fiches).
     tags: Option<(u64, u64, TagCounts)>,
+    /// Onglets ouverts (fiche active comprise), dans l'ordre.
+    tab_ids: Vec<NoteId>,
+    /// Éditeurs des onglets en arrière-plan (historique d'annulation gardé).
+    parked: std::collections::HashMap<NoteId, Editor>,
+    /// Second volet (fiches côte à côte).
+    other: Option<Editor>,
+    /// Le second volet est à droite (sinon à gauche).
+    other_right: bool,
+    /// Historique de navigation : fiches précédentes et suivantes.
+    back: Vec<NoteId>,
+    forward: Vec<NoteId>,
+    /// Compteur des éditeurs ouverts (identifiants d'affichage distincts).
+    next_salt: u64,
+}
+
+/// Ce qu'a demandé un volet de fiche.
+#[derive(Default)]
+struct PaneOutcome {
+    edited: bool,
+    insert_image: bool,
+    insert_template: bool,
+    search_tag: Option<String>,
+    open: Option<(NoteId, Option<String>)>,
 }
 
 impl Workspace {
@@ -222,6 +245,13 @@ impl Workspace {
             search: crate::search_ui::SearchPanel::default(),
             mentions: None,
             tags: None,
+            tab_ids: Vec::new(),
+            parked: std::collections::HashMap::new(),
+            other: None,
+            other_right: true,
+            back: Vec::new(),
+            forward: Vec::new(),
+            next_salt: 0,
         };
         ws.refresh_packs();
         Ok(ws)
@@ -405,7 +435,12 @@ impl Workspace {
             | Command::Redo
             | Command::InsertImage
             | Command::InsertTemplate
+            | Command::CloseTab
+            | Command::SplitView
             | Command::FindInNote => self.editor.is_some(),
+            Command::NavBack => !self.back.is_empty(),
+            Command::NavForward => !self.forward.is_empty(),
+            Command::NextTab => self.tab_ids.len() > 1,
             c if commands::format_of(c).is_some() => self.editor.is_some(),
             // Association de fichiers : Windows seulement pour l'instant.
             Command::AssociateFiles => cfg!(windows),
@@ -438,6 +473,27 @@ impl Workspace {
                     self.view = View::Note;
                     self.dialog = Some(Dialog::InsertTemplate);
                 }
+            }
+            Command::NavBack => self.nav_back(notices),
+            Command::NavForward => self.nav_forward(notices),
+            Command::CloseTab => {
+                if let Some(id) = self.editor.as_ref().map(|e| e.id.clone()) {
+                    self.close_tab(&id, notices);
+                }
+            }
+            Command::NextTab => {
+                let cur = self.editor.as_ref().map(|e| e.id.clone());
+                let n = self.tab_ids.len();
+                if let Some(p) = cur.and_then(|c| self.tab_ids.iter().position(|t| *t == c))
+                    && n > 1
+                {
+                    let next = self.tab_ids[(p + 1) % n].clone();
+                    self.activate_tab(&next, notices);
+                }
+            }
+            Command::SplitView => {
+                self.view = View::Note;
+                self.toggle_split(notices);
             }
             Command::FindInNote => {
                 self.view = View::Note;
@@ -700,12 +756,356 @@ impl Workspace {
             .collect();
     }
 
+    /// Ouvre une fiche dans l'onglet courant (ou passe à son onglet) ; la
+    /// fiche quittée va dans l'historique (retour : Alt+Gauche).
     pub fn select(&mut self, id: &NoteId, notices: &mut Notices) {
         if self.editor.as_ref().is_some_and(|e| &e.id == id) {
             return;
         }
         self.flush(notices);
-        self.editor = Editor::open(&self.project, id);
+        if let Some(cur) = self.editor.as_ref().map(|e| e.id.clone()) {
+            self.back.push(cur);
+            self.forward.clear();
+            if self.back.len() > 100 {
+                self.back.remove(0);
+            }
+        }
+        self.show_in_current_tab(id);
+    }
+
+    /// Une fiche dans un volet : en-tête, barre d'outils et corps.
+    fn note_pane(
+        ui: &mut egui::Ui,
+        editor: &mut Editor,
+        project: &mut Project,
+        user_packs: Option<&Path>,
+        notices: &mut Notices,
+        now_ms: u64,
+    ) -> PaneOutcome {
+        let mut out = PaneOutcome::default();
+        let edited = editor.header_ui(ui, project, now_ms, notices, user_packs);
+
+        if project.entry(&editor.id).is_some_and(|e| e.has_conflict()) {
+            let mut choice = None;
+            egui::Frame::new()
+                .fill(ui.visuals().error_fg_color.gamma_multiply(0.15))
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        "Ce fichier a été modifié hors de l'application alors que vous aviez \
+                         des modifications non enregistrées. La sauvegarde est suspendue.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Garder ma version").clicked() {
+                            choice = Some(true);
+                        }
+                        if ui.button("Prendre la version du disque").clicked() {
+                            choice = Some(false);
+                        }
+                    });
+                });
+            if let Some(keep_mine) = choice {
+                match project.resolve_conflict(&editor.id, keep_mine) {
+                    Ok(()) => editor.sync_from_project(project, now_ms),
+                    Err(e) => notices.error(format!("Résolution du conflit impossible : {e}")),
+                }
+            }
+        }
+
+        let mut insert_table = None;
+        ui.horizontal(|ui| {
+            if ui
+                .button("Insérer…")
+                .on_hover_text(
+                    "Image, son, vidéo ou document — ou glissez/collez (Ctrl+V) le fichier",
+                )
+                .clicked()
+            {
+                out.insert_image = true;
+            }
+            ui.menu_button("Tableau", |ui| {
+                if let Some(size) = crate::editor::table_picker(ui) {
+                    insert_table = Some(size);
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("Insérer un tableau (redimensionnable ensuite par son coin)");
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Cliquez dans le texte pour le modifier ; Échap pour terminer ; / pour insérer.",
+                    )
+                    .weak(),
+                )
+                .truncate(),
+            );
+        });
+        ui.separator();
+        if let Some((r, c)) = insert_table {
+            editor.format(crate::editor::Format::Table(r, c), project, now_ms);
+        }
+        let body = editor.body_ui(ui, project, now_ms, notices);
+        out.insert_image |= body.insert_file;
+        out.edited = edited || body.edited || insert_table.is_some();
+        out.insert_template = body.insert_template;
+        out.search_tag = body.search_tag;
+        out.open = body.open.map(|id| (id, body.open_section));
+        out
+    }
+
+    /// Applique ce qu'a demandé un volet.
+    fn apply_pane(&mut self, out: PaneOutcome, ctx: &egui::Context, notices: &mut Notices) {
+        if out.insert_image {
+            self.run_command(Command::InsertImage, ctx, notices);
+        }
+        if out.edited {
+            self.mark_edited();
+        }
+        if out.insert_template {
+            self.dialog = Some(Dialog::InsertTemplate);
+        }
+        if let Some(tag) = out.search_tag {
+            self.search_tag(&tag);
+        }
+        if let Some((target, section)) = out.open {
+            if ctx.input(|i| i.modifiers.command) {
+                self.open_in_new_tab(&target, notices);
+            } else {
+                self.select(&target, notices);
+            }
+            self.reveal_section(&target, section.as_deref());
+        }
+    }
+
+    /// Barre des onglets : fiches ouvertes, retour/suivant, côte à côte.
+    fn tabs_ui(&mut self, ui: &mut egui::Ui, notices: &mut Notices) {
+        let active = self.editor.as_ref().map(|e| e.id.clone());
+        let mut activate = None;
+        let mut close = None;
+        let mut back = false;
+        let mut forward = false;
+        let mut split = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if ui
+                .add_enabled(!self.back.is_empty(), egui::Button::new("<").small())
+                .on_hover_text("Fiche précédente (Alt+Gauche)")
+                .clicked()
+            {
+                back = true;
+            }
+            if ui
+                .add_enabled(!self.forward.is_empty(), egui::Button::new(">").small())
+                .on_hover_text("Fiche suivante (Alt+Droite)")
+                .clicked()
+            {
+                forward = true;
+            }
+            ui.add_space(6.0);
+            for id in &self.tab_ids {
+                let Some(title) = self.project.note(id).map(|n| n.meta.title.clone()) else {
+                    continue;
+                };
+                let on = active.as_ref() == Some(id);
+                let r = ui
+                    .selectable_label(on, title)
+                    .on_hover_text("Clic du milieu : fermer");
+                if r.clicked() {
+                    activate = Some(id.clone());
+                }
+                if r.middle_clicked() {
+                    close = Some(id.clone());
+                }
+                if ui
+                    .add(egui::Button::new("×").small().frame(false))
+                    .on_hover_text("Fermer l'onglet (Ctrl+W)")
+                    .clicked()
+                {
+                    close = Some(id.clone());
+                }
+                ui.add_space(4.0);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let on = self.other.is_some();
+                if ui
+                    .selectable_label(on, "Côte à côte")
+                    .on_hover_text("Afficher une deuxième fiche à côté")
+                    .clicked()
+                {
+                    split = true;
+                }
+            });
+        });
+        ui.separator();
+        if back {
+            self.nav_back(notices);
+        }
+        if forward {
+            self.nav_forward(notices);
+        }
+        if let Some(id) = activate {
+            self.activate_tab(&id, notices);
+        }
+        if let Some(id) = close {
+            self.close_tab(&id, notices);
+        }
+        if split {
+            self.toggle_split(notices);
+        }
+    }
+
+    /// Range la fiche active dans les onglets en arrière-plan.
+    fn park_active(&mut self) {
+        if let Some(ed) = self.editor.take() {
+            self.parked.insert(ed.id.clone(), ed);
+        }
+    }
+
+    /// Passe à l'onglet de cette fiche (l'ouvre s'il n'existe pas).
+    fn activate_tab(&mut self, id: &NoteId, notices: &mut Notices) {
+        if self.editor.as_ref().is_some_and(|e| &e.id == id) {
+            return;
+        }
+        self.flush(notices);
+        self.park_active();
+        let ed = match self.parked.remove(id) {
+            Some(e) => Some(e),
+            None => self.new_editor(id),
+        };
+        if let Some(mut ed) = ed {
+            ed.sync_from_project(&self.project, self.now_ms);
+            if !self.tab_ids.contains(id) {
+                self.tab_ids.push(id.clone());
+            }
+            self.editor = Some(ed);
+        }
+    }
+
+    /// Montre une fiche dans l'onglet courant (ou passe à son onglet).
+    fn show_in_current_tab(&mut self, id: &NoteId) {
+        if self.tab_ids.contains(id) {
+            self.park_active();
+            let ed = match self.parked.remove(id) {
+                Some(e) => Some(e),
+                None => self.new_editor(id),
+            };
+            if let Some(mut ed) = ed {
+                ed.sync_from_project(&self.project, self.now_ms);
+                self.editor = Some(ed);
+            }
+            return;
+        }
+        let current = self.editor.as_ref().map(|e| e.id.clone());
+        match current.and_then(|c| self.tab_ids.iter().position(|t| *t == c)) {
+            Some(p) => self.tab_ids[p] = id.clone(),
+            None => self.tab_ids.push(id.clone()),
+        }
+        self.editor = self.new_editor(id);
+    }
+
+    /// Ouvre une fiche dans un nouvel onglet (après l'onglet actif).
+    pub fn open_in_new_tab(&mut self, id: &NoteId, notices: &mut Notices) {
+        if !self.tab_ids.contains(id) {
+            let at = self
+                .editor
+                .as_ref()
+                .and_then(|e| self.tab_ids.iter().position(|t| *t == e.id))
+                .map_or(self.tab_ids.len(), |p| p + 1);
+            self.tab_ids.insert(at, id.clone());
+        }
+        self.activate_tab(id, notices);
+        self.view = View::Note;
+    }
+
+    /// Ferme l'onglet d'une fiche ; l'onglet voisin devient actif.
+    fn close_tab(&mut self, id: &NoteId, notices: &mut Notices) {
+        let Some(p) = self.tab_ids.iter().position(|t| t == id) else {
+            return;
+        };
+        self.flush(notices);
+        self.tab_ids.remove(p);
+        self.parked.remove(id);
+        if self.editor.as_ref().is_some_and(|e| &e.id == id) {
+            self.editor = None;
+            if let Some(next) = self
+                .tab_ids
+                .get(p.min(self.tab_ids.len().saturating_sub(1)))
+            {
+                let next = next.clone();
+                self.activate_tab(&next, notices);
+            }
+        }
+    }
+
+    /// Oublie une fiche supprimée (onglets, volet, historique).
+    fn forget_note(&mut self, id: &NoteId) {
+        self.tab_ids.retain(|t| t != id);
+        self.parked.remove(id);
+        if self.other.as_ref().is_some_and(|e| &e.id == id) {
+            self.other = None;
+        }
+        self.back.retain(|t| t != id);
+        self.forward.retain(|t| t != id);
+    }
+
+    fn nav_back(&mut self, notices: &mut Notices) {
+        if let Some(prev) = self.back.pop() {
+            self.flush(notices);
+            if let Some(cur) = self.editor.as_ref().map(|e| e.id.clone()) {
+                self.forward.push(cur);
+            }
+            self.show_in_current_tab(&prev);
+            self.view = View::Note;
+        }
+    }
+
+    fn nav_forward(&mut self, notices: &mut Notices) {
+        if let Some(next) = self.forward.pop() {
+            self.flush(notices);
+            if let Some(cur) = self.editor.as_ref().map(|e| e.id.clone()) {
+                self.back.push(cur);
+            }
+            self.show_in_current_tab(&next);
+            self.view = View::Note;
+        }
+    }
+
+    /// Ouvre ou ferme le second volet (avec la fiche précédente, ou la même).
+    fn toggle_split(&mut self, notices: &mut Notices) {
+        if self.other.take().is_some() {
+            return;
+        }
+        let Some(cur) = self.editor.as_ref().map(|e| e.id.clone()) else {
+            return;
+        };
+        let pick = self
+            .back
+            .iter()
+            .rev()
+            .find(|id| **id != cur)
+            .cloned()
+            .unwrap_or(cur);
+        self.open_beside(&pick, notices);
+    }
+
+    /// Montre une fiche dans le volet de droite.
+    pub fn open_beside(&mut self, id: &NoteId, notices: &mut Notices) {
+        self.flush(notices);
+        self.other = self.new_editor(id);
+        self.other_right = true;
+        self.view = View::Note;
+    }
+
+    /// Nouvel éditeur, avec un identifiant d'affichage propre (deux volets
+    /// peuvent montrer la même fiche).
+    fn new_editor(&mut self, id: &NoteId) -> Option<Editor> {
+        self.next_salt += 1;
+        let salt = self.next_salt;
+        Editor::open(&self.project, id).map(|mut e| {
+            e.set_salt(salt);
+            e
+        })
     }
 
     /// Montre les fiches qui portent ce tag (onglet Recherche).
@@ -1013,6 +1413,7 @@ impl Workspace {
                         self.editor = None;
                         notices.info("La fiche ouverte a été supprimée hors de l'application.");
                     }
+                    self.forget_note(&id);
                 }
                 FileChange::RemovedWhileDirty(id) => notices.error(format!(
                     "Le fichier de « {} » a été supprimé ; il sera recréé à la prochaine sauvegarde.",
@@ -1200,6 +1601,8 @@ impl Workspace {
         let mut to_rename = None;
         let mut to_delete = None;
         let mut to_toggle: Option<String> = None;
+        let mut to_tab = None;
+        let mut to_beside = None;
         let selected = self.editor.as_ref().map(|e| e.id.clone());
         egui::ScrollArea::vertical()
             .id_salt("notes_scroll")
@@ -1231,10 +1634,22 @@ impl Workspace {
                         row_h,
                         indent,
                     );
-                    if resp.clicked() {
+                    if resp.clicked() && ui.input(|i| i.modifiers.command) || resp.middle_clicked()
+                    {
+                        to_tab = Some(id.clone());
+                    } else if resp.clicked() {
                         to_select = Some(id.clone());
                     }
                     resp.context_menu(|ui| {
+                        if ui.button("Ouvrir dans un nouvel onglet").clicked() {
+                            to_tab = Some(id.clone());
+                            ui.close();
+                        }
+                        if ui.button("Ouvrir à côté").clicked() {
+                            to_beside = Some(id.clone());
+                            ui.close();
+                        }
+                        ui.separator();
                         if ui.button("Renommer").clicked() {
                             to_rename = Some(id.clone());
                             ui.close();
@@ -1269,6 +1684,12 @@ impl Workspace {
         }
         if let Some(id) = to_select {
             self.select(&id, notices);
+        }
+        if let Some(id) = to_tab {
+            self.open_in_new_tab(&id, notices);
+        }
+        if let Some(id) = to_beside {
+            self.open_beside(&id, notices);
         }
         if let Some(id) = to_rename {
             self.select(&id, notices);
@@ -1419,7 +1840,7 @@ impl Workspace {
             }
             if out.deselect {
                 self.flush(notices);
-                self.editor = None;
+                self.park_active();
             }
             return;
         }
@@ -1429,7 +1850,10 @@ impl Workspace {
             self.apply_graph_outcome(outcome, notices, now_ms);
             return;
         }
-        let Some(editor) = &mut self.editor else {
+        if self.editor.is_none() {
+            if !self.tab_ids.is_empty() {
+                self.tabs_ui(ui, notices);
+            }
             ui.centered_and_justified(|ui| {
                 ui.weak(if self.project.is_empty() {
                     "Aucune fiche. Créez-en une avec « + Nouvelle » (Ctrl+N)."
@@ -1438,94 +1862,98 @@ impl Workspace {
                 });
             });
             return;
+        }
+        self.tabs_ui(ui, notices);
+        let ctx = ui.ctx().clone();
+        let user_packs = self.user_packs_dir.clone();
+        let (Some(editor), other) = (&mut self.editor, &mut self.other) else {
+            return;
         };
-
-        let edited = editor.header_ui(
-            ui,
-            &mut self.project,
-            now_ms,
-            notices,
-            self.user_packs_dir.as_deref(),
-        );
-        let mut insert_image = false;
-
-        if self
-            .project
-            .entry(&editor.id)
-            .is_some_and(|e| e.has_conflict())
-        {
-            let mut choice = None;
-            egui::Frame::new()
-                .fill(ui.visuals().error_fg_color.gamma_multiply(0.15))
-                .inner_margin(8.0)
-                .corner_radius(0.0)
-                .show(ui, |ui| {
-                    ui.label(
-                        "Ce fichier a été modifié hors de l'application alors que vous aviez \
-                         des modifications non enregistrées. La sauvegarde est suspendue.",
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Garder ma version").clicked() {
-                            choice = Some(true);
-                        }
-                        if ui.button("Prendre la version du disque").clicked() {
-                            choice = Some(false);
-                        }
-                    });
+        let mut outs = Vec::new();
+        let mut focus_other = false;
+        match other {
+            None => {
+                outs.push(Self::note_pane(
+                    ui,
+                    editor,
+                    &mut self.project,
+                    user_packs.as_deref(),
+                    notices,
+                    now_ms,
+                ));
+            }
+            Some(other) => {
+                let right = self.other_right;
+                let press = ctx.input(|i| {
+                    i.pointer
+                        .any_pressed()
+                        .then(|| i.pointer.press_origin())
+                        .flatten()
                 });
-            if let Some(keep_mine) = choice {
-                match self.project.resolve_conflict(&editor.id, keep_mine) {
-                    Ok(()) => editor.sync_from_project(&self.project, now_ms),
-                    Err(e) => notices.error(format!("Résolution du conflit impossible : {e}")),
+                ui.columns(2, |cols| {
+                    let (main_col, other_col) = if right {
+                        let [a, b] = cols else { return };
+                        (a, b)
+                    } else {
+                        let [a, b] = cols else { return };
+                        (b, a)
+                    };
+                    let main_rect = main_col.max_rect();
+                    let other_rect = other_col.max_rect();
+                    main_col.push_id("volet_actif", |ui| {
+                        ui.painter().hline(
+                            main_rect.x_range(),
+                            main_rect.top(),
+                            egui::Stroke::new(2.0, crate::theme::accent(ui.visuals())),
+                        );
+                        outs.push(Self::note_pane(
+                            ui,
+                            editor,
+                            &mut self.project,
+                            user_packs.as_deref(),
+                            notices,
+                            now_ms,
+                        ));
+                    });
+                    other_col.push_id("volet_autre", |ui| {
+                        outs.push(Self::note_pane(
+                            ui,
+                            other,
+                            &mut self.project,
+                            user_packs.as_deref(),
+                            notices,
+                            now_ms,
+                        ));
+                    });
+                    // Un clic dans l'autre volet le rend actif (champs,
+                    // liens, raccourcis).
+                    focus_other =
+                        press.is_some_and(|p| other_rect.contains(p) && !main_rect.contains(p));
+                });
+                // Même fiche dans les deux volets : chacun reprend le texte
+                // de l'autre.
+                if other.id == editor.id {
+                    other.sync_from_project(&self.project, now_ms);
+                    editor.sync_from_project(&self.project, now_ms);
                 }
             }
         }
-
-        let mut insert_table = None;
-        ui.horizontal(|ui| {
-            if ui
-                .button("Insérer…")
-                .on_hover_text(
-                    "Image, son, vidéo ou document — ou glissez/collez (Ctrl+V) le fichier",
-                )
-                .clicked()
+        if focus_other {
+            std::mem::swap(&mut self.editor, &mut self.other);
+            self.other_right = !self.other_right;
+            if let Some(id) = self.editor.as_ref().map(|e| e.id.clone())
+                && !self.tab_ids.contains(&id)
             {
-                insert_image = true;
-            }
-            ui.menu_button("Tableau", |ui| {
-                if let Some(size) = crate::editor::table_picker(ui) {
-                    insert_table = Some(size);
-                    ui.close();
+                // Le volet actif devient l'onglet courant.
+                let old = self.other.as_ref().map(|e| e.id.clone());
+                match old.and_then(|o| self.tab_ids.iter().position(|t| *t == o)) {
+                    Some(p) => self.tab_ids.insert(p + 1, id),
+                    None => self.tab_ids.push(id),
                 }
-            })
-            .response
-            .on_hover_text("Insérer un tableau (redimensionnable ensuite par son coin)");
-            ui.weak("Cliquez dans le texte pour le modifier ; Échap pour terminer.");
-        });
-        ui.separator();
-        if let Some((r, c)) = insert_table {
-            editor.format(
-                crate::editor::Format::Table(r, c),
-                &mut self.project,
-                now_ms,
-            );
+            }
         }
-        let body = editor.body_ui(ui, &mut self.project, now_ms, notices);
-        if insert_image || body.insert_file {
-            self.run_command(Command::InsertImage, &ui.ctx().clone(), notices);
-        }
-        if edited || body.edited || insert_table.is_some() {
-            self.mark_edited();
-        }
-        if body.insert_template {
-            self.dialog = Some(Dialog::InsertTemplate);
-        }
-        if let Some(tag) = body.search_tag {
-            self.search_tag(&tag);
-        }
-        if let Some(target) = body.open {
-            self.select(&target, notices);
-            self.reveal_section(&target, body.open_section.as_deref());
+        for out in outs {
+            self.apply_pane(out, &ctx, notices);
         }
     }
 
@@ -1612,7 +2040,7 @@ impl Workspace {
         }
         if outcome.deselect {
             self.flush(notices);
-            self.editor = None;
+            self.park_active();
         }
     }
 
@@ -1948,6 +2376,7 @@ impl Workspace {
                 self.flush(notices);
                 self.editor = None;
             }
+            self.forget_note(&id);
             match self.project.delete(&id) {
                 Ok(_) => notices.info("Fiche déplacée dans la corbeille du projet."),
                 Err(e) => notices.error(format!("Suppression impossible : {e}")),
@@ -2599,8 +3028,10 @@ mod ui_tests {
         assert!(harness.query_by_label("#lieu").is_some());
         harness.get_by_label("#manoir").click();
         harness.run_steps(4);
-        assert!(
-            harness.query_by_label("Essai").is_some(),
+        // L'onglet et le résultat de recherche.
+        assert_eq!(
+            harness.query_all_by_label("Essai").count(),
+            2,
             "résultat de tag:lieu/manoir"
         );
     }
@@ -2787,6 +3218,50 @@ mod ui_tests {
         let body = body_text(&harness);
         assert!(body.starts_with("Début\n\n## Essai ("), "{body}");
         assert_eq!(editing_text(&harness).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn tabs_history_and_split_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        harness.get_by_label("Majordome").click();
+        harness.run_steps(4);
+        harness.get_by_label("Coffre du bureau").click();
+        harness.run_steps(4);
+        assert_eq!(open_title(&harness), "Coffre du bureau");
+        // Retour / suivant.
+        harness.key_press_modifiers(egui::Modifiers::ALT, egui::Key::ArrowLeft);
+        harness.run_steps(4);
+        assert_eq!(open_title(&harness), "Majordome");
+        harness.key_press_modifiers(egui::Modifiers::ALT, egui::Key::ArrowRight);
+        harness.run_steps(4);
+        assert_eq!(open_title(&harness), "Coffre du bureau");
+        // Nouvel onglet (comme Ctrl+clic dans la liste), puis fermeture
+        // (Ctrl+W).
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            let salle = ws
+                .project
+                .resolve_title("Salle des Archives")
+                .unwrap()
+                .clone();
+            ws.open_in_new_tab(&salle, &mut state.notices);
+        }
+        harness.run_steps(4);
+        assert_eq!(open_title(&harness), "Salle des Archives");
+        assert_eq!(harness.state().ws.as_ref().unwrap().tab_ids.len(), 2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::W);
+        harness.run_steps(4);
+        assert_eq!(open_title(&harness), "Coffre du bureau");
+        assert_eq!(harness.state().ws.as_ref().unwrap().tab_ids.len(), 1);
+        // Côte à côte : la fiche précédente dans le second volet.
+        harness.get_by_label("Côte à côte").click();
+        harness.run_steps(6);
+        let ws = harness.state().ws.as_ref().unwrap();
+        let other = ws.other.as_ref().unwrap().id.clone();
+        assert_eq!(ws.project.note(&other).unwrap().meta.title, "Majordome");
+        snapshot(&mut harness, "48_cote_a_cote");
     }
 
     #[test]
