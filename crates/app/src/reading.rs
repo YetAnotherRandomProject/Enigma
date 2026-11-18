@@ -123,25 +123,24 @@ impl ReadingState {
             }
             Block::Quote(spans) => {
                 let mut out = None;
-                egui::Frame::new()
+                let frame = egui::Frame::new()
                     .inner_margin(egui::Margin {
-                        left: 10,
+                        left: 12,
                         right: 4,
                         top: 2,
                         bottom: 2,
                     })
-                    .stroke(Stroke::NONE)
                     .show(ui, |ui| {
-                        let r = ui.max_rect();
-                        ui.painter().line_segment(
-                            [
-                                Pos2::new(r.left() - 8.0, r.top()),
-                                Pos2::new(r.left() - 8.0, r.bottom()),
-                            ],
-                            Stroke::new(3.0, visuals.weak_text_color()),
-                        );
                         out = rich_text(ui, spans, 14.0, Some(visuals.weak_text_color()), project);
                     });
+                let r = frame.response.rect;
+                ui.painter().line_segment(
+                    [
+                        Pos2::new(r.left() + 3.0, r.top()),
+                        Pos2::new(r.left() + 3.0, r.bottom()),
+                    ],
+                    Stroke::new(3.0, visuals.weak_text_color()),
+                );
                 out
             }
             Block::Code(code) => {

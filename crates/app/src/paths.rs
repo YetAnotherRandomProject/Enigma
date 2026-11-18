@@ -37,8 +37,17 @@ pub fn pack_roots() -> Vec<PathBuf> {
 }
 
 /// Fichier des raccourcis clavier de l'utilisateur
-/// (ex. `%APPDATA%\\Enigma Notes\\config\\raccourcis.json`).
+/// (ex. `%APPDATA%\Enigma Notes\config\raccourcis.json`).
 pub fn keymap_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "Enigma Notes")
         .map(|d| d.config_dir().join("raccourcis.json"))
+}
+
+/// Dossier des dossiers de travail des projets ouverts (cache de
+/// l'utilisateur ; un sous-dossier par projet ouvert, supprimé à la
+/// fermeture).
+pub fn work_root() -> PathBuf {
+    directories::ProjectDirs::from("", "", "Enigma Notes")
+        .map(|d| d.cache_dir().join("projets-ouverts"))
+        .unwrap_or_else(|| std::env::temp_dir().join("enigma-notes-projets"))
 }

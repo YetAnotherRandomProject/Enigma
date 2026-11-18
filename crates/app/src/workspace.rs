@@ -180,10 +180,6 @@ impl Workspace {
         Ok(ws)
     }
 
-    pub fn root(&self) -> &Path {
-        self.project.root()
-    }
-
     /// Raccourcis de l'utilisateur et fichier où les enregistrer.
     pub fn set_keymap(&mut self, keymap: Keymap, path: Option<PathBuf>) {
         self.keymap = keymap;
@@ -191,7 +187,6 @@ impl Workspace {
     }
 
     /// Le projet a-t-il changé sur le disque depuis le dernier appel ?
-    #[allow(dead_code)] // branché avec le fichier .enigma (en cours)
     pub fn take_disk_changed(&mut self) -> bool {
         std::mem::take(&mut self.disk_changed)
     }
@@ -266,7 +261,7 @@ impl Workspace {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let md = enigma_core::render::image_markdown(&alt, &rel);
-                editor.insert_text(&md, &mut self.project, self.now_ms);
+                editor.insert_text(&md, true, &mut self.project, self.now_ms);
                 self.disk_changed = true;
                 self.mark_edited();
             }
@@ -835,6 +830,12 @@ impl Workspace {
         if !out.open {
             self.shortcut_editor = None;
         }
+    }
+
+    /// Texte de la fiche ouverte (tests).
+    #[cfg(test)]
+    pub fn editor_body(&self) -> Option<&str> {
+        self.editor.as_ref().map(|e| e.body())
     }
 
     #[cfg(test)]

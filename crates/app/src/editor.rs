@@ -462,21 +462,32 @@ impl Editor {
         outcome
     }
 
-    /// Insère du texte au curseur (ou à la fin), comme une étape d'historique.
-    pub fn insert_text(&mut self, text: &str, project: &mut Project, now_ms: u64) {
+    /// Insère du texte au curseur (ou à la fin), comme une étape
+    /// d'historique. `block` : le texte forme un paragraphe à part (lignes
+    /// vides autour), comme une image ou un tableau.
+    pub fn insert_text(&mut self, text: &str, block: bool, project: &mut Project, now_ms: u64) {
         let len = self.body.len();
         let pos = self
             .last_cursor
             .filter(|&p| p <= len && self.body.is_char_boundary(p))
             .unwrap_or(len);
-        // Une image se place sur sa propre ligne.
         let mut insert = String::new();
-        if pos > 0 && !self.body[..pos].ends_with('\n') {
-            insert.push('\n');
+        if block {
+            let before = &self.body[..pos];
+            if !before.is_empty() && !before.ends_with("\n\n") {
+                insert.push_str(if before.ends_with('\n') { "\n" } else { "\n\n" });
+            }
         }
         insert.push_str(text);
-        if !self.body[pos..].starts_with('\n') {
-            insert.push('\n');
+        if block {
+            let after = &self.body[pos..];
+            if !after.starts_with("\n\n") {
+                insert.push_str(if after.starts_with('\n') {
+                    "\n"
+                } else {
+                    "\n\n"
+                });
+            }
         }
         self.body.insert_str(pos, &insert);
         let end = pos + insert.len();

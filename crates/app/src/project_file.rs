@@ -311,6 +311,11 @@ impl ProjectFile {
         result
     }
 
+    /// Une écriture est-elle en cours ?
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
     /// Supprime le dossier de travail (à appeler après le dernier `commit`).
     pub fn close(mut self) {
         if let Some(job) = self.job.take() {

@@ -10,6 +10,7 @@ mod colors;
 mod commands;
 mod completion;
 mod editor;
+mod file_assoc;
 mod filter_ui;
 mod graph_export;
 mod graph_view;
@@ -18,10 +19,9 @@ mod notices;
 mod pack_editor;
 mod palette;
 mod paths;
-// Pas encore branché sur l'écran d'accueil (intégration en cours).
-#[allow(dead_code)]
 mod project_file;
 mod reading;
+mod session;
 mod shortcuts_ui;
 mod update;
 mod watcher;
