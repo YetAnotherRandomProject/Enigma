@@ -186,9 +186,16 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
   d'écran (`ctx.request_screenshot`, rappel) recadrée sur le canevas,
   encodée avec `png` (déjà dans l'arbre via epaint).
 - **Tableau d'enquête** (`enigma_core::board`, `app/board_view.rs`) :
-  positions dans `.enigma/board.json`, indépendantes de `pos` (graphe).
-  Une carte de fiche supprimée est gardée mais masquée. Fichier illisible →
-  tableau non enregistré (jamais écrasé).
+  positions dans `.enigma/board.json` (version 2 ; la 1 se lit toujours),
+  indépendantes de `pos` (graphe). Éléments repérés par une clé (l'id de
+  la fiche pour une carte) : cartes de fiches, textes, images (chemin
+  relatif au projet), groupes (déplacés avec ce qu'ils contiennent),
+  flèches entre deux clés. Ordre de dessin : groupes, fils, flèches,
+  fiches, images, textes ; le choix au clic suit l'ordre inverse. La
+  saisie (texte, nom de groupe, étiquette) est un `TextEdit` dans une
+  `Area` avec un `id_salt` propre à l'élément (sinon la perte de focus de
+  la saisie précédente ferme la nouvelle). Une carte de fiche supprimée est
+  gardée mais masquée. Fichier illisible → tableau non enregistré.
 - **Édition en direct** (`enigma_core::live`, `app/reading.rs`, `Editor::body_ui`) :
   plus de bascule Édition/Lecture. La fiche est découpée en unités (une
   ligne, ou un tableau / bloc de code entier) ; toutes sont mises en forme
@@ -219,6 +226,35 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
   marges de boutons larges, gris neutres et accent bleu (`theme::accent`,
   à utiliser plutôt que `selection.stroke`, qui est la couleur du texte
   sélectionné).
+- **Sélection sur plusieurs lignes** : l'unité active peut couvrir
+  plusieurs unités (`Editor::active` = plage de la première à la
+  dernière) ; glisser (`drag_anchor`, rectangles des unités de l'image
+  précédente), Maj+clic, Maj+flèches aux bords, Ctrl+A. Sans sélection,
+  seule l'unité du curseur reste active.
+- **Syntaxe enrichie** : `[[Fiche#Section]]`, `[[Fiche#^id]]`
+  (`enigma_core::sections`, `WikiLink::section`) ; `![[Fiche…]]` seul sur
+  une ligne = insertion (contenu reconstruit par `reading::build`, deux
+  niveaux au plus ; les clics ouvrent la fiche insérée) ; encadrés
+  `> [!type]` et commentaires `%%` sur plusieurs lignes = unités à part
+  (`live::UnitKind`) ; `==…==`, `%%…%%`, `#tag`, `[^note]` traités dans
+  `render::Builder::inline_marks` (les lignes étant analysées une à une,
+  une définition de note manquante est ajoutée puis ses blocs retirés).
+- **Recherche** (`enigma_core::search`) : repliement 1 caractère pour 1
+  (`fold_char`) pour garder les positions ; dépendance `regex`.
+- **Onglets et volets** (`Workspace::{tab_ids, parked, other}`) : l'éditeur
+  actif est `editor` ; les onglets en arrière-plan gardent leur éditeur
+  (historique d'annulation) dans `parked` ; `other` = volet côte à côte (un
+  clic dedans l'échange avec `editor`). Chaque éditeur a un `salt` (id du
+  `TextEdit`), deux volets pouvant montrer la même fiche. `select` =
+  navigation dans l'onglet courant (historique retour/suivant).
+- **Versions** (`enigma_core::versions`) : `Project::save` garde le
+  contenu *remplacé* (pas le nouveau) dans `.enigma/versions/<id>/`.
+- **Dans kittest** : l'indication (`placeholder`) d'un champ n'existe que
+  s'il est vide ; les menus déroulants n'ont pas de libellé (chercher par
+  rôle, le panneau de droite est dessiné avant la fiche) ; glyphes absents
+  aussi : `✕`, `↑`, `↓`, `←`, `→` (préférer `×`, du texte). Un séparateur
+  vertical dans une ligne horizontale prend toute la hauteur restante et
+  peut pousser les boutons d'une modale hors de l'écran (clics perdus).
 - **Presse-papiers** (`app/clipboard.rs`) : `clipboard_shortcuts: false`
   (egui-winit n'émet rien quand on colle des fichiers) ; Ctrl+C/X/V traduits
   dans `raw_input_hook` via `arboard` : texte → `Event::Paste`, image →
@@ -310,3 +346,14 @@ jalons suivants n'est codé avant validation.
   (SVG compris) redimensionnables, coller des images/fichiers, pièces
   jointes audio/vidéo, outils d'écriture Markdown, liste par catégorie,
   pack enrichi depuis la fiche et le graphe.
+- [x] **9. Édition en direct et fonctions inspirées d'Obsidian** (à la
+  demande) — plus de mode Lecture séparé, vrais tableaux, thème anguleux,
+  sélection multi-lignes, listes continues, recherche plein texte,
+  ouverture rapide, mentions non liées, aperçu au survol, liens de
+  section/paragraphe, insertion de fiche, encadrés, tags, surlignage,
+  commentaires, notes, plan, repli, rechercher/remplacer, Alt+↑/↓,
+  commandes « / », champs date/liste/lien, modèles à variables, onglets,
+  côte à côte, retour/suivant, tableau d'enquête enrichi, versions,
+  fusion/extraction.
+- [ ] **10. Export PDF, maths, Mermaid** — options à valider (dépendances
+  lourdes).
