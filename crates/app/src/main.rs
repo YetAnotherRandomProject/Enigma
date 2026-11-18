@@ -6,6 +6,7 @@
 mod app;
 mod board_view;
 mod bundled_packs;
+mod clipboard;
 mod colors;
 mod commands;
 mod completion;
@@ -23,6 +24,7 @@ mod project_file;
 mod reading;
 mod session;
 mod shortcuts_ui;
+mod system_open;
 mod update;
 mod watcher;
 mod workspace;
@@ -41,6 +43,8 @@ fn main() -> anyhow::Result<()> {
             .with_inner_size([1200.0, 780.0])
             .with_min_inner_size([640.0, 400.0]),
         wgpu_options: wgpu_options(),
+        // Copier/coller géré par l'application (fichiers et images, voir `clipboard`).
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     eframe::run_native(

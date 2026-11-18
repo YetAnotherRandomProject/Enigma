@@ -36,6 +36,8 @@ pub struct EnigmaApp {
     auto_update: bool,
     /// Ancien dossier de fiches dont on propose la conversion.
     convert: Option<PathBuf>,
+    /// Fichiers collés (Ctrl+V), à joindre à la fiche ouverte.
+    pasted_files: Vec<PathBuf>,
 }
 
 impl EnigmaApp {
@@ -72,6 +74,7 @@ impl EnigmaApp {
                 .and_then(|s| eframe::get_value(s, AUTO_UPDATE_KEY))
                 .unwrap_or(true),
             convert: None,
+            pasted_files: Vec::new(),
         };
         // Pas de vérification automatique en développement.
         if app.auto_update && !cfg!(debug_assertions) {
@@ -379,6 +382,11 @@ fn recent_label(p: &Path) -> String {
 }
 
 impl eframe::App for EnigmaApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let files = crate::clipboard::translate(raw_input, crate::clipboard::read_system);
+        self.pasted_files.extend(files);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let ctx = ui.ctx().clone();
@@ -405,6 +413,10 @@ impl eframe::App for EnigmaApp {
         let mut requests = Vec::new();
         match &mut self.session {
             Some(s) => {
+                let pasted = std::mem::take(&mut self.pasted_files);
+                if !pasted.is_empty() {
+                    s.ws.paste_files(&pasted, &mut self.notices);
+                }
                 s.ws.ui(ui, &mut self.notices, now_ms);
                 requests = s.ws.take_requests();
                 s.tick(&ctx, &mut self.notices);

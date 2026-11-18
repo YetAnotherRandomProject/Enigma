@@ -16,6 +16,63 @@ pub const ASSETS_DIR: &str = "assets";
 
 /// Extensions d'images prises en charge.
 pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg"];
+/// Extensions audio reconnues (lues avec le lecteur du système).
+pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "wav", "ogg", "oga", "flac", "m4a", "aac", "opus"];
+/// Extensions vidéo reconnues (lues avec le lecteur du système).
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mkv", "mov", "avi", "m4v", "ogv"];
+
+/// Nature d'un fichier joint à une fiche.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileKind {
+    Image,
+    Audio,
+    Video,
+    Other,
+}
+
+impl FileKind {
+    /// Libellé affiché.
+    pub fn label(self) -> &'static str {
+        match self {
+            FileKind::Image => "Image",
+            FileKind::Audio => "Audio",
+            FileKind::Video => "Vidéo",
+            FileKind::Other => "Fichier",
+        }
+    }
+}
+
+/// Nature d'un fichier d'après son extension.
+pub fn file_kind(path: &Path) -> FileKind {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+        FileKind::Image
+    } else if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
+        FileKind::Audio
+    } else if VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+        FileKind::Video
+    } else {
+        FileKind::Other
+    }
+}
+
+/// Texte Markdown pour joindre un fichier du projet : image affichée, ou
+/// lien vers le fichier (audio, vidéo, autre).
+pub fn attachment_markdown(label: &str, rel: &str, kind: FileKind) -> String {
+    if kind == FileKind::Image {
+        return crate::render::image_markdown(label, rel);
+    }
+    let label: String = label.chars().filter(|c| !matches!(c, '[' | ']')).collect();
+    let target = if rel.contains([' ', '(', ')']) {
+        format!("<{rel}>")
+    } else {
+        rel.to_owned()
+    };
+    format!("[{label}]({target})")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
@@ -25,8 +82,8 @@ pub enum ImportError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("« {0} » n'est pas une image prise en charge (png, jpg, gif, webp, svg)")]
-    NotAnImage(PathBuf),
+    #[error("« {0} » n'est pas un fichier")]
+    NotAFile(PathBuf),
 }
 
 fn io_err(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> ImportError {
@@ -81,11 +138,11 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Copie une image dans `assets/` du projet sous un nom libre ; rend son
-/// chemin relatif au projet (`assets/plan 2.png`).
+/// Copie un fichier (image, son, vidéo, document…) dans `assets/` du projet
+/// sous un nom libre ; rend son chemin relatif au projet (`assets/plan 2.png`).
 pub fn add_asset(project_root: &Path, source: &Path) -> Result<String, ImportError> {
-    if !is_image_path(source) {
-        return Err(ImportError::NotAnImage(source.to_owned()));
+    if !source.is_file() {
+        return Err(ImportError::NotAFile(source.to_owned()));
     }
     let bytes = std::fs::read(source).map_err(io_err("lire", source))?;
     let name = source
@@ -314,9 +371,21 @@ mod tests {
         assert_eq!(a, "assets/Plan.png");
         assert_eq!(b, "assets/Plan 2.png");
         assert!(matches!(
-            add_asset(p.path(), Path::new("notes.txt")),
-            Err(ImportError::NotAnImage(_))
+            add_asset(p.path(), Path::new("absent.txt")),
+            Err(ImportError::NotAFile(_))
         ));
+        assert_eq!(file_kind(Path::new("a/B.MP3")), FileKind::Audio);
+        assert_eq!(file_kind(Path::new("film.webm")), FileKind::Video);
+        assert_eq!(file_kind(Path::new("x.svg")), FileKind::Image);
+        assert_eq!(file_kind(Path::new("doc.pdf")), FileKind::Other);
+        assert_eq!(
+            attachment_markdown("Ambiance", "assets/son du manoir.ogg", FileKind::Audio),
+            "[Ambiance](<assets/son du manoir.ogg>)"
+        );
+        assert_eq!(
+            attachment_markdown("plan", "assets/plan.png", FileKind::Image),
+            "![plan](assets/plan.png)"
+        );
     }
 
     #[test]

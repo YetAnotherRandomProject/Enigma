@@ -28,6 +28,8 @@ pub enum ReadingAction {
     OpenTitle(String),
     /// Nouvelle largeur d'une image (fin du glisser).
     Resize { image: ImageRef, width: u32 },
+    /// Ouvrir une pièce jointe avec l'application du système.
+    OpenFile(std::path::PathBuf),
 }
 
 #[derive(Default)]
@@ -159,6 +161,7 @@ impl ReadingState {
                 None
             }
             Block::Image(img) => self.image_ui(ui, img, project, note_path),
+            Block::Attachment { label, src } => attachment_ui(ui, label, src, project, note_path),
         }
     }
 
@@ -254,6 +257,55 @@ impl ReadingState {
             );
         }
         None
+    }
+}
+
+/// Pièce jointe (son, vidéo, document) : carte avec bouton « Ouvrir ».
+fn attachment_ui(
+    ui: &mut egui::Ui,
+    label: &str,
+    src: &str,
+    project: &Project,
+    note_path: &Path,
+) -> Option<ReadingAction> {
+    let path = resolve_image(project.root(), note_path, src);
+    let kind = enigma_core::import::file_kind(Path::new(src));
+    let mut action = None;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(kind.label()).strong());
+            ui.label(if label.is_empty() { src } else { label });
+            match &path {
+                Some(p) => {
+                    let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                    ui.weak(human_size(size));
+                    let verb = match kind {
+                        enigma_core::import::FileKind::Audio
+                        | enigma_core::import::FileKind::Video => "Lire",
+                        _ => "Ouvrir",
+                    };
+                    if ui
+                        .button(verb)
+                        .on_hover_text("Ouvrir avec l'application du système")
+                        .clicked()
+                    {
+                        action = Some(ReadingAction::OpenFile(p.clone()));
+                    }
+                }
+                None => {
+                    ui.colored_label(ui.visuals().warn_fg_color, "fichier introuvable");
+                }
+            }
+        });
+    });
+    action
+}
+
+fn human_size(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 20 => format!("{:.1} Mo", b as f64 / f64::from(1u32 << 20)),
+        b if b >= 1 << 10 => format!("{} Ko", b >> 10),
+        b => format!("{b} o"),
     }
 }
 

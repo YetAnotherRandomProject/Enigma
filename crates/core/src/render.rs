@@ -148,6 +148,12 @@ pub enum Block {
     Code(String),
     Rule,
     Image(ImageRef),
+    /// Paragraphe réduit à un lien vers un fichier local (son, vidéo,
+    /// document) : affiché comme une pièce jointe.
+    Attachment {
+        label: String,
+        src: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -251,7 +257,19 @@ impl Builder<'_> {
                 spans,
             },
             _ if self.quote_depth > 0 => Block::Quote(spans),
-            _ => Block::Paragraph(spans),
+            _ => match spans.as_slice() {
+                [
+                    Inline {
+                        text,
+                        link: Some(InlineLink::Url(url)),
+                        ..
+                    },
+                ] if !crate::import::is_remote(url) && !url.starts_with('#') => Block::Attachment {
+                    label: text.clone(),
+                    src: url.clone(),
+                },
+                _ => Block::Paragraph(spans),
+            },
         };
         self.blocks.push(block);
     }
@@ -535,6 +553,19 @@ mod tests {
             last.iter()
                 .any(|s| s.link == Some(InlineLink::Url("https://x.y".into())) && s.text == "web")
         );
+    }
+
+    #[test]
+    fn local_file_link_alone_is_an_attachment() {
+        let b = blocks("[Ambiance](<assets/son du manoir.ogg>)\n\nVoir [site](https://x.y) ici.");
+        assert_eq!(
+            b[0],
+            Block::Attachment {
+                label: "Ambiance".into(),
+                src: "assets/son du manoir.ogg".into()
+            }
+        );
+        assert!(matches!(&b[1], Block::Paragraph(_)));
     }
 
     #[test]

@@ -13,6 +13,8 @@ enigma-core = { path = "crates/core" }
 enigma-graph = { path = "crates/graph" }
 
 anyhow = "1.0.104"
+# Presse-papiers (fichiers et images collés) ; déjà dans l'arbre via egui-winit, mêmes fonctions.
+arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
 directories = "6.0.0"
 eframe = { version = "0.37.0", features = ["persistence"] }
 # Police d'emoji embarquée : icônes des packs (🚪, 🔎…) lisibles sur tous les OS.

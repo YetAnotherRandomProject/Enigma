@@ -143,7 +143,7 @@ impl Command {
             Command::NewProject => "Nouveau projet…",
             Command::ImportFolder => "Importer un dossier de fiches .md…",
             Command::ImportNotes => "Importer des fiches .md…",
-            Command::InsertImage => "Insérer une image…",
+            Command::InsertImage => "Insérer une image ou un fichier…",
             Command::ToggleReading => "Basculer lecture / édition",
             Command::AssociateFiles => "Ouvrir les fichiers .enigma avec Enigma Notes",
         }

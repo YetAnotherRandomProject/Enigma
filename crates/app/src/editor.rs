@@ -515,6 +515,11 @@ impl Editor {
                 self.commit_body(project, EditKind::Discrete, now_ms);
                 outcome.edited = true;
             }
+            Some(ReadingAction::OpenFile(path)) => {
+                if let Err(e) = crate::system_open::open(&path) {
+                    notices.error(format!("Impossible d'ouvrir « {} » : {e}", path.display()));
+                }
+            }
             Some(ReadingAction::OpenTitle(title)) => {
                 outcome.open = match project.resolve_title(&title) {
                     Some(id) => Some(id.clone()),

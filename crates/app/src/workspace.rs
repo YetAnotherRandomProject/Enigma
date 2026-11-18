@@ -249,7 +249,8 @@ impl Workspace {
         }
     }
 
-    /// Copie une image dans le projet et l'insère dans la fiche ouverte.
+    /// Copie un fichier (image, son, vidéo, document) dans le projet et
+    /// l'insère dans la fiche ouverte.
     pub fn insert_image(&mut self, file: &Path, notices: &mut Notices) {
         let Some(editor) = &mut self.editor else {
             return;
@@ -260,7 +261,8 @@ impl Workspace {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let md = enigma_core::render::image_markdown(&alt, &rel);
+                let kind = enigma_core::import::file_kind(file);
+                let md = enigma_core::import::attachment_markdown(&alt, &rel, kind);
                 editor.insert_text(&md, true, &mut self.project, self.now_ms);
                 self.disk_changed = true;
                 self.mark_edited();
@@ -269,8 +271,39 @@ impl Workspace {
         }
     }
 
-    /// Fichiers glissés sur la fenêtre : images insérées dans la fiche
-    /// ouverte, fiches `.md` importées.
+    /// Image collée (Ctrl+V) : enregistrée en PNG dans le projet et insérée.
+    fn handle_pasted_images(&mut self, ctx: &egui::Context, notices: &mut Notices) {
+        if self.view != View::Note || self.editor.is_none() {
+            return;
+        }
+        let images: Vec<std::sync::Arc<egui::ColorImage>> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::PasteImage(img) => Some(img.clone()),
+                    _ => None,
+                })
+                .collect()
+        });
+        for img in images {
+            let result = crate::clipboard::image_png(&img).and_then(|png| {
+                enigma_core::import::add_asset_bytes(self.project.root(), "image collée.png", &png)
+                    .map_err(|e| e.to_string())
+            });
+            match (result, &mut self.editor) {
+                (Ok(rel), Some(editor)) => {
+                    let md = enigma_core::render::image_markdown("image collée", &rel);
+                    editor.insert_text(&md, true, &mut self.project, self.now_ms);
+                    self.disk_changed = true;
+                    self.mark_edited();
+                }
+                (Err(e), _) => notices.error(format!("Image collée non enregistrée : {e}")),
+                _ => {}
+            }
+        }
+    }
+
+    /// Fichiers glissés sur la fenêtre.
     fn handle_dropped_files(&mut self, ctx: &egui::Context, notices: &mut Notices) {
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -279,6 +312,13 @@ impl Workspace {
                 .map(|f| f.path().to_owned())
                 .collect()
         });
+        self.paste_files(&dropped, notices);
+    }
+
+    /// Fichiers collés ou déposés : fiches `.md` importées, autres fichiers
+    /// (images, sons, vidéos, documents) joints à la fiche ouverte.
+    pub fn paste_files(&mut self, dropped: &[PathBuf], notices: &mut Notices) {
+        let dropped: Vec<PathBuf> = dropped.to_vec();
         if dropped.is_empty() {
             return;
         }
@@ -289,13 +329,13 @@ impl Workspace {
             self.import_notes(&md, notices);
         }
         for file in other {
-            if !enigma_core::import::is_image_path(&file) {
+            if file.is_dir() {
                 notices.error(format!(
-                    "« {} » n'est ni une image ni une fiche .md.",
+                    "« {} » est un dossier : utilisez « Importer un dossier de fiches .md… ».",
                     file.display()
                 ));
             } else if self.editor.is_none() {
-                notices.info("Ouvrez d'abord une fiche pour y déposer une image.");
+                notices.info("Ouvrez d'abord une fiche pour y joindre un fichier.");
             } else {
                 self.insert_image(&file, notices);
             }
@@ -418,8 +458,11 @@ impl Workspace {
                 if self.editor.is_none() {
                     notices.info("Ouvrez d'abord une fiche pour y insérer une image.");
                 } else if let Some(file) = rfd::FileDialog::new()
-                    .set_title("Insérer une image")
+                    .set_title("Insérer une image ou un fichier")
                     .add_filter("Images", enigma_core::import::IMAGE_EXTENSIONS)
+                    .add_filter("Sons", enigma_core::import::AUDIO_EXTENSIONS)
+                    .add_filter("Vidéos", enigma_core::import::VIDEO_EXTENSIONS)
+                    .add_filter("Tous les fichiers", &["*"])
                     .pick_file()
                 {
                     self.insert_image(&file, notices);
@@ -651,6 +694,7 @@ impl Workspace {
     pub fn ui(&mut self, ui: &mut egui::Ui, notices: &mut Notices, now_ms: u64) {
         self.now_ms = now_ms;
         self.handle_dropped_files(&ui.ctx().clone(), notices);
+        self.handle_pasted_images(&ui.ctx().clone(), notices);
         self.process_fs_events(notices, now_ms);
         self.handle_screenshot(&ui.ctx().clone(), notices);
         let modal_open = self.dialog.is_some()
@@ -1128,8 +1172,10 @@ impl Workspace {
                 .on_hover_text("Fiche mise en forme, avec ses images (glisser le coin d'une image pour la redimensionner)");
             ui.separator();
             if ui
-                .button("Insérer une image…")
-                .on_hover_text("Ou glissez une image sur la fenêtre")
+                .button("Insérer…")
+                .on_hover_text(
+                    "Image, son, vidéo ou document — ou glissez/collez (Ctrl+V) le fichier",
+                )
                 .clicked()
             {
                 insert_image = true;
@@ -2372,6 +2418,58 @@ id: "
             .get_by(|n| n.role() == Role::TextInput && n.placeholder() == Some(HINT))
             .type_text(text);
         harness.run_steps(2);
+    }
+
+    #[test]
+    fn paste_image_and_audio_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        harness.get_by_label("Salle des Archives").click();
+        harness.run_steps(8);
+        // Ctrl+V d'une image (événement produit par clipboard::translate).
+        harness.event(egui::Event::PasteImage(std::sync::Arc::new(
+            egui::ColorImage::filled([4, 3], egui::Color32::RED),
+        )));
+        harness.run_steps(3);
+        let body = harness
+            .state()
+            .ws
+            .as_ref()
+            .unwrap()
+            .editor_body()
+            .unwrap()
+            .to_owned();
+        assert!(
+            body.contains("![image collée](<assets/image collée.png>)"),
+            "{body}"
+        );
+        assert!(dir.path().join("assets/image collée.png").is_file());
+
+        // Fichier audio collé : joint comme pièce jointe.
+        let src = tempfile::tempdir().unwrap();
+        let mp3 = src.path().join("ambiance.mp3");
+        std::fs::write(&mp3, b"ID3").unwrap();
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            ws.paste_files(std::slice::from_ref(&mp3), &mut state.notices);
+        }
+        let body = harness
+            .state()
+            .ws
+            .as_ref()
+            .unwrap()
+            .editor_body()
+            .unwrap()
+            .to_owned();
+        assert!(body.contains("[ambiance](assets/ambiance.mp3)"), "{body}");
+        harness.state_mut().ws.as_mut().unwrap().reading = true;
+        harness.run_steps(8);
+        assert!(
+            harness.query_by_label("Lire").is_some(),
+            "bouton de lecture"
+        );
+        snapshot(&mut harness, "22_pieces_jointes");
     }
 
     #[test]
