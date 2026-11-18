@@ -63,6 +63,13 @@ pub struct Editor {
     /// Texte affiché par le `TextEdit` à l'image précédente (flèches haut
     /// et bas : changer d'unité depuis la première ou la dernière ligne).
     last_galley: Option<Arc<egui::Galley>>,
+    /// Position de ce texte à l'écran.
+    last_galley_pos: egui::Pos2,
+    /// Sélection à la souris commencée à cet octet (glisser sur plusieurs
+    /// lignes : elles passent toutes en édition).
+    drag_anchor: Option<usize>,
+    /// Position verticale de chaque unité à l'image précédente.
+    unit_rects: Vec<(Range<usize>, egui::Rangef)>,
     /// Formulaires « + » pour enrichir le pack depuis la fiche.
     quick_category: QuickAdd,
     quick_status: QuickAdd,
@@ -397,6 +404,9 @@ impl Editor {
             preview: Preview::default(),
             active: None,
             last_galley: None,
+            last_galley_pos: egui::Pos2::ZERO,
+            drag_anchor: None,
+            unit_rects: Vec::new(),
             quick_category: QuickAdd::default(),
             quick_status: QuickAdd::default(),
             quick_field: QuickAdd::default(),
@@ -748,6 +758,7 @@ impl Editor {
         let mut active_rect: Option<egui::Rect> = None;
         let mut table_op: Option<table::Op> = None;
         let mut menu = |ui: &mut egui::Ui| format_menu(ui, false);
+        let mut unit_rects: Vec<(Range<usize>, egui::Rangef)> = Vec::new();
         {
             let project_ref: &Project = project;
             let body = &self.body;
@@ -761,15 +772,25 @@ impl Editor {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     for cu in &units {
                         let range = cu.unit.range.clone();
-                        if active.as_ref() != Some(&range) {
+                        let top = ui.cursor().top();
+                        let covered = active
+                            .as_ref()
+                            .is_some_and(|a| a.start <= range.start && range.end <= a.end);
+                        if !covered {
                             if action.is_none() {
                                 action = drags.unit_ui(ui, cu, project_ref, &note_path, &mut menu);
                             } else {
                                 drags.unit_ui(ui, cu, project_ref, &note_path, &mut menu);
                             }
+                            unit_rects.push((range, egui::Rangef::new(top, ui.cursor().top())));
                             continue;
                         }
-                        let kind = cu.unit.kind;
+                        let Some(range) = active.clone().filter(|a| a.start == range.start) else {
+                            continue;
+                        };
+                        // Plusieurs unités sélectionnées : texte Markdown ordinaire.
+                        let single = range == cu.unit.range;
+                        let kind = if single { cu.unit.kind } else { UnitKind::Line };
                         let scope = ui.scope(|ui| {
                             if kind == UnitKind::Table {
                                 table_op = table_toolbar(ui);
@@ -827,7 +848,8 @@ impl Editor {
                             );
                             // Images de la ligne, toujours visibles et
                             // redimensionnables pendant la modification.
-                            if cu.has_images()
+                            if single
+                                && cu.has_images()
                                 && let reading::Content::Line { blocks, .. } = &cu.content
                             {
                                 ui.horizontal_wrapped(|ui| {
@@ -844,6 +866,7 @@ impl Editor {
                             (output, buf)
                         });
                         active_rect = Some(scope.response.rect);
+                        unit_rects.push((range.clone(), scope.response.rect.y_range()));
                         let (output, buf) = scope.inner;
                         edit = Some((output, buf, range, kind));
                     }
@@ -859,11 +882,13 @@ impl Editor {
                 });
         }
         self.preview.units = units;
+        self.unit_rects = unit_rects;
 
         // 4. Résultat de la modification.
         let mut cursor_byte = None;
         if let Some((output, buf, range, kind)) = edit {
             self.last_galley = Some(output.galley.clone());
+            self.last_galley_pos = output.galley_pos;
             let local = |c: usize| range.start + char_to_byte(&buf, c);
             let sel = output
                 .cursor_range
@@ -898,6 +923,28 @@ impl Editor {
                 self.last_cursor = Some(p);
                 self.last_sel = Some(p.min(s)..p.max(s));
                 cursor_byte = (p == s).then_some(p);
+                // Sélection retirée : seule la ligne du curseur reste en
+                // édition.
+                let idx = self.preview.unit_at(p);
+                let single = self.preview.units.get(idx).map(|u| u.unit.range.clone());
+                if p == s
+                    && self.drag_anchor.is_none()
+                    && single.as_ref().is_some_and(|u| *u != range)
+                    && !ctx.input(|i| i.pointer.any_down())
+                {
+                    self.activate(&ctx, te_id, p, None);
+                }
+            }
+            // Glisser depuis le texte au-delà de ses bords : les lignes
+            // survolées passent en édition.
+            if output.response.dragged()
+                && self.drag_anchor.is_none()
+                && let Some((_, s)) = sel
+                && ctx
+                    .input(|i| i.pointer.interact_pos())
+                    .is_some_and(|p| !output.response.rect.y_range().contains(p.y))
+            {
+                self.drag_anchor = Some(s);
             }
 
             // Clic droit : mise en forme de la sélection, ou insertions.
@@ -950,6 +997,19 @@ impl Editor {
             }
         }
 
+        // Sélection à la souris sur plusieurs lignes.
+        if let Some(anchor) = self.drag_anchor {
+            if ctx.input(|i| i.pointer.primary_down()) {
+                if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                    let b = self.byte_at_pointer(p, anchor);
+                    self.activate(&ctx, te_id, b, Some(anchor));
+                    ctx.request_repaint();
+                }
+            } else {
+                self.drag_anchor = None;
+            }
+        }
+
         // 5. Fenêtre de suggestions (clic souris).
         self.popup_rect = None;
         if let Some(popup) = &self.popup {
@@ -980,7 +1040,18 @@ impl Editor {
 
         // 7. Actions sur la fiche mise en forme.
         match action {
-            Some(ViewAction::EditAt(b)) => self.activate(&ctx, te_id, b, None),
+            Some(ViewAction::EditAt(b)) => {
+                // Maj+clic : sélection depuis le curseur précédent.
+                let anchor = ctx
+                    .input(|i| i.modifiers.shift)
+                    .then(|| self.selection_anchor())
+                    .flatten();
+                self.activate(&ctx, te_id, b, anchor);
+            }
+            Some(ViewAction::DragFrom(b)) => {
+                self.activate(&ctx, te_id, b, None);
+                self.drag_anchor = Some(b);
+            }
             Some(ViewAction::OpenTitle(title)) => {
                 outcome.open = self.open_or_create(&title, project, notices);
             }
@@ -1068,8 +1139,9 @@ impl Editor {
         }
     }
 
-    /// Modifie l'unité contenant l'octet `b`, curseur à cet endroit
-    /// (sélection depuis `anchor` si elle est dans la même unité).
+    /// Modifie l'unité contenant l'octet `b`, curseur à cet endroit. Avec
+    /// `anchor` : sélection depuis cet octet, toutes les unités entre les
+    /// deux passent en édition.
     fn activate(&mut self, ctx: &egui::Context, te_id: egui::Id, b: usize, anchor: Option<usize>) {
         self.preview.sync(&self.body);
         let mut b = b.min(self.body.len());
@@ -1077,9 +1149,14 @@ impl Editor {
             b -= 1;
         }
         let idx = self.preview.unit_at(b);
-        let Some(range) = self.preview.units.get(idx).map(|u| u.unit.range.clone()) else {
+        let ia = anchor.map_or(idx, |a| self.preview.unit_at(a.min(self.body.len())));
+        let (Some(first), Some(last)) = (
+            self.preview.units.get(idx.min(ia)),
+            self.preview.units.get(idx.max(ia)),
+        ) else {
             return;
         };
+        let range = first.unit.range.start..last.unit.range.end;
         let local = |x: usize| {
             let x = x.clamp(range.start, range.end);
             self.body
@@ -1108,11 +1185,56 @@ impl Editor {
             self.active = Some(0..0);
             return;
         }
-        if let Some(r) = &self.active
-            && !self.preview.units.iter().any(|u| u.unit.range == *r)
+        if let Some(r) = self.active.clone() {
+            let units = &self.preview.units;
+            let ok = units.iter().any(|u| u.unit.range.start == r.start)
+                && units.iter().any(|u| u.unit.range.end == r.end);
+            if !ok {
+                let len = self.body.len();
+                let a = units.get(self.preview.unit_at(r.start.min(len)));
+                let b = units.get(self.preview.unit_at(r.end.min(len)));
+                self.active = a.zip(b).map(|(a, b)| a.unit.range.start..b.unit.range.end);
+            }
+        }
+    }
+
+    /// Bout fixe de la sélection courante (octet).
+    fn selection_anchor(&self) -> Option<usize> {
+        let sel = self.last_sel.clone()?;
+        Some(if self.last_cursor == Some(sel.start) {
+            sel.end
+        } else {
+            sel.start
+        })
+    }
+
+    /// Octet sous le pointeur pendant une sélection à la souris : dans le
+    /// texte en édition, la position exacte ; sur une autre ligne, son début
+    /// ou sa fin selon le sens.
+    fn byte_at_pointer(&self, p: egui::Pos2, anchor: usize) -> usize {
+        if let (Some(range), Some(g)) = (&self.active, &self.last_galley)
+            && let Some((_, y)) = self.unit_rects.iter().find(|(r, _)| r == range)
+            && y.contains(p.y)
         {
-            let idx = self.preview.unit_at(r.start.min(self.body.len()));
-            self.active = self.preview.units.get(idx).map(|u| u.unit.range.clone());
+            let c = g.cursor_from_pos(p - self.last_galley_pos).index.0;
+            return range.start + char_to_byte(&self.body[range.clone()], c);
+        }
+        let hit = self
+            .unit_rects
+            .iter()
+            .find(|(_, y)| y.contains(p.y))
+            .or_else(|| {
+                let first = self.unit_rects.first()?;
+                if p.y < first.1.min {
+                    Some(first)
+                } else {
+                    self.unit_rects.last()
+                }
+            });
+        match hit {
+            Some((r, _)) if r.start >= anchor => r.end,
+            Some((r, _)) => r.start,
+            None => anchor,
         }
     }
 
@@ -1130,10 +1252,15 @@ impl Editor {
         }
     }
 
-    /// Flèches, Retour arrière et Suppr aux bords d'une unité : passage à
-    /// l'unité voisine (ou fusion des deux lignes). Dans un tableau : Tab,
-    /// Maj+Tab et Entrée passent d'une cellule à l'autre. Rend `true` si le
-    /// texte a changé.
+    /// Touches traitées avant le `TextEdit` :
+    /// - flèches, Retour arrière et Suppr aux bords : passage à l'unité
+    ///   voisine (ou fusion des deux lignes) ; avec Maj, la sélection
+    ///   s'étend et les lignes traversées passent en édition ; Ctrl+A
+    ///   sélectionne toute la fiche ;
+    /// - listes : Entrée reprend la puce, Tab / Maj+Tab changent le niveau ;
+    /// - tableau : Tab, Maj+Tab et Entrée passent d'une cellule à l'autre.
+    ///
+    /// Rend `true` si le texte a changé.
     fn unit_keys(
         &mut self,
         ctx: &egui::Context,
@@ -1144,8 +1271,10 @@ impl Editor {
         use egui::{Key, Modifiers};
         enum Move {
             To(usize),
+            Select(usize, usize),
             Join(Range<usize>, usize),
             Table(table::Op),
+            Text(md_edit::Edit),
         }
         let Some(range) = self.active.clone() else {
             return false;
@@ -1154,20 +1283,24 @@ impl Editor {
         else {
             return false;
         };
-        let idx = self.preview.unit_at(range.start);
-        let Some(kind) = self.preview.units.get(idx).map(|u| u.unit.kind) else {
+        let first = self.preview.unit_at(range.start);
+        let last = self.preview.unit_at(range.end);
+        let units = &self.preview.units;
+        let Some(kind) = units.get(first).map(|u| u.unit.kind) else {
             return false;
         };
-        let units = &self.preview.units;
+        let kind = if first == last { kind } else { UnitKind::Line };
         let text = &self.body[range.clone()];
         let n = text.chars().count();
         let c = cr.primary.index.0.min(n);
         let selecting = cr.primary.index != cr.secondary.index;
-        let prev = idx
+        let cursor = range.start + char_to_byte(text, c);
+        let anchor = range.start + char_to_byte(text, cr.secondary.index.0.min(n));
+        let prev = first
             .checked_sub(1)
             .and_then(|i| units.get(i))
             .map(|u| u.unit.range.clone());
-        let next = units.get(idx + 1).map(|u| u.unit.range.clone());
+        let next = units.get(last + 1).map(|u| u.unit.range.clone());
         // Ligne affichée du curseur (texte replié compris).
         let (row, rows, col) = match &self.last_galley {
             Some(g) if g.job.text == text => {
@@ -1194,12 +1327,48 @@ impl Editor {
             let off = line.char_indices().nth(col).map_or(line.len(), |(i, _)| i);
             r.start + start + off
         };
+        let in_list = kind == UnitKind::Line && !selecting;
+        let enter = in_list.then(|| md_edit::list_enter(body, cursor)).flatten();
+        let indent = in_list
+            .then(|| md_edit::list_indent(body, cursor, false))
+            .flatten();
+        let outdent = in_list
+            .then(|| md_edit::list_indent(body, cursor, true))
+            .flatten();
+        let shift = Modifiers::SHIFT;
+        let shift_cmd = Modifiers::SHIFT | Modifiers::COMMAND;
         let mv = ctx.input_mut(|i| {
+            if i.consume_key(Modifiers::COMMAND, Key::A) {
+                return Some(Move::Select(0, body.len()));
+            }
+            if i.consume_key(shift_cmd, Key::Home) {
+                return Some(Move::Select(anchor, 0));
+            }
+            if i.consume_key(shift_cmd, Key::End) {
+                return Some(Move::Select(anchor, body.len()));
+            }
             if i.consume_key(Modifiers::COMMAND, Key::Home) {
                 return Some(Move::To(0));
             }
             if i.consume_key(Modifiers::COMMAND, Key::End) {
                 return Some(Move::To(body.len()));
+            }
+            // Maj+flèches au bord : la sélection gagne l'unité voisine.
+            if let Some(p) = &prev {
+                if row == 0 && i.consume_key(shift, Key::ArrowUp) {
+                    return Some(Move::Select(anchor, line_col(p, true)));
+                }
+                if c == 0 && i.consume_key(shift, Key::ArrowLeft) {
+                    return Some(Move::Select(anchor, p.end));
+                }
+            }
+            if let Some(nx) = &next {
+                if row + 1 >= rows && i.consume_key(shift, Key::ArrowDown) {
+                    return Some(Move::Select(anchor, line_col(nx, false)));
+                }
+                if c == n && i.consume_key(shift, Key::ArrowRight) {
+                    return Some(Move::Select(anchor, nx.end.min(nx.start)));
+                }
             }
             if selecting {
                 return None;
@@ -1214,6 +1383,21 @@ impl Editor {
                 if i.consume_key(Modifiers::NONE, Key::Enter) {
                     return Some(Move::Table(table::Op::NextRow));
                 }
+            }
+            if let Some(e) = &enter
+                && i.consume_key(Modifiers::NONE, Key::Enter)
+            {
+                return Some(Move::Text(e.clone()));
+            }
+            if let Some(e) = &outdent
+                && i.consume_key(Modifiers::SHIFT, Key::Tab)
+            {
+                return Some(Move::Text(e.clone()));
+            }
+            if let Some(e) = &indent
+                && i.consume_key(Modifiers::NONE, Key::Tab)
+            {
+                return Some(Move::Text(e.clone()));
             }
             if let Some(p) = &prev {
                 if row == 0 && i.consume_key(Modifiers::NONE, Key::ArrowUp) {
@@ -1245,24 +1429,34 @@ impl Editor {
                 self.activate(ctx, te_id, b, None);
                 false
             }
+            Some(Move::Select(a, b)) => {
+                self.activate(ctx, te_id, b, Some(a));
+                self.last_cursor = Some(b);
+                self.last_sel = Some(a.min(b)..a.max(b));
+                false
+            }
             Some(Move::Join(sep, b)) => {
                 self.body.replace_range(sep, "");
                 self.commit_body(project, EditKind::Typing, now_ms);
                 self.activate(ctx, te_id, b, None);
                 true
             }
-            Some(Move::Table(op)) => {
-                let cursor = range.start + char_to_byte(text, c);
-                match table::edit(text, cursor - range.start, op) {
-                    Some((t, pos)) => {
-                        self.body.replace_range(range.clone(), &t);
-                        self.commit_body(project, EditKind::Discrete, now_ms);
-                        self.activate(ctx, te_id, range.start + pos, None);
-                        true
-                    }
-                    None => false,
-                }
+            Some(Move::Text(e)) => {
+                self.body = e.text;
+                self.history.break_group();
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                self.activate(ctx, te_id, e.selection.end, None);
+                true
             }
+            Some(Move::Table(op)) => match table::edit(text, cursor - range.start, op) {
+                Some((t, pos)) => {
+                    self.body.replace_range(range.clone(), &t);
+                    self.commit_body(project, EditKind::Discrete, now_ms);
+                    self.activate(ctx, te_id, range.start + pos, None);
+                    true
+                }
+                None => false,
+            },
         }
     }
 

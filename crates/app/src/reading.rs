@@ -43,6 +43,8 @@ pub enum ViewAction {
     OpenFile(std::path::PathBuf),
     /// Modifier le texte à cet octet de la fiche.
     EditAt(usize),
+    /// Début d'une sélection à la souris à cet octet.
+    DragFrom(usize),
     /// Cocher/décocher la tâche de cette ligne.
     ToggleTask(Range<usize>),
     /// Nouvelles dimensions d'un tableau (lignes de données, colonnes).
@@ -960,7 +962,7 @@ impl Drags {
         }
         job.wrap.max_width = ui.available_width();
         let galley = ui.fonts_mut(|f| f.layout_job(job));
-        let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click_and_drag());
         ui.painter().galley(rect.min, galley.clone(), base);
         let index_at = |pos: Pos2| galley.cursor_from_pos(pos - rect.min).index.0;
         let link_at = |i: usize| links.iter().find(|(r, _)| r.contains(&i)).map(|(_, l)| *l);
@@ -991,6 +993,11 @@ impl Drags {
                 action = Some(ViewAction::Menu(c, at));
             }
         });
+        if resp.drag_started()
+            && let Some(p) = ui.input(|i| i.pointer.press_origin())
+        {
+            return Some(ViewAction::DragFrom(src.byte(index_at(p))));
+        }
         if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {

@@ -2097,6 +2097,71 @@ mod ui_tests {
         snapshot(&mut harness, "32_tableau_lecture");
     }
 
+    fn new_note(harness: &mut Harness<'_, State>, title: &str, body: &str) {
+        let state = harness.state_mut();
+        let ws = state.ws.as_mut().unwrap();
+        let id = ws
+            .project
+            .create_note(title, vec![], body.to_owned())
+            .unwrap();
+        ws.select(&id, &mut state.notices);
+        harness.run_steps(8);
+    }
+
+    fn editing_text(harness: &Harness<'_, State>) -> Option<String> {
+        harness
+            .query_by_role(Role::MultilineTextInput)
+            .and_then(|n| n.value())
+    }
+
+    #[test]
+    fn multi_line_selection_and_list_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        new_note(&mut harness, "Essai", "a\nb\nc");
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .edit_at(0);
+        harness.run_steps(4);
+        assert_eq!(editing_text(&harness).as_deref(), Some("a"));
+        // Maj+Bas : la ligne suivante passe aussi en édition.
+        harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+        harness.run_steps(4);
+        assert_eq!(editing_text(&harness).as_deref(), Some("a\nb"));
+        // Ctrl+A : toute la fiche.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run_steps(4);
+        assert_eq!(editing_text(&harness).as_deref(), Some("a\nb\nc"));
+        harness
+            .get_by_role(Role::MultilineTextInput)
+            .type_text("- un");
+        harness.run_steps(4);
+        assert_eq!(body_text(&harness), "- un");
+        // Entrée : puce suivante ; Tab : un niveau de plus.
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(4);
+        harness
+            .get_by_role(Role::MultilineTextInput)
+            .type_text("deux");
+        harness.run_steps(4);
+        harness.key_press(egui::Key::Tab);
+        harness.run_steps(4);
+        assert_eq!(body_text(&harness), "- un\n  - deux");
+        // Entrée sur un élément vide : il remonte d'un niveau.
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(4);
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(4);
+        assert_eq!(body_text(&harness), "- un\n  - deux\n- ");
+        assert_eq!(editing_text(&harness).as_deref(), Some("- "));
+    }
+
     #[test]
     fn rename_from_title_and_external_reload() {
         let dir = tempfile::tempdir().unwrap();

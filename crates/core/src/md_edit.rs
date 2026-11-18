@@ -269,6 +269,160 @@ pub fn table(rows: usize, cols: usize) -> String {
     crate::table::Table::empty(rows.max(1), cols).to_markdown()
 }
 
+/// Préfixe d'une ligne de liste ou de citation : retrait, `> `, puce ou
+/// numéro, case de tâche. (retrait, citations, marqueur, case, longueur).
+struct Prefix<'a> {
+    indent: &'a str,
+    quote: &'a str,
+    /// `- `, `* `, `+ `, `3. `, `3) ` (vide : simple citation).
+    marker: &'a str,
+    task: bool,
+    len: usize,
+}
+
+fn line_prefix(line: &str) -> Option<Prefix<'_>> {
+    let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let mut at = indent_len;
+    let rest = &line[at..];
+    let quote_len = rest.len() - rest.trim_start_matches(['>', ' ']).len();
+    let quote = &rest[..quote_len];
+    let quote = if quote.contains('>') { quote } else { "" };
+    at += quote.len();
+    let rest = &line[at..];
+    let marker_len = if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
+        2
+    } else {
+        let d = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if d > 0 && d < 10 && (rest[d..].starts_with(". ") || rest[d..].starts_with(") ")) {
+            d + 2
+        } else {
+            0
+        }
+    };
+    if marker_len == 0 && quote.is_empty() {
+        return None;
+    }
+    let marker = &rest[..marker_len];
+    at += marker_len;
+    let task = marker_len > 0
+        && ["[ ] ", "[x] ", "[X] "]
+            .iter()
+            .any(|t| line[at..].starts_with(t));
+    if task {
+        at += 4;
+    }
+    Some(Prefix {
+        indent: &line[..indent_len],
+        quote,
+        marker,
+        task,
+        len: at,
+    })
+}
+
+fn line_bounds(text: &str, cursor: usize) -> Range<usize> {
+    let start = text[..cursor].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[cursor..].find('\n').map_or(text.len(), |i| cursor + i);
+    start..end
+}
+
+/// Entrée dans une liste ou une citation : la ligne suivante reprend la
+/// puce (numéro + 1, case vide). Sur un élément vide, la puce est retirée
+/// (ou l'élément remonte d'un niveau s'il est en retrait). `None` : pas
+/// une liste, Entrée ordinaire.
+pub fn list_enter(text: &str, cursor: usize) -> Option<Edit> {
+    let cursor = clamp_sel(text, cursor..cursor).start;
+    let line = line_bounds(text, cursor);
+    let p = line_prefix(&text[line.clone()])?;
+    if cursor < line.start + p.len {
+        return None;
+    }
+    let content = &text[line.start + p.len..line.end];
+    if content.trim().is_empty() {
+        // Élément vide : remonter d'un niveau, ou fin de la liste.
+        let new = if !p.indent.is_empty() && !p.marker.is_empty() {
+            let cut = p
+                .indent
+                .len()
+                .min(if p.indent.starts_with('\t') { 1 } else { 2 });
+            format!(
+                "{}{}{}{}",
+                &p.indent[cut..],
+                p.quote,
+                p.marker,
+                if p.task { "[ ] " } else { "" }
+            )
+        } else {
+            String::new()
+        };
+        let t = format!("{}{new}{}", &text[..line.start], &text[line.end..]);
+        let c = line.start + new.len();
+        return Some(Edit {
+            text: t,
+            selection: c..c,
+        });
+    }
+    let marker = next_marker(p.marker);
+    let next = format!(
+        "\n{}{}{}{}",
+        p.indent,
+        p.quote,
+        marker,
+        if p.task { "[ ] " } else { "" }
+    );
+    let t = format!("{}{next}{}", &text[..cursor], &text[cursor..]);
+    let c = cursor + next.len();
+    Some(Edit {
+        text: t,
+        selection: c..c,
+    })
+}
+
+fn next_marker(marker: &str) -> String {
+    let d = marker.bytes().take_while(u8::is_ascii_digit).count();
+    if d == 0 {
+        return marker.to_owned();
+    }
+    let n: u64 = marker[..d].parse().unwrap_or(0);
+    format!("{}{}", n + 1, &marker[d..])
+}
+
+/// Tab / Maj+Tab sur un élément de liste : retrait d'un niveau en plus ou
+/// en moins (largeur de la puce, pour que les listes numérotées
+/// s'imbriquent). `None` : pas une liste.
+pub fn list_indent(text: &str, cursor: usize, outdent: bool) -> Option<Edit> {
+    let cursor = clamp_sel(text, cursor..cursor).start;
+    let line = line_bounds(text, cursor);
+    let p = line_prefix(&text[line.clone()])?;
+    if p.marker.is_empty() {
+        return None;
+    }
+    let step = p.marker.len().min(4);
+    let (new_indent, delta): (String, isize) = if outdent {
+        if p.indent.is_empty() {
+            return None;
+        }
+        let cut = if p.indent.starts_with('\t') {
+            1
+        } else {
+            p.indent.len().min(step)
+        };
+        (p.indent[cut..].to_owned(), -(cut as isize))
+    } else {
+        (format!("{}{}", " ".repeat(step), p.indent), step as isize)
+    };
+    let t = format!(
+        "{}{new_indent}{}",
+        &text[..line.start],
+        &text[line.start + p.indent.len()..]
+    );
+    let c = (cursor as isize + delta).max(line.start as isize) as usize;
+    Some(Edit {
+        text: t,
+        selection: c..c,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +497,94 @@ mod tests {
         assert_eq!(e.selection, 10..10);
         let e = insert_inline("ab", 1..1, "X");
         assert_eq!((e.text.as_str(), e.selection), ("aXb", 2..2));
+    }
+
+    #[test]
+    fn enter_continues_lists() {
+        let e = list_enter("- un", 4).unwrap();
+        assert_eq!(
+            (e.text.as_str(), e.selection.start),
+            (
+                "- un
+- ", 7
+            )
+        );
+        let e = list_enter("  9. neuf", 9).unwrap();
+        assert_eq!(
+            e.text,
+            "  9. neuf
+  10. "
+        );
+        let e = list_enter("- [x] fait", 10).unwrap();
+        assert_eq!(
+            e.text,
+            "- [x] fait
+- [ ] "
+        );
+        let e = list_enter("> cité", 7).unwrap();
+        assert_eq!(
+            e.text,
+            "> cité
+> "
+        );
+        // Coupe la ligne au curseur.
+        let e = list_enter("- ab", 3).unwrap();
+        assert_eq!(
+            e.text,
+            "- a
+- b"
+        );
+        // Élément vide : fin de liste, ou un niveau de moins.
+        let e = list_enter(
+            "- a
+- ", 6,
+        )
+        .unwrap();
+        assert_eq!(
+            (e.text.as_str(), e.selection.start),
+            (
+                "- a
+", 4
+            )
+        );
+        let e = list_enter(
+            "- a
+  - ", 8,
+        )
+        .unwrap();
+        assert_eq!(
+            e.text,
+            "- a
+- "
+        );
+        assert!(list_enter("texte", 5).is_none());
+        assert!(list_enter("- a", 1).is_none(), "curseur dans la puce");
+    }
+
+    #[test]
+    fn tab_indents_list_items() {
+        let e = list_indent(
+            "- a
+- b", 7, false,
+        )
+        .unwrap();
+        assert_eq!(
+            (e.text.as_str(), e.selection.start),
+            (
+                "- a
+  - b",
+                9
+            )
+        );
+        let e = list_indent(&e.text, 9, true).unwrap();
+        assert_eq!(
+            e.text,
+            "- a
+- b"
+        );
+        let e = list_indent("1. a", 4, false).unwrap();
+        assert_eq!(e.text, "   1. a");
+        assert!(list_indent("a", 1, false).is_none());
+        assert!(list_indent("- a", 3, true).is_none());
     }
 }
