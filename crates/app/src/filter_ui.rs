@@ -48,7 +48,7 @@ pub fn chip(ui: &mut egui::Ui, label: &str, color: Color32, state: Chip) -> egui
         egui::Button::new(text.small())
             .fill(fill)
             .stroke(egui::Stroke::new(1.0, stroke_color))
-            .corner_radius(8.0),
+            .corner_radius(0.0),
     )
 }
 

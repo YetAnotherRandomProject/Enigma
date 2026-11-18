@@ -189,13 +189,36 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
   positions dans `.enigma/board.json`, indépendantes de `pos` (graphe).
   Une carte de fiche supprimée est gardée mais masquée. Fichier illisible →
   tableau non enregistré (jamais écrasé).
-- **Mode Lecture** (`enigma_core::render`, `app/reading.rs`) : blocs
-  recalculés seulement si le texte change ; images via `egui_extras`
-  (`install_image_loaders`, URI `file:///C:/…` sous Windows, SVG rendu par
-  resvg à la taille affichée) ; tirer le coin d'une image réécrit sa
-  largeur dans le texte (historique → Ctrl+Z). Un paragraphe réduit à un
-  lien vers un fichier local = pièce jointe, ouverte avec l'application du
-  système (`app/system_open.rs`) : egui ne lit pas l'audio/la vidéo.
+- **Édition en direct** (`enigma_core::live`, `app/reading.rs`, `Editor::body_ui`) :
+  plus de bascule Édition/Lecture. La fiche est découpée en unités (une
+  ligne, ou un tableau / bloc de code entier) ; toutes sont mises en forme
+  sauf l'unité active, montrée dans un seul `TextEdit` (même id) avec son
+  Markdown. Clic sur une unité → `ViewAction::EditAt(octet)` (position
+  retrouvée par `live::source_offset`) ; ↑/↓/←/→, Retour arrière et Suppr
+  aux bords passent à l'unité voisine (ou fusionnent les lignes),
+  Ctrl+Début/Fin vont aux extrémités ; Échap, un clic ailleurs dans la même
+  couche (pas dans un menu) ou le focus donné à un autre champ terminent
+  l'édition. Une fiche vide est toujours en édition. Unités et blocs
+  recalculés seulement si le texte change ; images via `egui_extras` (URI
+  `file:///C:/…` sous Windows, SVG rendu par resvg) ; tirer le coin d'une
+  image réécrit sa largeur (Ctrl+Z). Une ligne faite seulement d'images les
+  affiche côte à côte. Un paragraphe réduit à un lien vers un fichier local
+  = pièce jointe (`app/system_open.rs`). Cases de tâches cliquables. Dans
+  les tests, pas de `MultilineTextInput` tant que rien n'est en édition :
+  `Editor::edit_at_end()` / `edit_at(octet)`.
+- **Tableaux** (`enigma_core::table`) : un `|` dans `[[A|type]]`, dans du
+  code, échappé ou dans une légende d'image `![a|300](…)` ne sépare pas les
+  cellules (on peut donc mettre des images côte à côte dans un tableau).
+  Chaque frappe réaligne les colonnes (largeur en caractères, police à
+  chasse fixe en édition) en gardant le curseur dans sa cellule et les
+  espaces de fin de cette cellule. Tab/Maj+Tab/Entrée : cellule suivante /
+  précédente / ligne suivante (ajoute une ligne à la fin). Barre d'outils
+  en édition ; en lecture, poignée au coin bas-droit pour ajouter/retirer
+  lignes et colonnes ; cases vides toujours visibles.
+- **Apparence** (`app/theme.rs`) : angles droits partout, contours 1 px,
+  marges de boutons larges, gris neutres et accent bleu (`theme::accent`,
+  à utiliser plutôt que `selection.stroke`, qui est la couleur du texte
+  sélectionné).
 - **Presse-papiers** (`app/clipboard.rs`) : `clipboard_shortcuts: false`
   (egui-winit n'émet rien quand on colle des fichiers) ; Ctrl+C/X/V traduits
   dans `raw_input_hook` via `arboard` : texte → `Event::Paste`, image →

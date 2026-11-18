@@ -26,6 +26,7 @@ mod reading;
 mod session;
 mod shortcuts_ui;
 mod system_open;
+mod theme;
 mod update;
 mod watcher;
 mod workspace;

@@ -309,7 +309,6 @@ mod tests {
         }
 
         // Mode Lecture : l'image est chargée (rendu SVG), puis redimensionnée.
-        harness.state_mut().session.as_mut().unwrap().ws.reading = true;
         wait(&mut harness, |h| h.query_by_label("plan").is_some());
         snapshot(&mut harness, "20_lecture_svg");
         let rect = harness.get_by_label("plan").rect();

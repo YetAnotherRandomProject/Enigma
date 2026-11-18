@@ -351,7 +351,7 @@ impl BoardView {
         }
 
         // --- Cartes ---
-        let radius = CornerRadius::same((6.0 * zoom).clamp(2.0, 8.0) as u8);
+        let radius = CornerRadius::ZERO;
         for (id, q) in &cards {
             let r = card_rect(*q);
             if !r.intersects(rect) {

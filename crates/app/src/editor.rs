@@ -3,12 +3,16 @@
 //! montré en texte brut.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
+use std::sync::Arc;
 
 use eframe::egui::{self, Color32, FontId, RichText, Stroke};
 use enigma_core::history::{EditKind, History};
+use enigma_core::live::{self, UnitKind};
 use enigma_core::markdown;
 use enigma_core::md_edit;
 use enigma_core::pack::FieldKind;
+use enigma_core::table;
 use enigma_core::{FieldValue, NoteId, NoteMeta, Project};
 
 use crate::colors::{c32, text_on};
@@ -16,7 +20,7 @@ use crate::completion::{self, ItemKind, Nav, Popup};
 use crate::highlight::Highlighter;
 use crate::notices::Notices;
 use crate::quick_add::{self, NewItem, QuickAdd};
-use crate::reading::{ReadingAction, ReadingState};
+use crate::reading::{self, Preview, ViewAction};
 
 /// État complet annulable d'une fiche (le titre est exclu : il ne change
 /// que par renommage).
@@ -52,8 +56,13 @@ pub struct Editor {
     last_sel: Option<std::ops::Range<usize>>,
     /// Début (caractères) de la sélection à rétablir avec `pending_cursor`.
     pending_anchor: Option<usize>,
-    /// État du mode Lecture (blocs en cache, redimensionnement en cours).
-    reading: ReadingState,
+    /// Fiche mise en forme (unités en cache, glisser en cours).
+    preview: Preview,
+    /// Unité en cours de modification (plage dans `body`).
+    active: Option<Range<usize>>,
+    /// Texte affiché par le `TextEdit` à l'image précédente (flèches haut
+    /// et bas : changer d'unité depuis la première ou la dernière ligne).
+    last_galley: Option<Arc<egui::Galley>>,
     /// Formulaires « + » pour enrichir le pack depuis la fiche.
     quick_category: QuickAdd,
     quick_status: QuickAdd,
@@ -83,7 +92,8 @@ pub enum Format {
     Delete,
 }
 
-enum MenuChoice {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuChoice {
     Format(Format),
     InsertFile,
     Copy,
@@ -91,7 +101,7 @@ enum MenuChoice {
 }
 
 /// Menu contextuel du texte.
-fn format_menu(ui: &mut egui::Ui, has_selection: bool) -> Option<MenuChoice> {
+pub fn format_menu(ui: &mut egui::Ui, has_selection: bool) -> Option<MenuChoice> {
     use md_edit::{Inline as I, Line as L};
     let mut choice = None;
     let mut item = |ui: &mut egui::Ui, label: &str, keys: &str, c: MenuChoice| {
@@ -105,6 +115,7 @@ fn format_menu(ui: &mut egui::Ui, has_selection: bool) -> Option<MenuChoice> {
             ui.close();
         }
     };
+    let mut picked = None;
     if has_selection {
         item(ui, "Couper", "Ctrl+X", MenuChoice::Cut);
         item(ui, "Copier", "Ctrl+C", MenuChoice::Copy);
@@ -186,20 +197,179 @@ fn format_menu(ui: &mut egui::Ui, has_selection: bool) -> Option<MenuChoice> {
     ui.separator();
     ui.menu_button("Insérer", |ui| {
         ui.menu_button("Tableau", |ui| {
-            for (r, c) in [(2, 2), (3, 3), (4, 4), (3, 5)] {
-                item(
-                    ui,
-                    &format!("{c} colonnes × {r} lignes"),
-                    "",
-                    MenuChoice::Format(Format::Table(r, c)),
-                );
+            if let Some(size) = table_picker(ui) {
+                picked = Some(size);
+                ui.close();
             }
         });
         item(ui, "Séparateur", "", MenuChoice::Format(Format::Rule));
         item(ui, "Date du jour", "", MenuChoice::Format(Format::Date));
         item(ui, "Image ou fichier…", "", MenuChoice::InsertFile);
     });
+    if let Some((r, c)) = picked {
+        choice = Some(MenuChoice::Format(Format::Table(r, c)));
+    }
     choice
+}
+
+/// Grille de choix de la taille d'un tableau (survol puis clic) :
+/// (lignes de données, colonnes).
+pub fn table_picker(ui: &mut egui::Ui) -> Option<(usize, usize)> {
+    const N: usize = 8;
+    const CELL: f32 = 18.0;
+    let id = egui::Id::unique("table_picker");
+    let mut hover: (usize, usize) = ui.data(|d| d.get_temp(id)).unwrap_or((2, 3));
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(CELL * N as f32, CELL * (N + 1) as f32),
+        egui::Sense::click(),
+    );
+    if let Some(p) = resp.hover_pos() {
+        let c = (((p.x - rect.left()) / CELL) as usize).min(N - 1) + 1;
+        let r = (((p.y - rect.top()) / CELL) as usize).min(N);
+        hover = (r.max(1), c);
+        ui.data_mut(|d| d.insert_temp(id, hover));
+    }
+    let v = ui.visuals().clone();
+    let accent = crate::theme::accent(&v);
+    for r in 0..=N {
+        for c in 0..N {
+            let cell = egui::Rect::from_min_size(
+                rect.min + egui::vec2(c as f32 * CELL, r as f32 * CELL),
+                egui::Vec2::splat(CELL),
+            )
+            .shrink(1.5);
+            let on = r <= hover.0 && c < hover.1;
+            let fill = match (on, r == 0) {
+                (true, _) => accent.gamma_multiply(if r == 0 { 0.9 } else { 0.55 }),
+                (false, true) => v.widgets.inactive.bg_fill,
+                (false, false) => v.extreme_bg_color,
+            };
+            ui.painter().rect_filled(cell, 0.0, fill);
+            ui.painter().rect_stroke(
+                cell,
+                0.0,
+                Stroke::new(1.0, v.widgets.inactive.bg_stroke.color),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+    ui.label(
+        RichText::new(format!(
+            "{} colonnes × {} lignes (+ en-tête)",
+            hover.1, hover.0
+        ))
+        .small()
+        .weak(),
+    );
+    resp.clicked().then_some(hover)
+}
+
+/// Outils du tableau en cours de modification.
+fn table_toolbar(ui: &mut egui::Ui) -> Option<table::Op> {
+    use table::{Align, Op};
+    let mut op = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.spacing_mut().button_padding = egui::vec2(7.0, 2.0);
+        let mut b = |ui: &mut egui::Ui, label: &str, hint: &str, o: Op| {
+            if ui
+                .add(egui::Button::new(RichText::new(label).small()))
+                .on_hover_text(hint)
+                .clicked()
+            {
+                op = Some(o);
+            }
+        };
+        b(
+            ui,
+            "+ Ligne avant",
+            "Insérer une ligne au-dessus",
+            Op::RowAbove,
+        );
+        b(
+            ui,
+            "+ Ligne après",
+            "Insérer une ligne en dessous (Entrée sur la dernière ligne)",
+            Op::RowBelow,
+        );
+        b(
+            ui,
+            "+ Colonne avant",
+            "Insérer une colonne à gauche",
+            Op::ColLeft,
+        );
+        b(
+            ui,
+            "+ Colonne après",
+            "Insérer une colonne à droite",
+            Op::ColRight,
+        );
+        ui.add_space(6.0);
+        b(
+            ui,
+            "Suppr. ligne",
+            "Supprimer la ligne du curseur",
+            Op::DeleteRow,
+        );
+        b(
+            ui,
+            "Suppr. colonne",
+            "Supprimer la colonne du curseur",
+            Op::DeleteCol,
+        );
+        ui.add_space(6.0);
+        b(
+            ui,
+            "Gauche",
+            "Aligner la colonne à gauche",
+            Op::Align(Align::Left),
+        );
+        b(ui, "Centre", "Centrer la colonne", Op::Align(Align::Center));
+        b(
+            ui,
+            "Droite",
+            "Aligner la colonne à droite",
+            Op::Align(Align::Right),
+        );
+        ui.add_space(6.0);
+        ui.weak(RichText::new("Tab : cellule suivante · Entrée : ligne suivante").small());
+    });
+    op
+}
+
+/// Texte d'un tableau ou d'un bloc de code en cours de modification :
+/// police à chasse fixe (colonnes alignées), syntaxe atténuée.
+fn mono_job(text: &str, kind: UnitKind, v: &egui::Visuals) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let font = FontId::monospace(14.0);
+    let plain = TextFormat::simple(font.clone(), v.text_color());
+    let weak = TextFormat::simple(font, v.weak_text_color());
+    let mut job = LayoutJob::default();
+    let lines: Vec<&str> = text.split('\n').collect();
+    for (i, line) in lines.iter().enumerate() {
+        let syntax = match kind {
+            UnitKind::Code => i == 0 || (i + 1 == lines.len() && i > 0 && line.trim().len() >= 3),
+            _ => table::is_delimiter_row(line),
+        };
+        if syntax {
+            job.append(line, 0.0, weak.clone());
+        } else if kind == UnitKind::Table {
+            let cells = table::split_cells(line);
+            let mut at = 0;
+            for r in cells {
+                job.append(&line[at..r.start], 0.0, weak.clone());
+                job.append(&line[r.clone()], 0.0, plain.clone());
+                at = r.end;
+            }
+            job.append(&line[at..], 0.0, weak.clone());
+        } else {
+            job.append(line, 0.0, plain.clone());
+        }
+        if i + 1 < lines.len() {
+            job.append("\n", 0.0, plain.clone());
+        }
+    }
+    job
 }
 
 impl Editor {
@@ -224,7 +394,9 @@ impl Editor {
             last_cursor: None,
             last_sel: None,
             pending_anchor: None,
-            reading: ReadingState::default(),
+            preview: Preview::default(),
+            active: None,
+            last_galley: None,
             quick_category: QuickAdd::default(),
             quick_status: QuickAdd::default(),
             quick_field: QuickAdd::default(),
@@ -399,7 +571,7 @@ impl Editor {
                 }))
                 .fill(if on { color } else { Color32::TRANSPARENT })
                 .stroke(Stroke::new(1.0, color))
-                .corner_radius(10.0);
+                .corner_radius(0.0);
                 let hint = if on {
                     "Retirer cette catégorie"
                 } else {
@@ -413,7 +585,7 @@ impl Editor {
                 if pack.category(id).is_none() {
                     let button = egui::Button::new(format!("{id} ✕"))
                         .fill(Color32::from_gray(90))
-                        .corner_radius(10.0);
+                        .corner_radius(0.0);
                     if ui
                         .add(button)
                         .on_hover_text("Catégorie absente du pack : cliquer pour la retirer")
@@ -500,8 +672,10 @@ impl Editor {
         edited
     }
 
-    /// Corps Markdown mis en forme pendant la frappe, avec suggestions de
-    /// liens et Ctrl+clic pour suivre un lien.
+    /// Corps de la fiche, toujours mis en forme ; seule l'unité en cours de
+    /// modification (ligne, tableau, bloc de code) montre son Markdown, mis
+    /// en forme pendant la frappe. Suggestions de liens, Ctrl+clic pour
+    /// suivre un lien depuis le texte.
     pub fn body_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -511,11 +685,25 @@ impl Editor {
     ) -> BodyOutcome {
         let mut outcome = BodyOutcome::default();
         let te_id = egui::Id::unique(("body", self.id.as_str()));
-        let focused = ui.memory(|m| m.has_focus(te_id));
+        let ctx = ui.ctx().clone();
+        self.preview.sync(&self.body);
 
-        // 1. Touches de navigation, consommées avant le TextEdit.
+        // 1. Édition demandée (insertion, mise en forme, annuler…).
+        if let Some(ci) = self.pending_cursor.take() {
+            let b = char_to_byte(&self.body, ci);
+            let anchor = self
+                .pending_anchor
+                .take()
+                .map(|a| char_to_byte(&self.body, a));
+            self.activate(&ctx, te_id, b, anchor);
+        }
+        self.resolve_active();
+        let focused = ctx.memory(|m| m.has_focus(te_id));
+
+        // 2. Touches consommées avant le TextEdit : suggestions, passage
+        //    d'une unité à l'autre, cellules de tableau.
         if focused && self.popup.is_some() {
-            let nav = ui.input_mut(|i| {
+            let nav = ctx.input_mut(|i| {
                 use egui::{Key, Modifiers};
                 if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
                     Some(Nav::Down)
@@ -534,145 +722,566 @@ impl Editor {
             if let Some(nav) = nav {
                 outcome.edited |= self.navigate(nav, project, now_ms, notices);
             }
+        } else if focused {
+            outcome.edited |= self.unit_keys(&ctx, te_id, project, now_ms);
         }
-
-        // 2. Position du curseur après une insertion.
         if let Some(ci) = self.pending_cursor.take() {
-            let anchor = self.pending_anchor.take();
-            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
-                let cursor = egui::text::CCursor::new(ci);
-                let range = match anchor {
-                    Some(a) if a != ci => {
-                        egui::text::CCursorRange::two(egui::text::CCursor::new(a), cursor)
-                    }
-                    _ => egui::text::CCursorRange::one(cursor),
-                };
-                state.cursor.set_char_range(Some(range));
-                state.store(ui.ctx(), te_id);
-            }
-            ui.memory_mut(|m| m.request_focus(te_id));
+            let b = char_to_byte(&self.body, ci);
+            self.activate(&ctx, te_id, b, None);
         }
 
-        // 3. Le texte.
+        // 3. Les unités : mises en forme, sauf celle qu'on modifie.
+        let units = std::mem::take(&mut self.preview.units);
+        let active = self.active.clone();
         let popup_open = self.popup.is_some();
-        let output = {
+        let note_path = project
+            .entry(&self.id)
+            .map(|e| e.path.clone())
+            .unwrap_or_default();
+        let mut action: Option<ViewAction> = None;
+        let mut edit: Option<(
+            egui::text_edit::TextEditOutput,
+            String,
+            Range<usize>,
+            UnitKind,
+        )> = None;
+        let mut active_rect: Option<egui::Rect> = None;
+        let mut table_op: Option<table::Op> = None;
+        let mut menu = |ui: &mut egui::Ui| format_menu(ui, false);
+        {
             let project_ref: &Project = project;
-            let visuals = ui.visuals().clone();
+            let body = &self.body;
             let highlighter = &mut self.highlighter;
-            let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-                let mut job = highlighter.job(buf.as_str(), project_ref, &visuals);
-                job.wrap.max_width = wrap_width;
-                ui.fonts_mut(|f| f.layout_job(job))
-            };
+            let drags = &mut self.preview.drags;
+            let empty = body.is_empty();
             egui::ScrollArea::vertical()
                 .id_salt("body_scroll")
                 .auto_shrink(false)
                 .show(ui, |ui| {
-                    egui::TextEdit::multiline(&mut self.body)
-                        .id(te_id)
-                        .layouter(&mut layouter)
-                        .desired_width(f32::INFINITY)
-                        .min_size(ui.available_size())
-                        .frame(egui::Frame::NONE)
-                        // Tab indente ; Échap ferme les suggestions sans
-                        // faire perdre le focus quand elles sont ouvertes.
-                        .event_filter(egui::EventFilter {
-                            tab: true,
-                            horizontal_arrows: true,
-                            vertical_arrows: true,
-                            escape: popup_open,
-                        })
-                        .hint_text(
-                            "Écrivez ici… Markdown accepté. Tapez [[ pour lier une fiche, \
-                             Ctrl+clic sur un lien pour l'ouvrir.",
-                        )
-                        .show(ui)
-                })
-                .inner
-        };
-
-        if output.response.changed() {
-            self.commit_body(project, EditKind::Typing, now_ms);
-            outcome.edited = true;
-        }
-        if let Some(r) = output.cursor_range {
-            let p = char_to_byte(&self.body, r.primary.index.0);
-            let s = char_to_byte(&self.body, r.secondary.index.0);
-            self.last_cursor = Some(p);
-            self.last_sel = Some(p.min(s)..p.max(s));
-        }
-
-        // Clic droit : mise en forme de la sélection, ou insertions.
-        let has_selection = self.last_sel.as_ref().is_some_and(|r| !r.is_empty());
-        let mut chosen = None;
-        output.response.context_menu(|ui| {
-            chosen = format_menu(ui, has_selection);
-        });
-        match chosen {
-            Some(MenuChoice::Format(f)) => {
-                self.format(f, project, now_ms);
-                outcome.edited = true;
-            }
-            Some(MenuChoice::InsertFile) => outcome.insert_file = true,
-            Some(MenuChoice::Copy) => ui.ctx().copy_text(self.selected_text()),
-            Some(MenuChoice::Cut) => {
-                ui.ctx().copy_text(self.selected_text());
-                self.format(Format::Delete, project, now_ms);
-                outcome.edited = true;
-            }
-            None => {}
-        }
-
-        // 4. Ctrl+clic sur un lien.
-        let cursor_byte = output
-            .cursor_range
-            .filter(|r| r.primary.index == r.secondary.index)
-            .map(|r| char_to_byte(&self.body, r.primary.index.0));
-        if output.response.clicked()
-            && ui.input(|i| i.modifiers.command)
-            && let Some(link) = cursor_byte.and_then(|b| markdown::wiki_link_at(&self.body, b))
-        {
-            outcome.open = match project.resolve_title(&link.target) {
-                Some(id) => Some(id.clone()),
-                None => match project.create_note(&link.target, Vec::new(), String::new()) {
-                    Ok(id) => {
-                        notices.info(format!("Fiche « {} » créée.", link.target));
-                        Some(id)
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    for cu in &units {
+                        let range = cu.unit.range.clone();
+                        if active.as_ref() != Some(&range) {
+                            if action.is_none() {
+                                action = drags.unit_ui(ui, cu, project_ref, &note_path, &mut menu);
+                            } else {
+                                drags.unit_ui(ui, cu, project_ref, &note_path, &mut menu);
+                            }
+                            continue;
+                        }
+                        let kind = cu.unit.kind;
+                        let scope = ui.scope(|ui| {
+                            if kind == UnitKind::Table {
+                                table_op = table_toolbar(ui);
+                            }
+                            let mut buf = body[range.clone()].to_owned();
+                            let visuals = ui.visuals().clone();
+                            let mut layouter =
+                                |ui: &egui::Ui, b: &dyn egui::TextBuffer, wrap_width: f32| {
+                                    let mut job = match kind {
+                                        UnitKind::Line => {
+                                            highlighter.job(b.as_str(), project_ref, &visuals)
+                                        }
+                                        _ => mono_job(b.as_str(), kind, &visuals),
+                                    };
+                                    job.wrap.max_width = wrap_width;
+                                    ui.fonts_mut(|f| f.layout_job(job))
+                                };
+                            let bg = ui.painter().add(egui::Shape::Noop);
+                            let mut te = egui::TextEdit::multiline(&mut buf)
+                                .id(te_id)
+                                .layouter(&mut layouter)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(1)
+                                .frame(egui::Frame::NONE)
+                                // Tab : cellules de tableau ou indentation ;
+                                // Échap ferme les suggestions sans faire
+                                // perdre le focus quand elles sont ouvertes.
+                                .event_filter(egui::EventFilter {
+                                    tab: true,
+                                    horizontal_arrows: true,
+                                    vertical_arrows: true,
+                                    escape: popup_open,
+                                });
+                            if empty {
+                                te = te.hint_text(
+                                    "Écrivez ici… Markdown accepté. Tapez [[ pour lier une \
+                                     fiche, Ctrl+clic sur un lien pour l'ouvrir.",
+                                );
+                            }
+                            let output = te.show(ui);
+                            let r = output.response.rect.expand2(egui::vec2(6.0, 2.0));
+                            ui.painter().set(
+                                bg,
+                                egui::Shape::Vec(vec![
+                                    egui::Shape::rect_filled(r, 0.0, visuals.extreme_bg_color),
+                                    egui::Shape::rect_filled(
+                                        egui::Rect::from_min_size(
+                                            r.min,
+                                            egui::vec2(2.0, r.height()),
+                                        ),
+                                        0.0,
+                                        crate::theme::accent(&visuals),
+                                    ),
+                                ]),
+                            );
+                            // Images de la ligne, toujours visibles et
+                            // redimensionnables pendant la modification.
+                            if cu.has_images()
+                                && let reading::Content::Line { blocks, .. } = &cu.content
+                            {
+                                ui.horizontal_wrapped(|ui| {
+                                    for b in blocks {
+                                        if let enigma_core::render::Block::Image(img) = b
+                                            && let Some(a) =
+                                                drags.image_ui(ui, img, project_ref, &note_path)
+                                        {
+                                            action = Some(a);
+                                        }
+                                    }
+                                });
+                            }
+                            (output, buf)
+                        });
+                        active_rect = Some(scope.response.rect);
+                        let (output, buf) = scope.inner;
+                        edit = Some((output, buf, range, kind));
                     }
-                    Err(e) => {
-                        notices.error(format!("Création impossible : {e}"));
-                        None
+                    // Sous le texte : clic = écrire à la fin.
+                    let rest = ui.available_size_before_wrap();
+                    let (_, resp) = ui.allocate_exact_size(
+                        egui::vec2(rest.x, rest.y.max(40.0)),
+                        egui::Sense::click(),
+                    );
+                    if resp.on_hover_cursor(egui::CursorIcon::Text).clicked() {
+                        action = Some(ViewAction::EditAt(body.len()));
                     }
-                },
-            };
+                });
+        }
+        self.preview.units = units;
+
+        // 4. Résultat de la modification.
+        let mut cursor_byte = None;
+        if let Some((output, buf, range, kind)) = edit {
+            self.last_galley = Some(output.galley.clone());
+            let local = |c: usize| range.start + char_to_byte(&buf, c);
+            let sel = output
+                .cursor_range
+                .map(|r| (local(r.primary.index.0), local(r.secondary.index.0)));
+            if output.response.changed() {
+                self.body.replace_range(range.clone(), &buf);
+                let mut cursor = sel.map_or(range.start + buf.len(), |(p, _)| p);
+                let mut moved = false;
+                if kind == UnitKind::Table
+                    && let Some((t, c)) = table::edit(&buf, cursor - range.start, table::Op::Format)
+                    && t != buf
+                {
+                    self.body
+                        .replace_range(range.start..range.start + buf.len(), &t);
+                    cursor = range.start + c;
+                    moved = true;
+                }
+                self.commit_body(project, EditKind::Typing, now_ms);
+                outcome.edited = true;
+                self.preview.sync(&self.body);
+                let idx = self.preview.unit_at(cursor);
+                let now = self.preview.units[idx].unit.range.clone();
+                if moved || now.start != range.start {
+                    self.activate(&ctx, te_id, cursor, None);
+                } else {
+                    self.active = Some(now);
+                }
+                self.last_cursor = Some(cursor);
+                self.last_sel = Some(cursor..cursor);
+                cursor_byte = Some(cursor);
+            } else if let Some((p, s)) = sel {
+                self.last_cursor = Some(p);
+                self.last_sel = Some(p.min(s)..p.max(s));
+                cursor_byte = (p == s).then_some(p);
+            }
+
+            // Clic droit : mise en forme de la sélection, ou insertions.
+            let has_selection = self.last_sel.as_ref().is_some_and(|r| !r.is_empty());
+            let mut chosen = None;
+            output.response.context_menu(|ui| {
+                chosen = format_menu(ui, has_selection);
+            });
+            if let Some(c) = chosen {
+                self.apply_menu(c, &ctx, project, now_ms, &mut outcome);
+            }
+
+            // Ctrl+clic sur un lien.
+            if output.response.clicked()
+                && ctx.input(|i| i.modifiers.command)
+                && let Some(link) = cursor_byte.and_then(|b| markdown::wiki_link_at(&self.body, b))
+            {
+                outcome.open = self.open_or_create(&link.target, project, notices);
+            }
+
+            // Suggestions.
+            let pointer_on_popup = self
+                .popup_rect
+                .zip(ctx.input(|i| i.pointer.hover_pos()))
+                .is_some_and(|(r, p)| r.contains(p));
+            if output.response.has_focus() {
+                self.update_popup(project, cursor_byte, &output);
+            } else if !pointer_on_popup {
+                self.popup = None;
+            }
+
+            // Fin de la modification : clic ailleurs dans la fiche (pas
+            // dans un menu), Échap, ou focus donné à un autre champ.
+            let layer = ui.layer_id();
+            let press = ctx.input(|i| {
+                i.pointer
+                    .any_pressed()
+                    .then(|| i.pointer.press_origin())
+                    .flatten()
+            });
+            let pressed_outside = press.is_some_and(|p| {
+                !active_rect.is_some_and(|r| r.contains(p))
+                    && ctx.layer_id_at(p).is_none_or(|l| l == layer)
+            });
+            let escape = !popup_open && ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            let elsewhere = ctx.memory(|m| m.focused().is_some_and(|f| f != te_id));
+            if (pressed_outside || escape || elsewhere) && self.pending_cursor.is_none() {
+                self.active = None;
+                self.popup = None;
+            }
         }
 
-        // 5. Suggestions.
-        let has_focus = output.response.has_focus();
-        let pointer_on_popup = self
-            .popup_rect
-            .zip(ui.input(|i| i.pointer.hover_pos()))
-            .is_some_and(|(r, p)| r.contains(p));
-        if has_focus {
-            self.update_popup(project, cursor_byte, &output);
-        } else if !pointer_on_popup {
-            self.popup = None;
-        }
-
-        // 6. Fenêtre de suggestions (clic souris).
+        // 5. Fenêtre de suggestions (clic souris).
         self.popup_rect = None;
         if let Some(popup) = &self.popup {
-            let (clicked, rect) = popup.show(ui.ctx());
+            let (clicked, rect) = popup.show(&ctx);
             self.popup_rect = Some(rect);
             if let Some(i) = clicked {
                 if let Some(p) = &mut self.popup {
                     p.selected = i;
                 }
                 outcome.edited |= self.navigate(Nav::Accept, project, now_ms, notices);
-                ui.ctx().request_repaint();
+                ctx.request_repaint();
             }
         }
+
+        // 6. Barre d'outils du tableau en cours de modification.
+        if let (Some(op), Some(range)) = (table_op, self.active.clone()) {
+            let cursor = self
+                .last_cursor
+                .filter(|c| range.contains(c) || *c == range.end)
+                .unwrap_or(range.start);
+            if let Some((t, c)) = table::edit(&self.body[range.clone()], cursor - range.start, op) {
+                self.body.replace_range(range.clone(), &t);
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                outcome.edited = true;
+                self.activate(&ctx, te_id, range.start + c, None);
+            }
+        }
+
+        // 7. Actions sur la fiche mise en forme.
+        match action {
+            Some(ViewAction::EditAt(b)) => self.activate(&ctx, te_id, b, None),
+            Some(ViewAction::OpenTitle(title)) => {
+                outcome.open = self.open_or_create(&title, project, notices);
+            }
+            Some(ViewAction::OpenFile(path)) => {
+                if let Err(e) = crate::system_open::open(&path) {
+                    notices.error(format!("Impossible d'ouvrir « {} » : {e}", path.display()));
+                }
+            }
+            Some(ViewAction::Resize { image, width }) => {
+                self.body = enigma_core::render::set_image_width(&self.body, &image, Some(width));
+                self.realign_table_at(image.range.start);
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                outcome.edited = true;
+            }
+            Some(ViewAction::ToggleTask(range)) => {
+                if let Some(line) = self.body.get(range.clone()).and_then(live::toggle_task) {
+                    self.body.replace_range(range, &line);
+                    self.commit_body(project, EditKind::Discrete, now_ms);
+                    outcome.edited = true;
+                }
+            }
+            Some(ViewAction::TableResize { range, rows, cols }) => {
+                if let Some((t, _)) = self
+                    .body
+                    .get(range.clone())
+                    .and_then(|t| table::edit(t, 0, table::Op::Resize { rows, cols }))
+                {
+                    self.body.replace_range(range, &t);
+                    self.commit_body(project, EditKind::Discrete, now_ms);
+                    outcome.edited = true;
+                }
+            }
+            Some(ViewAction::Menu(choice, b)) => {
+                self.last_cursor = Some(b);
+                self.last_sel = Some(b..b);
+                self.apply_menu(choice, &ctx, project, now_ms, &mut outcome);
+            }
+            None => {}
+        }
         outcome
+    }
+
+    /// Fiche liée : ouverte, ou créée si elle n'existe pas.
+    fn open_or_create(
+        &self,
+        title: &str,
+        project: &mut Project,
+        notices: &mut Notices,
+    ) -> Option<NoteId> {
+        match project.resolve_title(title) {
+            Some(id) => Some(id.clone()),
+            None => match project.create_note(title, Vec::new(), String::new()) {
+                Ok(id) => {
+                    notices.info(format!("Fiche « {title} » créée."));
+                    Some(id)
+                }
+                Err(e) => {
+                    notices.error(format!("Création impossible : {e}"));
+                    None
+                }
+            },
+        }
+    }
+
+    fn apply_menu(
+        &mut self,
+        choice: MenuChoice,
+        ctx: &egui::Context,
+        project: &mut Project,
+        now_ms: u64,
+        outcome: &mut BodyOutcome,
+    ) {
+        match choice {
+            MenuChoice::Format(f) => {
+                self.format(f, project, now_ms);
+                outcome.edited = true;
+            }
+            MenuChoice::InsertFile => outcome.insert_file = true,
+            MenuChoice::Copy => ctx.copy_text(self.selected_text()),
+            MenuChoice::Cut => {
+                ctx.copy_text(self.selected_text());
+                self.format(Format::Delete, project, now_ms);
+                outcome.edited = true;
+            }
+        }
+    }
+
+    /// Modifie l'unité contenant l'octet `b`, curseur à cet endroit
+    /// (sélection depuis `anchor` si elle est dans la même unité).
+    fn activate(&mut self, ctx: &egui::Context, te_id: egui::Id, b: usize, anchor: Option<usize>) {
+        self.preview.sync(&self.body);
+        let mut b = b.min(self.body.len());
+        while !self.body.is_char_boundary(b) {
+            b -= 1;
+        }
+        let idx = self.preview.unit_at(b);
+        let Some(range) = self.preview.units.get(idx).map(|u| u.unit.range.clone()) else {
+            return;
+        };
+        let local = |x: usize| {
+            let x = x.clamp(range.start, range.end);
+            self.body
+                .get(range.start..x)
+                .map_or(0, |s| s.chars().count())
+        };
+        let cursor = egui::text::CCursor::new(local(b));
+        let sel = match anchor.map(local) {
+            Some(a) if a != cursor.index.0 => {
+                egui::text::CCursorRange::two(egui::text::CCursor::new(a), cursor)
+            }
+            _ => egui::text::CCursorRange::one(cursor),
+        };
+        let mut state = egui::TextEdit::load_state(ctx, te_id).unwrap_or_default();
+        state.cursor.set_char_range(Some(sel));
+        state.store(ctx, te_id);
+        ctx.memory_mut(|m| m.request_focus(te_id));
+        self.active = Some(range);
+        self.last_cursor = Some(b);
+    }
+
+    /// Recale l'unité modifiée après un changement venu d'ailleurs
+    /// (annuler, rechargement…). Fiche vide : toujours modifiable.
+    fn resolve_active(&mut self) {
+        if self.body.is_empty() {
+            self.active = Some(0..0);
+            return;
+        }
+        if let Some(r) = &self.active
+            && !self.preview.units.iter().any(|u| u.unit.range == *r)
+        {
+            let idx = self.preview.unit_at(r.start.min(self.body.len()));
+            self.active = self.preview.units.get(idx).map(|u| u.unit.range.clone());
+        }
+    }
+
+    /// Réaligne le tableau contenant l'octet `b` (après un redimensionnement
+    /// d'image dans une cellule).
+    fn realign_table_at(&mut self, b: usize) {
+        let units = live::units(&self.body);
+        let Some(u) = units.get(live::unit_at(&units, b)) else {
+            return;
+        };
+        if u.kind == UnitKind::Table
+            && let Some((t, _)) = table::edit(&self.body[u.range.clone()], 0, table::Op::Format)
+        {
+            self.body.replace_range(u.range.clone(), &t);
+        }
+    }
+
+    /// Flèches, Retour arrière et Suppr aux bords d'une unité : passage à
+    /// l'unité voisine (ou fusion des deux lignes). Dans un tableau : Tab,
+    /// Maj+Tab et Entrée passent d'une cellule à l'autre. Rend `true` si le
+    /// texte a changé.
+    fn unit_keys(
+        &mut self,
+        ctx: &egui::Context,
+        te_id: egui::Id,
+        project: &mut Project,
+        now_ms: u64,
+    ) -> bool {
+        use egui::{Key, Modifiers};
+        enum Move {
+            To(usize),
+            Join(Range<usize>, usize),
+            Table(table::Op),
+        }
+        let Some(range) = self.active.clone() else {
+            return false;
+        };
+        let Some(cr) = egui::TextEdit::load_state(ctx, te_id).and_then(|s| s.cursor.char_range())
+        else {
+            return false;
+        };
+        let idx = self.preview.unit_at(range.start);
+        let Some(kind) = self.preview.units.get(idx).map(|u| u.unit.kind) else {
+            return false;
+        };
+        let units = &self.preview.units;
+        let text = &self.body[range.clone()];
+        let n = text.chars().count();
+        let c = cr.primary.index.0.min(n);
+        let selecting = cr.primary.index != cr.secondary.index;
+        let prev = idx
+            .checked_sub(1)
+            .and_then(|i| units.get(i))
+            .map(|u| u.unit.range.clone());
+        let next = units.get(idx + 1).map(|u| u.unit.range.clone());
+        // Ligne affichée du curseur (texte replié compris).
+        let (row, rows, col) = match &self.last_galley {
+            Some(g) if g.job.text == text => {
+                let l = g.layout_from_cursor(cr.primary);
+                (l.row, g.rows.len(), l.column.0)
+            }
+            _ => {
+                let before: String = text.chars().take(c).collect();
+                let row = before.matches('\n').count();
+                let col = before.rsplit('\n').next().map_or(0, |s| s.chars().count());
+                (row, text.matches('\n').count() + 1, col)
+            }
+        };
+        let body = &self.body;
+        let line_col = |r: &Range<usize>, last_line: bool| {
+            let t = &body[r.clone()];
+            let start = if last_line {
+                t.rfind('\n').map_or(0, |i| i + 1)
+            } else {
+                0
+            };
+            let line = &t[start..];
+            let line = line.split('\n').next().unwrap_or("");
+            let off = line.char_indices().nth(col).map_or(line.len(), |(i, _)| i);
+            r.start + start + off
+        };
+        let mv = ctx.input_mut(|i| {
+            if i.consume_key(Modifiers::COMMAND, Key::Home) {
+                return Some(Move::To(0));
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::End) {
+                return Some(Move::To(body.len()));
+            }
+            if selecting {
+                return None;
+            }
+            if kind == UnitKind::Table {
+                if i.consume_key(Modifiers::SHIFT, Key::Tab) {
+                    return Some(Move::Table(table::Op::PrevCell));
+                }
+                if i.consume_key(Modifiers::NONE, Key::Tab) {
+                    return Some(Move::Table(table::Op::NextCell));
+                }
+                if i.consume_key(Modifiers::NONE, Key::Enter) {
+                    return Some(Move::Table(table::Op::NextRow));
+                }
+            }
+            if let Some(p) = &prev {
+                if row == 0 && i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                    return Some(Move::To(line_col(p, true)));
+                }
+                if c == 0 && i.consume_key(Modifiers::NONE, Key::ArrowLeft) {
+                    return Some(Move::To(p.end));
+                }
+                if c == 0 && i.consume_key(Modifiers::NONE, Key::Backspace) {
+                    return Some(Move::Join(p.end..range.start, p.end));
+                }
+            }
+            if let Some(nx) = &next {
+                if row + 1 >= rows && i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                    return Some(Move::To(line_col(nx, false)));
+                }
+                if c == n && i.consume_key(Modifiers::NONE, Key::ArrowRight) {
+                    return Some(Move::To(nx.start));
+                }
+                if c == n && i.consume_key(Modifiers::NONE, Key::Delete) {
+                    return Some(Move::Join(range.end..nx.start, range.end));
+                }
+            }
+            None
+        });
+        match mv {
+            None => false,
+            Some(Move::To(b)) => {
+                self.activate(ctx, te_id, b, None);
+                false
+            }
+            Some(Move::Join(sep, b)) => {
+                self.body.replace_range(sep, "");
+                self.commit_body(project, EditKind::Typing, now_ms);
+                self.activate(ctx, te_id, b, None);
+                true
+            }
+            Some(Move::Table(op)) => {
+                let cursor = range.start + char_to_byte(text, c);
+                match table::edit(text, cursor - range.start, op) {
+                    Some((t, pos)) => {
+                        self.body.replace_range(range.clone(), &t);
+                        self.commit_body(project, EditKind::Discrete, now_ms);
+                        self.activate(ctx, te_id, range.start + pos, None);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
+    }
+
+    /// Commence à écrire à la fin de la fiche (tests).
+    #[cfg(test)]
+    pub fn edit_at_end(&mut self) {
+        self.pending_cursor = Some(self.body.chars().count());
+    }
+
+    /// Commence à écrire à cet octet (tests).
+    #[cfg(test)]
+    pub fn edit_at(&mut self, b: usize) {
+        self.pending_cursor = Some(self.body[..b].chars().count());
+    }
+
+    /// Une unité est-elle en cours de modification ? (tests)
+    #[cfg(test)]
+    pub fn is_editing(&self) -> bool {
+        self.active.is_some()
     }
 
     /// Texte sélectionné (vide sans sélection).
@@ -751,50 +1360,6 @@ impl Editor {
         self.last_cursor = Some(end);
         self.pending_cursor = Some(self.body[..end].chars().count());
         self.commit_body(project, EditKind::Discrete, now_ms);
-    }
-
-    /// Fiche mise en forme (mode Lecture) : liens cliquables, images
-    /// redimensionnables (la largeur est écrite dans le texte).
-    pub fn reading_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        project: &mut Project,
-        now_ms: u64,
-        notices: &mut Notices,
-    ) -> BodyOutcome {
-        let mut outcome = BodyOutcome::default();
-        let Some(note_path) = project.entry(&self.id).map(|e| e.path.clone()) else {
-            return outcome;
-        };
-        match self.reading.show(ui, &self.body, project, &note_path) {
-            Some(ReadingAction::Resize { image, width }) => {
-                self.body = enigma_core::render::set_image_width(&self.body, &image, Some(width));
-                self.commit_body(project, EditKind::Discrete, now_ms);
-                outcome.edited = true;
-            }
-            Some(ReadingAction::OpenFile(path)) => {
-                if let Err(e) = crate::system_open::open(&path) {
-                    notices.error(format!("Impossible d'ouvrir « {} » : {e}", path.display()));
-                }
-            }
-            Some(ReadingAction::OpenTitle(title)) => {
-                outcome.open = match project.resolve_title(&title) {
-                    Some(id) => Some(id.clone()),
-                    None => match project.create_note(&title, Vec::new(), String::new()) {
-                        Ok(id) => {
-                            notices.info(format!("Fiche « {title} » créée."));
-                            Some(id)
-                        }
-                        Err(e) => {
-                            notices.error(format!("Création impossible : {e}"));
-                            None
-                        }
-                    },
-                };
-            }
-            None => {}
-        }
-        outcome
     }
 
     /// Enregistre le tampon courant comme nouvel état (historique + projet).

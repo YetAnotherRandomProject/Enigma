@@ -120,8 +120,6 @@ pub struct Workspace {
     /// Un fichier du projet a changé sur le disque depuis le dernier
     /// enregistrement du fichier `.enigma`.
     disk_changed: bool,
-    /// Mode Lecture (fiche mise en forme) plutôt qu'Édition.
-    pub reading: bool,
     /// Horloge de la dernière image (historique de l'éditeur).
     now_ms: u64,
     /// Liste rangée par catégorie (une fiche peut apparaître plusieurs fois).
@@ -196,7 +194,6 @@ impl Workspace {
             pending_png: None,
             requests: Vec::new(),
             disk_changed: false,
-            reading: false,
             now_ms: 0,
             group_by_category: true,
             collapsed: std::collections::HashSet::new(),
@@ -383,7 +380,7 @@ impl Workspace {
             Command::DeleteNote | Command::Undo | Command::Redo | Command::InsertImage => {
                 self.editor.is_some()
             }
-            c if commands::format_of(c).is_some() => self.editor.is_some() && !self.reading,
+            c if commands::format_of(c).is_some() => self.editor.is_some(),
             // Association de fichiers : Windows seulement pour l'instant.
             Command::AssociateFiles => cfg!(windows),
             Command::EditPack => !self.project.pack().id.is_empty(),
@@ -513,17 +510,13 @@ impl Workspace {
             | Command::InsertRule
             | Command::InsertDate => {
                 if let Some(f) = commands::format_of(cmd) {
-                    if self.reading || self.view != View::Note {
-                        notices.info("Passez en mode Édition d'une fiche pour la mettre en forme.");
+                    if self.view != View::Note {
+                        notices.info("Ouvrez une fiche pour la mettre en forme.");
                     } else if let Some(editor) = &mut self.editor {
                         editor.format(f, &mut self.project, self.now_ms);
                         self.mark_edited();
                     }
                 }
-            }
-            Command::ToggleReading => {
-                self.reading = !self.reading;
-                self.view = View::Note;
             }
             Command::DeleteNote => {
                 if let Some(ed) = &self.editor {
@@ -1309,7 +1302,7 @@ impl Workspace {
             egui::Frame::new()
                 .fill(ui.visuals().error_fg_color.gamma_multiply(0.15))
                 .inner_margin(8.0)
-                .corner_radius(6.0)
+                .corner_radius(0.0)
                 .show(ui, |ui| {
                     ui.label(
                         "Ce fichier a été modifié hors de l'application alors que vous aviez \
@@ -1332,12 +1325,8 @@ impl Workspace {
             }
         }
 
+        let mut insert_table = None;
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.reading, false, "Édition")
-                .on_hover_text("Texte Markdown");
-            ui.selectable_value(&mut self.reading, true, "Lecture")
-                .on_hover_text("Fiche mise en forme, avec ses images (glisser le coin d'une image pour la redimensionner)");
-            ui.separator();
             if ui
                 .button("Insérer…")
                 .on_hover_text(
@@ -1347,17 +1336,29 @@ impl Workspace {
             {
                 insert_image = true;
             }
+            ui.menu_button("Tableau", |ui| {
+                if let Some(size) = crate::editor::table_picker(ui) {
+                    insert_table = Some(size);
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("Insérer un tableau (redimensionnable ensuite par son coin)");
+            ui.weak("Cliquez dans le texte pour le modifier ; Échap pour terminer.");
         });
         ui.separator();
-        let body = if self.reading {
-            editor.reading_ui(ui, &mut self.project, now_ms, notices)
-        } else {
-            editor.body_ui(ui, &mut self.project, now_ms, notices)
-        };
+        if let Some((r, c)) = insert_table {
+            editor.format(
+                crate::editor::Format::Table(r, c),
+                &mut self.project,
+                now_ms,
+            );
+        }
+        let body = editor.body_ui(ui, &mut self.project, now_ms, notices);
         if insert_image || body.insert_file {
             self.run_command(Command::InsertImage, &ui.ctx().clone(), notices);
         }
-        if edited || body.edited {
+        if edited || body.edited || insert_table.is_some() {
             self.mark_edited();
         }
         if let Some(target) = body.open {
@@ -1719,7 +1720,7 @@ fn header_row(
     let visuals = ui.visuals();
     if resp.hovered() {
         ui.painter()
-            .rect_filled(rect, 4.0, visuals.widgets.hovered.weak_bg_fill);
+            .rect_filled(rect, 0.0, visuals.widgets.hovered.weak_bg_fill);
     }
     let cy = rect.center().y;
     let x = rect.left() + 6.0;
@@ -1777,10 +1778,10 @@ fn note_row(
     let visuals = ui.visuals();
     if selected {
         ui.painter()
-            .rect_filled(rect, 4.0, visuals.selection.bg_fill);
+            .rect_filled(rect, 0.0, visuals.selection.bg_fill);
     } else if resp.hovered() {
         ui.painter()
-            .rect_filled(rect, 4.0, visuals.widgets.hovered.weak_bg_fill);
+            .rect_filled(rect, 0.0, visuals.widgets.hovered.weak_bg_fill);
     }
     let mut x = rect.left() + 8.0 + indent;
     let cy = rect.center().y;
@@ -1897,6 +1898,7 @@ mod ui_tests {
                 },
                 State::default(),
             );
+        crate::theme::install(&harness.ctx);
         let ctx = harness.ctx.clone();
         {
             let state = harness.state_mut();
@@ -1951,6 +1953,16 @@ mod ui_tests {
         );
 
         // Taper dans le corps : l'en-tête reste intact.
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .edit_at_end();
+        harness.run_steps(4);
         harness.get_by_role(Role::MultilineTextInput).focus();
         harness.run_steps(8);
         harness
@@ -1969,6 +1981,120 @@ mod ui_tests {
             std::fs::read(dir.path().join("Majordome.md")).unwrap(),
             majordome_before
         );
+    }
+
+    #[test]
+    fn live_editing_lines_tables_and_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        egui_extras::install_image_loaders(&harness.ctx);
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(
+            dir.path().join("assets/plan.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="#4aa3ff"/></svg>"##,
+        )
+        .unwrap();
+        let start = "# Plan\n\n- [ ] fouiller\n- [x] lire\n\n| ![a|90](assets/plan.svg) | ![b|90](assets/plan.svg) |\n|---|---|\n|  |  |\n\nFin";
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            let id = ws
+                .project
+                .create_note("Essai", vec![], start.to_owned())
+                .unwrap();
+            ws.select(&id, &mut state.notices);
+        }
+        for _ in 0..20 {
+            harness.run_steps(2);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        fn editor<'a>(h: &'a mut Harness<'_, State>) -> &'a mut crate::editor::Editor {
+            h.state_mut().ws.as_mut().unwrap().editor.as_mut().unwrap()
+        }
+        // Tout est mis en forme : aucun texte Markdown affiché.
+        assert!(harness.query_by_role(Role::MultilineTextInput).is_none());
+        snapshot(&mut harness, "30_lecture_directe");
+
+        // Modifier la dernière ligne, Entrée : nouvelle ligne en édition.
+        editor(&mut harness).edit_at_end();
+        harness.run_steps(4);
+        assert_eq!(
+            harness
+                .get_by_role(Role::MultilineTextInput)
+                .value()
+                .as_deref(),
+            Some("Fin")
+        );
+        harness
+            .get_by_role(Role::MultilineTextInput)
+            .type_text("\nsuite");
+        harness.run_steps(4);
+        assert!(body_text(&harness).ends_with("Fin\nsuite"));
+        assert_eq!(
+            harness
+                .get_by_role(Role::MultilineTextInput)
+                .value()
+                .as_deref(),
+            Some("suite")
+        );
+        // Retour arrière en début de ligne : fusion avec la précédente.
+        harness.key_press(egui::Key::Home);
+        harness.run_steps(2);
+        harness.key_press(egui::Key::Backspace);
+        harness.run_steps(4);
+        assert!(
+            body_text(&harness).ends_with("\nFinsuite"),
+            "{}",
+            body_text(&harness)
+        );
+        assert_eq!(
+            harness
+                .get_by_role(Role::MultilineTextInput)
+                .value()
+                .as_deref(),
+            Some("Finsuite")
+        );
+        // Flèche haut depuis la première ligne : unité précédente.
+        harness.key_press(egui::Key::ArrowUp);
+        harness.run_steps(4);
+        assert_eq!(
+            harness
+                .get_by_role(Role::MultilineTextInput)
+                .value()
+                .as_deref(),
+            Some("")
+        );
+
+        // Tableau : frappe dans une cellule vide, colonnes réalignées.
+        let body = body_text(&harness);
+        let cell = body.find("|  |  |").unwrap() + 2;
+        editor(&mut harness).edit_at(cell);
+        harness.run_steps(4);
+        harness.get_by_role(Role::MultilineTextInput).type_text("x");
+        harness.run_steps(4);
+        harness.key_press(egui::Key::Tab);
+        harness.run_steps(4);
+        harness.get_by_role(Role::MultilineTextInput).type_text("y");
+        harness.run_steps(4);
+        let body = body_text(&harness);
+        let units = enigma_core::live::units(&body);
+        let tab = units
+            .iter()
+            .find(|u| u.kind == enigma_core::live::UnitKind::Table)
+            .unwrap();
+        let text = &body[tab.range.clone()];
+        let widths: Vec<usize> = text.lines().map(|l| l.chars().count()).collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "{text}");
+        let p = enigma_core::table::parse(text).unwrap();
+        assert_eq!(p.table.rows[1], ["x", "y"], "{text}");
+        snapshot(&mut harness, "31_tableau_edition");
+
+        // Échap : fin de la modification, tout est de nouveau mis en forme.
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(4);
+        assert!(!editor(&mut harness).is_editing());
+        assert!(harness.query_by_role(Role::MultilineTextInput).is_none());
+        snapshot(&mut harness, "32_tableau_lecture");
     }
 
     #[test]
@@ -2044,6 +2170,16 @@ id: "
         let mut harness = setup(dir.path());
         harness.get_by_label("Salle des Archives").click();
         harness.run_steps(8);
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .edit_at_end();
+        harness.run_steps(4);
         harness.get_by_role(Role::MultilineTextInput).focus();
         harness.run_steps(8);
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
@@ -2709,7 +2845,6 @@ id: "
             .unwrap()
             .to_owned();
         assert!(body.contains("[ambiance](assets/ambiance.mp3)"), "{body}");
-        harness.state_mut().ws.as_mut().unwrap().reading = true;
         harness.run_steps(8);
         assert!(
             harness.query_by_label("Lire").is_some(),

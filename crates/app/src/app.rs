@@ -43,6 +43,7 @@ pub struct EnigmaApp {
 impl EnigmaApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> EnigmaApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        crate::theme::install(&cc.egui_ctx);
         let recent: Vec<PathBuf> = cc
             .storage
             .and_then(|s| eframe::get_value(s, RECENT_KEY))

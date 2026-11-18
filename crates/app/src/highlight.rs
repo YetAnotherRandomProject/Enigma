@@ -11,7 +11,7 @@ use enigma_core::markdown::{self, Style};
 
 use crate::colors::WIKI_LINK;
 
-const LIST_MARKER: Color32 = Color32::from_rgb(0xff, 0xb8, 0x6b);
+pub const LIST_MARKER: Color32 = Color32::from_rgb(0xff, 0xb8, 0x6b);
 pub const BODY_SIZE: f32 = 15.0;
 
 /// Cache du dernier `LayoutJob` calculé : l'analyse n'est refaite que si le
