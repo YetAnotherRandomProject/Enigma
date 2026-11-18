@@ -11,9 +11,13 @@ graphe 2D/3D filtrable. Réutilisable pour d'autres jeux via des **packs de jeu*
   caches + dirty flags (parsing, index de liens, layout, mise en forme).
 - Cible Windows ; doit compiler sur Linux et macOS. Pas de code spécifique OS
   sans nécessité (et alors derrière `cfg` documenté).
-- Données = dossier de fichiers `.md` (une fiche par fichier), lisible et
-  versionnable avec git. Écritures **atomiques** (fichier temporaire dans le
-  même dossier puis renommage).
+- Données = **un fichier projet `.enigma`** (format binaire maison, voir
+  « Fichier projet ») contenant les fiches `.md`, leurs fichiers joints
+  (`assets/`), les réglages, packs locaux, tableau et corbeille. Les
+  anciens dossiers de fiches `.md` s'importent (conversion, dossier
+  d'origine intact). Le projet n'est donc plus un dossier versionnable avec
+  git (décision de l'utilisateur). Écritures **atomiques** (fichier
+  temporaire dans le même dossier puis renommage).
 - Pas de compatibilité Obsidian requise.
 
 ## Architecture (workspace Cargo)
@@ -61,6 +65,30 @@ Règles :
 - Fichier sans en-tête accepté (valeurs par défaut) ; l'en-tête est ajouté à la
   première sauvegarde.
 - Clés YAML inconnues conservées telles quelles à la réécriture.
+
+Images et fichiers joints : `![légende|300](assets/plan.svg)` (largeur
+d'affichage en pixels après `|`), `[Ambiance](assets/son.mp3)` pour un son,
+une vidéo ou un document (affiché comme pièce jointe en mode Lecture).
+
+## Fichier projet `.enigma`
+- Format (`enigma_core::container`) : magic `ENIGMANB`, u16 version (1),
+  u16 drapeaux, u32 nombre d'entrées, puis par entrée : u32 longueur du
+  chemin, chemin UTF-8 (`/`, relatif, sans `..`), u64 longueur, données,
+  u32 CRC-32 (chemin + données). Tout en petit-boutiste. Fichier abîmé ou
+  chemin dangereux → erreur lisible, rien n'est chargé.
+- À l'ouverture (`app/project_file.rs`, `app/session.rs`) : extraction dans
+  un dossier de travail (`<cache>/Enigma Notes/projets-ouverts/<hash>-<pid>`)
+  sur lequel `Project` travaille comme sur un dossier. Chaque écriture
+  (repérée par la surveillance ou `disk_changed`) déclenche un
+  réenregistrement en arrière-plan : seuls les fichiers modifiés (taille +
+  date) sont relus ; rien de changé = 0,3 ms. Fermeture : dernier
+  enregistrement puis suppression du dossier de travail.
+- Sécurité : `.enigma` modifié ailleurs → enregistrement dans
+  « Nom (conflit …).enigma » ; dossier de travail d'une session plantée
+  différent du fichier → sauvé dans « Nom (récupéré …).enigma ».
+- Association Windows (`app/file_assoc.rs`) : `HKCU\Software\Classes`
+  via `reg.exe`, commande « Ouvrir les fichiers .enigma avec Enigma Notes ».
+  macOS/Linux : non fait (paquet `.app` / fichier `.desktop` requis).
 
 ## Packs de jeu
 Dossier contenant un `pack.json` (champ `version` obligatoire) : `categories`,
@@ -161,6 +189,35 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
   positions dans `.enigma/board.json`, indépendantes de `pos` (graphe).
   Une carte de fiche supprimée est gardée mais masquée. Fichier illisible →
   tableau non enregistré (jamais écrasé).
+- **Mode Lecture** (`enigma_core::render`, `app/reading.rs`) : blocs
+  recalculés seulement si le texte change ; images via `egui_extras`
+  (`install_image_loaders`, URI `file:///C:/…` sous Windows, SVG rendu par
+  resvg à la taille affichée) ; tirer le coin d'une image réécrit sa
+  largeur dans le texte (historique → Ctrl+Z). Un paragraphe réduit à un
+  lien vers un fichier local = pièce jointe, ouverte avec l'application du
+  système (`app/system_open.rs`) : egui ne lit pas l'audio/la vidéo.
+- **Presse-papiers** (`app/clipboard.rs`) : `clipboard_shortcuts: false`
+  (egui-winit n'émet rien quand on colle des fichiers) ; Ctrl+C/X/V traduits
+  dans `raw_input_hook` via `arboard` : texte → `Event::Paste`, image →
+  `Event::PasteImage` (PNG dans `assets/`), fichiers → joints à la fiche.
+- **Outils d'écriture** (`enigma_core::md_edit`) : transformations pures
+  texte + sélection (octets) ; chaque outil est une commande (Ctrl+B, I, K,
+  Ctrl+1-3…) et une entrée du menu clic droit du texte. Un `Button` avec
+  `shortcut_text("")` change son libellé d'accessibilité : ne pas en mettre
+  quand il n'y a pas de raccourci.
+- **Liste par catégorie** : lignes aplaties (en-têtes + fiches) pour garder
+  `show_rows` ; une fiche à plusieurs catégories apparaît plusieurs fois
+  (les tests désactivent le rangement pour garder des titres uniques).
+- **Pack enrichi depuis l'usage** (`Project::update_pack`, `app/quick_add.rs`) :
+  copie locale d'un pack fourni avant modification ; pack « projet » créé
+  s'il n'y en a pas. Dans les tests, le premier dossier de packs (« dossier
+  utilisateur », modifié sur place) doit être jetable, jamais `packs/` du dépôt.
+- **Surveillance sous macOS** : les événements arrivent avec le chemin
+  résolu (`/private/var/…` pour `/var/…`) ; `watcher::under_root` les ramène
+  à la racine du projet.
+- **Tests kittest et watcher** : pas de `harness.run()` (les réaffichages du
+  watcher le font dépasser son nombre d'étapes) : `run_steps(n)`. Un clic
+  droit simulé : appui et relâchement dans deux images distinctes.
 - **Modales dans kittest** : attendre quelques images (`run_steps(10)`)
   avant de cliquer, le temps que la fenêtre se cale.
 - **Tests kittest** : pas de temps fixé à 1/60 s (le défaut, 0,25 s, rend
@@ -179,7 +236,8 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
   `ENIGMA_SNAPSHOT_DIR=<dossier> WGPU_BACKEND=dx12 cargo test -p enigma-app -- --test-threads=1`
   (le rendu GPU en parallèle plante sur certains pilotes).
 - Lancer sur la démo : `cargo run -p enigma-app -- exemples/blue_prince_demo`
-  (attention : modifie les fichiers de la démo ; travailler sur une copie).
+  propose de la convertir en `exemples/blue_prince_demo.enigma` (le dossier
+  n'est pas modifié) ; ensuite `cargo run -p enigma-app -- <fichier>.enigma`.
 
 ## Build et publication
 - Exécutable : `cargo build --release -p enigma-app` → `target/release/enigma(.exe)`
@@ -224,3 +282,8 @@ jalons suivants n'est codé avant validation.
   supprimer depuis le graphe.
 - [x] **7. Confort** — palette Ctrl+P, raccourcis configurables, thèmes,
   export image, tableau d'enquête libre.
+- [x] **8. Fichier projet et contenus riches** (après les jalons, à la
+  demande) — fichier `.enigma`, import de `.md`, mode Lecture avec images
+  (SVG compris) redimensionnables, coller des images/fichiers, pièces
+  jointes audio/vidéo, outils d'écriture Markdown, liste par catégorie,
+  pack enrichi depuis la fiche et le graphe.
