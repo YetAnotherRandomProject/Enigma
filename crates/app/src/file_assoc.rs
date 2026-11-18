@@ -10,9 +10,11 @@
 use std::path::Path;
 
 /// ProgID Windows des projets.
+#[cfg_attr(not(windows), allow(dead_code))] // utilisé seulement sous Windows (et par les tests)
 pub const PROG_ID: &str = "EnigmaNotes.Projet";
 
 /// Clés et valeurs par défaut à écrire pour associer `.enigma` à `exe`.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn registry_entries(exe: &Path) -> Vec<(String, String)> {
     let exe = exe.display().to_string();
     let base = r"HKCU\Software\Classes";
