@@ -30,7 +30,9 @@ const MIN_WIDTH: f32 = 32.0;
 /// Côté de la poignée de redimensionnement.
 const HANDLE: f32 = 12.0;
 /// Largeur minimale d'une cellule de tableau.
-const CELL_MIN: Vec2 = Vec2::new(56.0, BODY_SIZE + 6.0);
+const CELL_MIN: Vec2 = Vec2::new(24.0, BODY_SIZE + 6.0);
+/// Largeur au-delà de laquelle le texte d'une case revient à la ligne.
+const CELL_WRAP: f32 = 420.0;
 
 /// Ce que l'utilisateur a demandé dans la fiche mise en forme.
 #[derive(Debug, Clone)]
@@ -140,6 +142,9 @@ pub struct Drags {
     /// Tableau : (début, déplacement cumulé).
     table: Option<(usize, Vec2)>,
     menu_byte: usize,
+    /// Largeur maximale du texte (cases de tableau), au lieu de la largeur
+    /// disponible.
+    wrap_cap: Option<f32>,
     /// Contenus insérés `![[…]]` : (version du contenu du projet, chemin
     /// de la fiche, unités), par cible écrite.
     embeds: std::collections::HashMap<String, (u64, std::path::PathBuf, Vec<CachedUnit>)>,
@@ -1149,10 +1154,28 @@ impl Drags {
         let mut action = None;
         let bg = ui.painter().add(Shape::Noop);
         let mut rects: Vec<Vec<Rect>> = Vec::with_capacity(rows.len());
-        // Hauteur de chaque ligne à l'image précédente : toutes les cases
-        // d'une ligne ont la même hauteur, contenu calé en haut.
-        let heights_id = ui.scope_id().with(("table_rows", range.start));
-        let heights: Vec<f32> = ui.data(|d| d.get_temp(heights_id)).unwrap_or_default();
+        // Cases de l'image précédente : zones cliquables sous le contenu
+        // (une case plus basse que sa ligne reste cliquable en entier). Les
+        // dimensions ne viennent jamais de là : colonnes et lignes ont
+        // toujours juste la taille de leur contenu.
+        let cells_id = ui.scope_id().with(("table_cells", range.start));
+        let prev_cells: Vec<Rect> = ui.data(|d| d.get_temp(cells_id)).unwrap_or_default();
+        for (k, r) in prev_cells.iter().enumerate() {
+            let resp = ui
+                .interact(
+                    *r,
+                    ui.scope_id().with(("cell_bg", range.start, k)),
+                    Sense::click(),
+                )
+                .on_hover_cursor(CursorIcon::Text);
+            if resp.clicked()
+                && let Some(cell) = rows
+                    .get(k / cols.max(1))
+                    .and_then(|row| row.get(k % cols.max(1)))
+            {
+                action = Some(ViewAction::EditAt(cell.range.end));
+            }
+        }
         ui.add_space(2.0);
         egui::Grid::new(("table", range.start))
             .spacing([0.0, 0.0])
@@ -1163,26 +1186,20 @@ impl Drags {
                     let mut line = Vec::with_capacity(cols);
                     for c in 0..cols {
                         let cell = row.get(c);
-                        let min_h = heights.get(r).copied().unwrap_or(0.0);
-                        let builder = UiBuilder::new()
-                            .sense(Sense::click())
-                            .layout(egui::Layout::top_down(egui::Align::Min));
+                        let builder =
+                            UiBuilder::new().layout(egui::Layout::top_down(egui::Align::Min));
                         let inner = ui.scope_builder(builder, |ui| {
                             egui::Frame::new()
                                 .inner_margin(egui::Margin::symmetric(8, 5))
                                 .show(ui, |ui| {
-                                    ui.set_min_size(CELL_MIN.max(Vec2::new(0.0, min_h - 10.0)));
+                                    ui.set_min_size(CELL_MIN);
                                     let cell = cell?;
                                     let strong = (r == 0).then(|| ui.visuals().strong_text_color());
                                     self.cell_ui(ui, cell, strong, project, note_path, menu)
                                 })
                         });
-                        let resp = inner.response.on_hover_cursor(CursorIcon::Text);
                         if let Some(a) = inner.inner.inner {
                             action = Some(a);
-                        } else if resp.clicked() {
-                            let at = cell.map_or(range.end, |c| c.range.end);
-                            action = Some(ViewAction::EditAt(at));
                         }
                         line.push(inner.inner.response.rect);
                     }
@@ -1221,12 +1238,17 @@ impl Drags {
                 .fold(f32::NEG_INFINITY, f32::max),
         );
         let _ = first;
-        let measured: Vec<f32> = rects
-            .iter()
-            .map(|r| r.iter().map(|x| x.height()).fold(0.0, f32::max))
+        // Cases entières (colonne × ligne) pour l'image suivante.
+        let full: Vec<Rect> = (0..rects.len())
+            .flat_map(|r| {
+                let (xs, ys) = (&xs, &ys);
+                (0..cols).map(move |c| {
+                    Rect::from_min_max(Pos2::new(xs[c], ys[r]), Pos2::new(xs[c + 1], ys[r + 1]))
+                })
+            })
             .collect();
-        if measured != heights {
-            ui.data_mut(|d| d.insert_temp(heights_id, measured));
+        if full != prev_cells {
+            ui.data_mut(|d| d.insert_temp(cells_id, full));
             ui.ctx().request_repaint();
         }
         let (x0, x1, y0, y1) = (xs[0], xs[cols], ys[0], ys[ys.len() - 1]);
@@ -1337,7 +1359,11 @@ impl Drags {
             base: cell.range.start,
             offset: 0,
         };
-        ui.horizontal_wrapped(|ui| {
+        // Pas de retour à la ligne forcé par la largeur de la colonne
+        // précédente : la colonne prend la largeur de son contenu (jusqu'à
+        // `CELL_WRAP`, puis le texte revient à la ligne).
+        self.wrap_cap = Some(CELL_WRAP);
+        ui.horizontal(|ui| {
             for b in &cell.blocks {
                 let a = match b {
                     Block::Image(img) => self.image_ui(ui, img, project, note_path),
@@ -1367,6 +1393,7 @@ impl Drags {
                 }
             }
         });
+        self.wrap_cap = None;
         action
     }
 
@@ -1598,7 +1625,7 @@ impl Drags {
             chars += span.text.chars().count();
             job.append(&span.text, 0.0, fmt);
         }
-        job.wrap.max_width = ui.available_width();
+        job.wrap.max_width = self.wrap_cap.unwrap_or_else(|| ui.available_width());
         let galley = ui.fonts_mut(|f| f.layout_job(job));
         let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click_and_drag());
         ui.painter().galley(rect.min, galley.clone(), base);

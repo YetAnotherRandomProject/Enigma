@@ -2045,6 +2045,12 @@ impl Editor {
         self.pending_cursor = Some(self.body[..b].chars().count());
     }
 
+    /// Hauteur à l'écran de chaque unité à l'image précédente (tests).
+    #[cfg(test)]
+    pub fn unit_heights(&self) -> Vec<f32> {
+        self.unit_rects.iter().map(|(_, y)| y.max - y.min).collect()
+    }
+
     /// Une unité est-elle en cours de modification ? (tests)
     #[cfg(test)]
     pub fn is_editing(&self) -> bool {

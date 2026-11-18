@@ -3863,6 +3863,63 @@ mod ui_tests {
     }
 
     #[test]
+    fn table_shrinks_back_to_its_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        egui_extras::install_image_loaders(&harness.ctx);
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(
+            dir.path().join("assets/plan.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><rect width="200" height="200" fill="#4aa3ff"/></svg>"##,
+        )
+        .unwrap();
+        let table = |w: u32| {
+            format!(
+                "| Colonne 1 | Colonne 2 |\n| --------- | --------- |\n| ![a|{w}](assets/plan.svg) | x |\n\nFin"
+            )
+        };
+        new_note(&mut harness, "Essai", &table(300));
+        for _ in 0..10 {
+            harness.run_steps(2);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Hauteur du tableau (première unité : en-tête, séparateur, ligne).
+        let fin_y = |h: &Harness<'_, State>| {
+            h.state()
+                .ws
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .unwrap()
+                .unit_heights()[0]
+        };
+        let big = fin_y(&harness);
+        snapshot(&mut harness, "52_tableau_grand");
+        // Image réduite : la ligne du tableau doit redevenir basse.
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            let id = ws.project.resolve_title("Essai").unwrap().clone();
+            ws.project.set_body(&id, table(60)).unwrap();
+            let now = ws.now_ms;
+            ws.editor
+                .as_mut()
+                .unwrap()
+                .sync_from_project(&ws.project, now);
+        }
+        for _ in 0..10 {
+            harness.run_steps(2);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        snapshot(&mut harness, "53_tableau_reduit");
+        let small = fin_y(&harness);
+        assert!(small < big - 150.0, "tableau resté haut : {big} -> {small}");
+        // Et sans image, le tableau est bas (pas de hauteur résiduelle).
+        assert!(small < 150.0, "{small}");
+    }
+
+    #[test]
     fn rename_from_title_and_external_reload() {
         let dir = tempfile::tempdir().unwrap();
         let mut harness = setup(dir.path());
