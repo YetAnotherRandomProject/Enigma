@@ -38,6 +38,22 @@ pub enum Command {
     InsertImage,
     ToggleReading,
     AssociateFiles,
+    FormatBold,
+    FormatItalic,
+    FormatStrike,
+    FormatCode,
+    FormatLink,
+    Heading1,
+    Heading2,
+    Heading3,
+    BulletList,
+    NumberedList,
+    TaskList,
+    QuoteBlock,
+    CodeBlock,
+    InsertTable,
+    InsertRule,
+    InsertDate,
 }
 
 impl Command {
@@ -73,6 +89,22 @@ impl Command {
         Command::InsertImage,
         Command::ToggleReading,
         Command::AssociateFiles,
+        Command::FormatBold,
+        Command::FormatItalic,
+        Command::FormatStrike,
+        Command::FormatCode,
+        Command::FormatLink,
+        Command::Heading1,
+        Command::Heading2,
+        Command::Heading3,
+        Command::BulletList,
+        Command::NumberedList,
+        Command::TaskList,
+        Command::QuoteBlock,
+        Command::CodeBlock,
+        Command::InsertTable,
+        Command::InsertRule,
+        Command::InsertDate,
     ];
 
     /// Identifiant stable (fichier de raccourcis).
@@ -109,6 +141,22 @@ impl Command {
             Command::InsertImage => "insert_image",
             Command::ToggleReading => "toggle_reading",
             Command::AssociateFiles => "associate_files",
+            Command::FormatBold => "format_bold",
+            Command::FormatItalic => "format_italic",
+            Command::FormatStrike => "format_strike",
+            Command::FormatCode => "format_code",
+            Command::FormatLink => "format_link",
+            Command::Heading1 => "heading_1",
+            Command::Heading2 => "heading_2",
+            Command::Heading3 => "heading_3",
+            Command::BulletList => "bullet_list",
+            Command::NumberedList => "numbered_list",
+            Command::TaskList => "task_list",
+            Command::QuoteBlock => "quote",
+            Command::CodeBlock => "code_block",
+            Command::InsertTable => "insert_table",
+            Command::InsertRule => "insert_rule",
+            Command::InsertDate => "insert_date",
         }
     }
 
@@ -146,6 +194,22 @@ impl Command {
             Command::InsertImage => "Insérer une image ou un fichier…",
             Command::ToggleReading => "Basculer lecture / édition",
             Command::AssociateFiles => "Ouvrir les fichiers .enigma avec Enigma Notes",
+            Command::FormatBold => "Texte : gras",
+            Command::FormatItalic => "Texte : italique",
+            Command::FormatStrike => "Texte : barré",
+            Command::FormatCode => "Texte : code",
+            Command::FormatLink => "Texte : lien vers une fiche [[ ]]",
+            Command::Heading1 => "Texte : titre 1",
+            Command::Heading2 => "Texte : titre 2",
+            Command::Heading3 => "Texte : titre 3",
+            Command::BulletList => "Texte : liste à puces",
+            Command::NumberedList => "Texte : liste numérotée",
+            Command::TaskList => "Texte : liste de tâches",
+            Command::QuoteBlock => "Texte : citation",
+            Command::CodeBlock => "Texte : bloc de code",
+            Command::InsertTable => "Insérer un tableau",
+            Command::InsertRule => "Insérer un séparateur",
+            Command::InsertDate => "Insérer la date du jour",
         }
     }
 
@@ -162,6 +226,14 @@ impl Command {
             Command::ShowBoard => &["Ctrl+T"],
             Command::ToggleTheme => &["Ctrl+Maj+L"],
             Command::ToggleReading => &["Ctrl+E"],
+            Command::FormatBold => &["Ctrl+B"],
+            Command::FormatItalic => &["Ctrl+I"],
+            Command::FormatStrike => &["Ctrl+Maj+X"],
+            Command::FormatCode => &["Ctrl+Maj+C"],
+            Command::FormatLink => &["Ctrl+K"],
+            Command::Heading1 => &["Ctrl+1"],
+            Command::Heading2 => &["Ctrl+2"],
+            Command::Heading3 => &["Ctrl+3"],
             Command::OpenProject => &["Ctrl+O"],
             _ => &[],
         }
@@ -206,6 +278,31 @@ pub fn apply_theme(ctx: &egui::Context, cmd: Command) {
         _ => return,
     };
     ctx.set_theme(pref);
+}
+
+/// Outil d'écriture d'une commande de mise en forme.
+pub fn format_of(cmd: Command) -> Option<crate::editor::Format> {
+    use crate::editor::Format;
+    use enigma_core::md_edit::{Inline as I, Line as L};
+    Some(match cmd {
+        Command::FormatBold => Format::Inline(I::Bold),
+        Command::FormatItalic => Format::Inline(I::Italic),
+        Command::FormatStrike => Format::Inline(I::Strike),
+        Command::FormatCode => Format::Inline(I::Code),
+        Command::FormatLink => Format::Inline(I::WikiLink),
+        Command::Heading1 => Format::Line(L::Heading(1)),
+        Command::Heading2 => Format::Line(L::Heading(2)),
+        Command::Heading3 => Format::Line(L::Heading(3)),
+        Command::BulletList => Format::Line(L::Bullet),
+        Command::NumberedList => Format::Line(L::Numbered),
+        Command::TaskList => Format::Line(L::Task),
+        Command::QuoteBlock => Format::Line(L::Quote),
+        Command::CodeBlock => Format::CodeBlock,
+        Command::InsertTable => Format::Table(3, 3),
+        Command::InsertRule => Format::Rule,
+        Command::InsertDate => Format::Date,
+        _ => return None,
+    })
 }
 
 /// Raccourci egui correspondant (`None` si la touche est inconnue).

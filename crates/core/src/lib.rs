@@ -21,6 +21,7 @@ pub mod import;
 pub mod link_edit;
 pub mod links;
 pub mod markdown;
+pub mod md_edit;
 pub mod note;
 pub mod pack;
 pub mod project;

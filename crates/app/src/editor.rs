@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use eframe::egui::{self, Color32, FontId, RichText, Stroke};
 use enigma_core::history::{EditKind, History};
 use enigma_core::markdown;
+use enigma_core::md_edit;
 use enigma_core::pack::FieldKind;
 use enigma_core::{FieldValue, NoteId, NoteMeta, Project};
 
@@ -46,6 +47,10 @@ pub struct Editor {
     pending_cursor: Option<usize>,
     /// Dernière position connue du curseur (octet), pour insérer une image.
     last_cursor: Option<usize>,
+    /// Dernière sélection connue (octets), pour la mise en forme.
+    last_sel: Option<std::ops::Range<usize>>,
+    /// Début (caractères) de la sélection à rétablir avec `pending_cursor`.
+    pending_anchor: Option<usize>,
     /// État du mode Lecture (blocs en cache, redimensionnement en cours).
     reading: ReadingState,
 }
@@ -56,6 +61,140 @@ pub struct BodyOutcome {
     pub edited: bool,
     /// Fiche à ouvrir (Ctrl+clic sur un lien).
     pub open: Option<NoteId>,
+    /// Ouvrir le sélecteur « Insérer une image ou un fichier ».
+    pub insert_file: bool,
+}
+
+/// Outil d'écriture appliqué à la sélection (ou au curseur).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    Inline(md_edit::Inline),
+    Line(md_edit::Line),
+    CodeBlock,
+    Table(usize, usize),
+    Rule,
+    Date,
+    /// Supprime la sélection (Couper).
+    Delete,
+}
+
+enum MenuChoice {
+    Format(Format),
+    InsertFile,
+    Copy,
+    Cut,
+}
+
+/// Menu contextuel du texte.
+fn format_menu(ui: &mut egui::Ui, has_selection: bool) -> Option<MenuChoice> {
+    use md_edit::{Inline as I, Line as L};
+    let mut choice = None;
+    let mut item = |ui: &mut egui::Ui, label: &str, keys: &str, c: MenuChoice| {
+        let button = if keys.is_empty() {
+            egui::Button::new(label)
+        } else {
+            egui::Button::new(label).shortcut_text(keys)
+        };
+        if ui.add(button).clicked() {
+            choice = Some(c);
+            ui.close();
+        }
+    };
+    if has_selection {
+        item(ui, "Couper", "Ctrl+X", MenuChoice::Cut);
+        item(ui, "Copier", "Ctrl+C", MenuChoice::Copy);
+        ui.separator();
+    }
+    item(
+        ui,
+        "Gras",
+        "Ctrl+B",
+        MenuChoice::Format(Format::Inline(I::Bold)),
+    );
+    item(
+        ui,
+        "Italique",
+        "Ctrl+I",
+        MenuChoice::Format(Format::Inline(I::Italic)),
+    );
+    item(
+        ui,
+        "Barré",
+        "Ctrl+Maj+X",
+        MenuChoice::Format(Format::Inline(I::Strike)),
+    );
+    item(
+        ui,
+        "Code",
+        "Ctrl+Maj+C",
+        MenuChoice::Format(Format::Inline(I::Code)),
+    );
+    item(
+        ui,
+        "Lien vers une fiche [[ ]]",
+        "Ctrl+K",
+        MenuChoice::Format(Format::Inline(I::WikiLink)),
+    );
+    ui.separator();
+    ui.menu_button("Titre", |ui| {
+        for (h, k) in [(1u8, "Ctrl+1"), (2, "Ctrl+2"), (3, "Ctrl+3")] {
+            item(
+                ui,
+                &format!("Titre {h}"),
+                k,
+                MenuChoice::Format(Format::Line(L::Heading(h))),
+            );
+        }
+    });
+    ui.menu_button("Liste", |ui| {
+        item(
+            ui,
+            "Liste à puces",
+            "",
+            MenuChoice::Format(Format::Line(L::Bullet)),
+        );
+        item(
+            ui,
+            "Liste numérotée",
+            "",
+            MenuChoice::Format(Format::Line(L::Numbered)),
+        );
+        item(
+            ui,
+            "Liste de tâches",
+            "",
+            MenuChoice::Format(Format::Line(L::Task)),
+        );
+    });
+    item(
+        ui,
+        "Citation",
+        "",
+        MenuChoice::Format(Format::Line(L::Quote)),
+    );
+    item(
+        ui,
+        "Bloc de code",
+        "",
+        MenuChoice::Format(Format::CodeBlock),
+    );
+    ui.separator();
+    ui.menu_button("Insérer", |ui| {
+        ui.menu_button("Tableau", |ui| {
+            for (r, c) in [(2, 2), (3, 3), (4, 4), (3, 5)] {
+                item(
+                    ui,
+                    &format!("{c} colonnes × {r} lignes"),
+                    "",
+                    MenuChoice::Format(Format::Table(r, c)),
+                );
+            }
+        });
+        item(ui, "Séparateur", "", MenuChoice::Format(Format::Rule));
+        item(ui, "Date du jour", "", MenuChoice::Format(Format::Date));
+        item(ui, "Image ou fichier…", "", MenuChoice::InsertFile);
+    });
+    choice
 }
 
 impl Editor {
@@ -78,6 +217,8 @@ impl Editor {
             dismissed: None,
             pending_cursor: None,
             last_cursor: None,
+            last_sel: None,
+            pending_anchor: None,
             reading: ReadingState::default(),
         };
         editor.refresh_field_bufs();
@@ -354,11 +495,16 @@ impl Editor {
 
         // 2. Position du curseur après une insertion.
         if let Some(ci) = self.pending_cursor.take() {
+            let anchor = self.pending_anchor.take();
             if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
                 let cursor = egui::text::CCursor::new(ci);
-                state
-                    .cursor
-                    .set_char_range(Some(egui::text::CCursorRange::one(cursor)));
+                let range = match anchor {
+                    Some(a) if a != ci => {
+                        egui::text::CCursorRange::two(egui::text::CCursor::new(a), cursor)
+                    }
+                    _ => egui::text::CCursorRange::one(cursor),
+                };
+                state.cursor.set_char_range(Some(range));
                 state.store(ui.ctx(), te_id);
             }
             ui.memory_mut(|m| m.request_focus(te_id));
@@ -407,7 +553,31 @@ impl Editor {
             outcome.edited = true;
         }
         if let Some(r) = output.cursor_range {
-            self.last_cursor = Some(char_to_byte(&self.body, r.primary.index.0));
+            let p = char_to_byte(&self.body, r.primary.index.0);
+            let s = char_to_byte(&self.body, r.secondary.index.0);
+            self.last_cursor = Some(p);
+            self.last_sel = Some(p.min(s)..p.max(s));
+        }
+
+        // Clic droit : mise en forme de la sélection, ou insertions.
+        let has_selection = self.last_sel.as_ref().is_some_and(|r| !r.is_empty());
+        let mut chosen = None;
+        output.response.context_menu(|ui| {
+            chosen = format_menu(ui, has_selection);
+        });
+        match chosen {
+            Some(MenuChoice::Format(f)) => {
+                self.format(f, project, now_ms);
+                outcome.edited = true;
+            }
+            Some(MenuChoice::InsertFile) => outcome.insert_file = true,
+            Some(MenuChoice::Copy) => ui.ctx().copy_text(self.selected_text()),
+            Some(MenuChoice::Cut) => {
+                ui.ctx().copy_text(self.selected_text());
+                self.format(Format::Delete, project, now_ms);
+                outcome.edited = true;
+            }
+            None => {}
         }
 
         // 4. Ctrl+clic sur un lien.
@@ -460,6 +630,50 @@ impl Editor {
             }
         }
         outcome
+    }
+
+    /// Texte sélectionné (vide sans sélection).
+    fn selected_text(&self) -> String {
+        self.last_sel
+            .clone()
+            .and_then(|r| self.body.get(r))
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Applique un outil d'écriture à la sélection, comme une étape
+    /// d'historique, et rétablit la sélection.
+    pub fn format(&mut self, f: Format, project: &mut Project, now_ms: u64) {
+        let len = self.body.len();
+        let sel = self
+            .last_sel
+            .clone()
+            .filter(|r| r.end <= len)
+            .unwrap_or(len..len);
+        let text = self.body.as_str();
+        let edit = match f {
+            Format::Inline(k) => md_edit::toggle_inline(text, sel, k),
+            Format::Line(k) => md_edit::toggle_line(text, sel, k),
+            Format::CodeBlock => md_edit::code_block(text, sel),
+            Format::Table(r, c) => md_edit::insert_block(text, sel, &md_edit::table(r, c), 2),
+            Format::Rule => md_edit::insert_block(text, sel, "---", 3),
+            Format::Date => {
+                let date = crate::project_file::file_date(std::time::SystemTime::now());
+                md_edit::insert_inline(text, sel, date.get(..10).unwrap_or(&date))
+            }
+            Format::Delete => md_edit::insert_inline(text, sel, ""),
+        };
+        if edit.text == self.body {
+            return;
+        }
+        self.body = edit.text;
+        let a = self.body[..edit.selection.start].chars().count();
+        let b = self.body[..edit.selection.end].chars().count();
+        self.last_sel = Some(edit.selection.clone());
+        self.last_cursor = Some(edit.selection.end);
+        self.pending_anchor = Some(a);
+        self.pending_cursor = Some(b);
+        self.commit_body(project, EditKind::Discrete, now_ms);
     }
 
     /// Insère du texte au curseur (ou à la fin), comme une étape

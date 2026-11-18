@@ -356,6 +356,7 @@ impl Workspace {
             Command::DeleteNote | Command::Undo | Command::Redo | Command::InsertImage => {
                 self.editor.is_some()
             }
+            c if commands::format_of(c).is_some() => self.editor.is_some() && !self.reading,
             // Association de fichiers : Windows seulement pour l'instant.
             Command::AssociateFiles => cfg!(windows),
             Command::EditPack => !self.project.pack().id.is_empty(),
@@ -466,6 +467,31 @@ impl Workspace {
                     .pick_file()
                 {
                     self.insert_image(&file, notices);
+                }
+            }
+            Command::FormatBold
+            | Command::FormatItalic
+            | Command::FormatStrike
+            | Command::FormatCode
+            | Command::FormatLink
+            | Command::Heading1
+            | Command::Heading2
+            | Command::Heading3
+            | Command::BulletList
+            | Command::NumberedList
+            | Command::TaskList
+            | Command::QuoteBlock
+            | Command::CodeBlock
+            | Command::InsertTable
+            | Command::InsertRule
+            | Command::InsertDate => {
+                if let Some(f) = commands::format_of(cmd) {
+                    if self.reading || self.view != View::Note {
+                        notices.info("Passez en mode Édition d'une fiche pour la mettre en forme.");
+                    } else if let Some(editor) = &mut self.editor {
+                        editor.format(f, &mut self.project, self.now_ms);
+                        self.mark_edited();
+                    }
                 }
             }
             Command::ToggleReading => {
@@ -605,7 +631,7 @@ impl Workspace {
             .collect();
     }
 
-    fn select(&mut self, id: &NoteId, notices: &mut Notices) {
+    pub fn select(&mut self, id: &NoteId, notices: &mut Notices) {
         if self.editor.as_ref().is_some_and(|e| &e.id == id) {
             return;
         }
@@ -1187,7 +1213,7 @@ impl Workspace {
         } else {
             editor.body_ui(ui, &mut self.project, now_ms, notices)
         };
-        if insert_image {
+        if insert_image || body.insert_file {
             self.run_command(Command::InsertImage, &ui.ctx().clone(), notices);
         }
         if edited || body.edited {
@@ -2470,6 +2496,73 @@ id: "
             "bouton de lecture"
         );
         snapshot(&mut harness, "22_pieces_jointes");
+    }
+
+    #[test]
+    fn markdown_tools_shortcuts_and_context_menu() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            let id = ws
+                .project
+                .create_note("Essai", vec![], String::new())
+                .unwrap();
+            ws.select(&id, &mut state.notices);
+        }
+        harness.run_steps(8);
+        harness.get_by_role(Role::MultilineTextInput).focus();
+        harness.run_steps(4);
+        harness
+            .get_by_role(Role::MultilineTextInput)
+            .type_text("indice");
+        harness.run_steps(4);
+        let body = |h: &Harness<'_, State>| {
+            h.state()
+                .ws
+                .as_ref()
+                .unwrap()
+                .editor_body()
+                .unwrap()
+                .to_owned()
+        };
+        // Tout sélectionner puis Ctrl+B : gras ; Ctrl+1 : titre.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run_steps(3);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::B);
+        harness.run_steps(3);
+        assert_eq!(body(&harness), "**indice**");
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num1);
+        harness.run_steps(3);
+        assert_eq!(body(&harness), "# **indice**");
+        // Ctrl+Z annule le titre.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        harness.run_steps(3);
+        assert_eq!(body(&harness), "**indice**");
+
+        // Clic droit dans le texte : menu de mise en forme et d'insertion.
+        let at = harness
+            .get_by_role(Role::MultilineTextInput)
+            .rect()
+            .center();
+        harness.hover_at(at);
+        harness.run_steps(2);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run_steps(1);
+        }
+        harness.run_steps(6);
+        assert!(harness.query_by_label("Citation").is_some(), "menu affiché");
+        snapshot(&mut harness, "23_menu_texte");
+        harness.get_by_label("Citation").click();
+        harness.run_steps(4);
+        assert!(body(&harness).starts_with("> "), "{}", body(&harness));
     }
 
     #[test]
