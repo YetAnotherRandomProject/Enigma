@@ -63,7 +63,10 @@ pub struct Analysis {
 }
 
 pub(crate) fn options() -> Options {
-    Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES
+    Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
 }
 
 /// Analyse complète : styles et liens.
@@ -178,6 +181,15 @@ pub fn tags(text: &str) -> Vec<TagRef> {
             _ => {}
         }
     }
+    scan_tags(text, &in_code)
+}
+
+/// Tags d'un texte sans code (morceau de paragraphe déjà analysé).
+pub fn tags_in_plain(text: &str) -> Vec<TagRef> {
+    scan_tags(text, &vec![false; text.len()])
+}
+
+fn scan_tags(text: &str, in_code: &[bool]) -> Vec<TagRef> {
     let mut out = Vec::new();
     for (i, c) in text.char_indices() {
         if c != '#' || in_code[i] {

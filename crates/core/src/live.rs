@@ -15,6 +15,10 @@ pub enum UnitKind {
     /// Bloc de code délimité par ``` ou ~~~.
     Code,
     Table,
+    /// Encadré `> [!type] Titre` et ses lignes `>`.
+    Callout,
+    /// Commentaire sur plusieurs lignes `%%` … `%%`.
+    Comment,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +69,34 @@ fn fence_close(line: &str, ch: u8, n: usize) -> bool {
     t.len() >= n && t.bytes().all(|b| b == ch)
 }
 
+/// Première ligne d'un encadré : `> [!type]`, `> [!type]- Titre`…
+pub fn is_callout_start(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix('>')
+        .is_some_and(|r| r.trim_start().starts_with("[!"))
+}
+
+/// En-tête d'encadré : (type, repli : `Some(true)` replié par défaut,
+/// `Some(false)` déplié mais repliable, titre).
+pub fn callout_header(line: &str) -> Option<(String, Option<bool>, String)> {
+    let r = line.trim_start().strip_prefix('>')?.trim_start();
+    let r = r.strip_prefix("[!")?;
+    let close = r.find(']')?;
+    let kind = r[..close].trim().to_lowercase();
+    let rest = &r[close + 1..];
+    let (fold, title) = match rest.chars().next() {
+        Some('-') => (Some(true), &rest[1..]),
+        Some('+') => (Some(false), &rest[1..]),
+        _ => (None, rest),
+    };
+    Some((kind, fold, title.trim().to_owned()))
+}
+
+/// Ligne qui ouvre un commentaire sur plusieurs lignes (`%%` non refermé).
+fn comment_open(line: &str) -> bool {
+    line.trim_start().starts_with("%%") && line.matches("%%").count() % 2 == 1
+}
+
 /// Découpe le texte en unités d'édition.
 pub fn units(text: &str) -> Vec<Unit> {
     let lines = line_ranges(text);
@@ -81,6 +113,31 @@ pub fn units(text: &str) -> Vec<Unit> {
             out.push(Unit {
                 range: lines[i].start..lines[last].end,
                 kind: UnitKind::Code,
+            });
+            i = last + 1;
+            continue;
+        }
+        if is_callout_start(line(i)) {
+            let mut j = i + 1;
+            while j < lines.len() && line(j).trim_start().starts_with('>') {
+                j += 1;
+            }
+            out.push(Unit {
+                range: lines[i].start..lines[j - 1].end,
+                kind: UnitKind::Callout,
+            });
+            i = j;
+            continue;
+        }
+        if comment_open(line(i)) {
+            let mut j = i + 1;
+            while j < lines.len() && !line(j).contains("%%") {
+                j += 1;
+            }
+            let last = j.min(lines.len() - 1);
+            out.push(Unit {
+                range: lines[i].start..lines[last].end,
+                kind: UnitKind::Comment,
             });
             i = last + 1;
             continue;
@@ -227,6 +284,32 @@ mod tests {
         assert_eq!(unit_at(&u, 2), 0);
         assert_eq!(unit_at(&u, 4), 1);
         assert_eq!(unit_at(&u, 99), 1);
+    }
+
+    #[test]
+    fn callouts_and_comments() {
+        let text = "> [!indice]- Le coffre\n> Code à 4 chiffres\n> suite\nAprès\n%%\nnote cachée\n%%\n> simple citation";
+        assert_eq!(
+            kinds(text),
+            [
+                (
+                    UnitKind::Callout,
+                    "> [!indice]- Le coffre\n> Code à 4 chiffres\n> suite"
+                ),
+                (UnitKind::Line, "Après"),
+                (UnitKind::Comment, "%%\nnote cachée\n%%"),
+                (UnitKind::Line, "> simple citation"),
+            ]
+        );
+        assert_eq!(
+            callout_header("> [!INDICE]- Le coffre"),
+            Some(("indice".into(), Some(true), "Le coffre".into()))
+        );
+        assert_eq!(
+            callout_header("> [!note]"),
+            Some(("note".into(), None, String::new()))
+        );
+        assert!(callout_header("> texte").is_none());
     }
 
     #[test]

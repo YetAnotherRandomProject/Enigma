@@ -331,6 +331,33 @@ fn snippet(line: &str, ranges: Vec<Range<usize>>) -> (String, Vec<Range<usize>>)
 }
 
 impl Project {
+    /// Tous les tags du projet (en minuscules) et le nombre de fiches qui
+    /// les portent. Un tag `a/b` compte aussi pour `a`.
+    pub fn all_tags(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut out = std::collections::BTreeMap::new();
+        for id in self.ids() {
+            let Some(note) = self.note(id) else {
+                continue;
+            };
+            let mut seen = std::collections::BTreeSet::new();
+            for t in crate::markdown::tags(&note.body) {
+                let name = t.name.to_lowercase();
+                let mut prefix = String::new();
+                for part in name.split('/') {
+                    if !prefix.is_empty() {
+                        prefix.push('/');
+                    }
+                    prefix.push_str(part);
+                    seen.insert(prefix.clone());
+                }
+            }
+            for t in seen {
+                *out.entry(t).or_insert(0) += 1;
+            }
+        }
+        out
+    }
+
     /// Fiches qui répondent à la requête, avec les lignes trouvées. Tri :
     /// titre trouvé d'abord, puis nombre de lignes, puis titre.
     pub fn search_text(&self, query: &Query) -> Vec<Hit> {
@@ -449,6 +476,11 @@ mod tests {
         assert_eq!(titles(&p, "tag:indice").len(), 2);
         assert_eq!(titles(&p, "tag:indice/plante"), ["Serre"]);
         assert_eq!(titles(&p, "lien:major"), ["Salle des Archives"]);
+        let tags: Vec<(String, usize)> = p.all_tags().into_iter().collect();
+        assert_eq!(
+            tags,
+            [("indice".to_owned(), 2), ("indice/plante".to_owned(), 1)]
+        );
     }
 
     #[test]

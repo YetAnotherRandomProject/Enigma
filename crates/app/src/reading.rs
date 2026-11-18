@@ -44,6 +44,8 @@ pub enum ViewAction {
     OpenFile(std::path::PathBuf),
     /// Modifier le texte à cet octet de la fiche.
     EditAt(usize),
+    /// Chercher les fiches qui portent ce tag.
+    SearchTag(String),
     /// Début d'une sélection à la souris à cet octet.
     DragFrom(usize),
     /// Cocher/décocher la tâche de cette ligne.
@@ -87,6 +89,20 @@ pub enum Content {
         /// Cellules par ligne de données (en-tête compris).
         rows: Vec<Vec<CellView>>,
     },
+    /// Encadré `> [!type] Titre` : contenu mis en forme, repliable.
+    Callout {
+        kind: String,
+        /// `Some(true)` : replié par défaut ; `None` : pas repliable.
+        fold: Option<bool>,
+        title: String,
+        /// Octet de fin de la ligne d'en-tête.
+        header_end: usize,
+        units: Vec<CachedUnit>,
+        /// (début de ligne dans le contenu, octet correspondant de la fiche).
+        line_map: Vec<(usize, usize)>,
+    },
+    /// Commentaire `%%` … `%%` : affiché atténué.
+    Comment { text: String },
     /// Ligne réduite à `![[Fiche]]`, `![[Fiche#Section]]` ou
     /// `![[Fiche#^id]]` : contenu de l'autre fiche inséré.
     Embed {
@@ -123,6 +139,38 @@ pub struct Drags {
     embeds: std::collections::HashMap<String, (u64, std::path::PathBuf, Vec<CachedUnit>)>,
     /// Profondeur d'insertion (une fiche insérée dans une fiche insérée…).
     depth: usize,
+    /// Encadrés ouverts ou repliés par l'utilisateur (début → ouvert).
+    callouts: std::collections::HashMap<usize, bool>,
+    /// Notes de bas de page de la fiche : nom → (texte, octet).
+    pub footnotes: std::collections::HashMap<String, (String, usize)>,
+}
+
+/// Couleur et libellé par défaut d'un type d'encadré.
+fn callout_style(kind: &str, accent: Color32) -> (Color32, String) {
+    let color = match kind {
+        "note" | "info" | "abstract" | "resume" | "résumé" | "summary" => {
+            Color32::from_rgb(0x44, 0x8a, 0xff)
+        }
+        "indice" | "tip" | "hint" | "astuce" | "piste" => Color32::from_rgb(0x1d, 0xb9, 0x9a),
+        "question" | "enigme" | "énigme" | "faq" | "help" => Color32::from_rgb(0xec, 0xa7, 0x00),
+        "attention" | "warning" | "caution" | "avertissement" => {
+            Color32::from_rgb(0xff, 0x91, 0x00)
+        }
+        "danger" | "erreur" | "error" | "bug" | "piege" | "piège" | "failure" => {
+            Color32::from_rgb(0xe9, 0x3d, 0x50)
+        }
+        "solution" | "success" | "succes" | "succès" | "check" | "done" | "resolu" | "résolu" => {
+            Color32::from_rgb(0x08, 0xb9, 0x4e)
+        }
+        "example" | "exemple" => Color32::from_rgb(0x7c, 0x4d, 0xff),
+        "quote" | "citation" | "cite" => Color32::from_gray(0x9e),
+        _ => accent,
+    };
+    let mut label = kind.to_owned();
+    if let Some(first) = label.get(..1) {
+        label = format!("{}{}", first.to_uppercase(), &label[1..]);
+    }
+    (color, label)
 }
 
 /// Profondeur maximale des insertions imbriquées.
@@ -199,6 +247,46 @@ fn build(body: &str) -> Vec<CachedUnit> {
             let text = &body[unit.range.clone()];
             let base = unit.range.start;
             let content = match unit.kind {
+                UnitKind::Callout => {
+                    let lines = live::line_ranges(text);
+                    let (kind, fold, title) =
+                        live::callout_header(&text[lines[0].clone()]).unwrap_or_default();
+                    let mut content = String::new();
+                    let mut line_map = Vec::new();
+                    for l in lines.iter().skip(1) {
+                        let line = &text[l.clone()];
+                        let lead = line.len() - line.trim_start().len();
+                        let mut cut = lead + usize::from(line[lead..].starts_with('>'));
+                        if line[cut..].starts_with(' ') {
+                            cut += 1;
+                        }
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        line_map.push((content.len(), base + l.start + cut));
+                        content.push_str(&line[cut..]);
+                    }
+                    Content::Callout {
+                        kind,
+                        fold,
+                        title,
+                        header_end: base + lines[0].end,
+                        units: if content.is_empty() {
+                            Vec::new()
+                        } else {
+                            build(&content)
+                        },
+                        line_map,
+                    }
+                }
+                UnitKind::Comment => Content::Comment {
+                    text: text
+                        .trim()
+                        .trim_start_matches("%%")
+                        .trim_end_matches("%%")
+                        .trim()
+                        .to_owned(),
+                },
                 UnitKind::Line if embed_of(text).is_some() => {
                     let (target, section) = embed_of(text).unwrap_or_default();
                     Content::Embed { target, section }
@@ -271,6 +359,19 @@ impl Preview {
         if self.key != Some(key) {
             self.units = build(body);
             self.key = Some(key);
+            // Notes de bas de page : `[^nom]: texte`.
+            self.drags.footnotes.clear();
+            let mut at = 0;
+            for line in body.split('\n') {
+                if let Some(rest) = line.trim_start().strip_prefix("[^")
+                    && let Some((label, text)) = rest.split_once("]:")
+                {
+                    self.drags
+                        .footnotes
+                        .insert(label.to_owned(), (text.trim().to_owned(), at));
+                }
+                at += line.len() + 1;
+            }
         }
     }
 
@@ -349,6 +450,126 @@ impl Drags {
             }
             Content::Embed { target, section } => {
                 self.embed_ui(ui, cu, target, section.as_deref(), project, menu)
+            }
+            Content::Callout {
+                kind,
+                fold,
+                title,
+                header_end,
+                units,
+                line_map,
+            } => {
+                let start = cu.unit.range.start;
+                let accent = crate::theme::accent(ui.visuals());
+                let (color, label) = callout_style(kind, accent);
+                let open = *self.callouts.get(&start).unwrap_or(&(*fold != Some(true)));
+                let mut action = None;
+                let frame = egui::Frame::new()
+                    .fill(color.gamma_multiply(0.12))
+                    .inner_margin(egui::Margin {
+                        left: 14,
+                        right: 8,
+                        top: 5,
+                        bottom: 6,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let header = ui
+                            .horizontal(|ui| {
+                                if fold.is_some() {
+                                    let (r, _) =
+                                        ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                                    let c = r.center();
+                                    let pts = if open {
+                                        vec![
+                                            c + Vec2::new(-4.0, -2.0),
+                                            c + Vec2::new(4.0, -2.0),
+                                            c + Vec2::new(0.0, 3.0),
+                                        ]
+                                    } else {
+                                        vec![
+                                            c + Vec2::new(-2.0, -4.0),
+                                            c + Vec2::new(3.0, 0.0),
+                                            c + Vec2::new(-2.0, 4.0),
+                                        ]
+                                    };
+                                    ui.painter().add(Shape::convex_polygon(
+                                        pts,
+                                        color,
+                                        Stroke::NONE,
+                                    ));
+                                }
+                                let text = if title.is_empty() { &label } else { title };
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(text).color(color).size(BODY_SIZE),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                            })
+                            .inner;
+                        let header = header.on_hover_cursor(CursorIcon::PointingHand);
+                        if header.clicked() {
+                            if fold.is_some() {
+                                self.callouts.insert(start, !open);
+                            } else {
+                                action = Some(ViewAction::EditAt(*header_end));
+                            }
+                        }
+                        if !open {
+                            return;
+                        }
+                        let map = |b: usize| {
+                            let (s, src) = line_map
+                                .iter()
+                                .rev()
+                                .find(|(s, _)| *s <= b)
+                                .copied()
+                                .unwrap_or((0, *header_end));
+                            src + (b - s)
+                        };
+                        for u in units {
+                            let a = self.unit_ui(ui, u, project, note_path, menu);
+                            action = match a {
+                                Some(ViewAction::EditAt(b)) => Some(ViewAction::EditAt(map(b))),
+                                Some(ViewAction::DragFrom(b)) => Some(ViewAction::DragFrom(map(b))),
+                                Some(ViewAction::Menu(c, b)) => Some(ViewAction::Menu(c, map(b))),
+                                Some(ViewAction::ToggleTask(r)) => {
+                                    Some(ViewAction::ToggleTask(map(r.start)..map(r.end)))
+                                }
+                                Some(ViewAction::Resize { mut image, width }) => {
+                                    let s = map(image.range.start);
+                                    image.range = s..s + image.range.len();
+                                    Some(ViewAction::Resize { image, width })
+                                }
+                                Some(ViewAction::TableResize { range, .. }) => {
+                                    Some(ViewAction::EditAt(map(range.start)))
+                                }
+                                Some(other) => Some(other),
+                                None => action.take(),
+                            };
+                        }
+                    });
+                let r = frame.response.rect;
+                ui.painter()
+                    .vline(r.left() + 1.5, r.y_range(), Stroke::new(3.0, color));
+                action
+            }
+            Content::Comment { text } => {
+                let resp = ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new(format!("%% {text} %%"))
+                                .italics()
+                                .size(BODY_SIZE - 2.0)
+                                .color(ui.visuals().weak_text_color()),
+                        )
+                        .sense(Sense::click()),
+                    )
+                    .on_hover_text("Commentaire (jamais exporté) : cliquer pour le modifier")
+                    .on_hover_cursor(CursorIcon::Text);
+                resp.clicked()
+                    .then(|| ViewAction::EditAt(cu.unit.range.start + 2))
             }
         }
     }
@@ -1104,15 +1325,33 @@ impl Drags {
             if span.style.code {
                 fmt.background = visuals.code_bg_color;
             }
+            if span.style.highlight {
+                fmt.background = Color32::from_rgb(0xff, 0xd2, 0x3f).gamma_multiply(0.38);
+                fmt.color = visuals.strong_text_color();
+            }
+            if span.style.comment {
+                fmt.color = visuals.weak_text_color().gamma_multiply(0.8);
+                fmt.italics = true;
+            }
+            if span.style.sup {
+                fmt.font_id = FontId::proportional(size * 0.7);
+                fmt.valign = egui::Align::TOP;
+            }
             if let Some(link) = &span.link {
+                let accent = crate::theme::accent(&visuals);
                 fmt.color = match link {
                     InlineLink::Wiki { target, .. } if project.resolve_title(target).is_none() => {
                         visuals.error_fg_color
                     }
                     InlineLink::Wiki { .. } => crate::colors::WIKI_LINK,
                     InlineLink::Url(_) => visuals.hyperlink_color,
+                    InlineLink::Tag(_) | InlineLink::Footnote(_) => accent,
                 };
-                fmt.underline = Stroke::new(1.0, fmt.color);
+                match link {
+                    InlineLink::Tag(_) => fmt.background = accent.gamma_multiply(0.18),
+                    InlineLink::Footnote(_) => {}
+                    _ => fmt.underline = Stroke::new(1.0, fmt.color),
+                }
                 let n = span.text.chars().count();
                 links.push((chars..chars + n, link));
             }
@@ -1146,6 +1385,11 @@ impl Drags {
                     }
                     InlineLink::Wiki { target, .. } => format!("Ouvrir « {target} »"),
                     InlineLink::Url(u) => u.clone(),
+                    InlineLink::Tag(t) => format!("Fiches avec #{t}"),
+                    InlineLink::Footnote(l) => match self.footnotes.get(l) {
+                        Some((text, _)) => text.clone(),
+                        None => format!("Note [^{l}] non définie"),
+                    },
                 };
                 resp.clone().on_hover_text_at_pointer(tip);
             }
@@ -1181,6 +1425,11 @@ impl Drags {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(u));
                     return None;
                 }
+                Some(InlineLink::Tag(t)) => ViewAction::SearchTag(t.clone()),
+                Some(InlineLink::Footnote(l)) => match self.footnotes.get(l) {
+                    Some((_, at)) => ViewAction::EditAt(*at + l.len() + 4),
+                    None => ViewAction::EditAt(src.byte(i)),
+                },
                 None => ViewAction::EditAt(src.byte(i)),
             });
         }

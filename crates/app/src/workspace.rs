@@ -49,11 +49,15 @@ pub enum AppRequest {
     AssociateFiles,
 }
 
+/// Tags et nombre de fiches qui les portent.
+type TagCounts = Vec<(String, usize)>;
+
 /// Onglet du panneau de gauche.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LeftTab {
     Notes,
     Search,
+    Tags,
 }
 
 /// Vue de la zone centrale.
@@ -140,6 +144,8 @@ pub struct Workspace {
     search: crate::search_ui::SearchPanel,
     /// Mentions non liées de la fiche ouverte (fiche, génération, contenu).
     mentions: Option<((NoteId, u64, u64), Vec<enigma_core::mentions::Mention>)>,
+    /// Tags du projet (version du contenu, tag → nombre de fiches).
+    tags: Option<(u64, u64, TagCounts)>,
 }
 
 impl Workspace {
@@ -213,6 +219,7 @@ impl Workspace {
             left_tab: LeftTab::Notes,
             search: crate::search_ui::SearchPanel::default(),
             mentions: None,
+            tags: None,
         };
         ws.refresh_packs();
         Ok(ws)
@@ -684,6 +691,57 @@ impl Workspace {
         self.editor = Editor::open(&self.project, id);
     }
 
+    /// Montre les fiches qui portent ce tag (onglet Recherche).
+    fn search_tag(&mut self, tag: &str) {
+        self.left_tab = LeftTab::Search;
+        self.search.query = format!("tag:{tag}");
+    }
+
+    /// Onglet « Tags » : tags du projet et nombre de fiches ; rend le tag
+    /// cliqué.
+    fn tags_ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        let key = (self.project.generation(), self.project.content_version());
+        if self.tags.as_ref().map(|(g, c, _)| (*g, *c)) != Some(key) {
+            let all = self.project.all_tags().into_iter().collect();
+            self.tags = Some((key.0, key.1, all));
+        }
+        let tags = self
+            .tags
+            .as_ref()
+            .map(|(_, _, t)| t.as_slice())
+            .unwrap_or_default();
+        if tags.is_empty() {
+            ui.weak("Aucun tag. Écrivez #nom dans une fiche (#lieu/manoir pour ranger).");
+            return None;
+        }
+        let mut clicked = None;
+        let accent = crate::theme::accent(ui.visuals());
+        egui::ScrollArea::vertical()
+            .id_salt("tags_scroll")
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                for (tag, n) in tags {
+                    let depth = tag.matches('/').count();
+                    let short = tag.rsplit('/').next().unwrap_or(tag);
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0 * depth as f32);
+                        let r = ui
+                            .add(
+                                egui::Label::new(RichText::new(format!("#{short}")).color(accent))
+                                    .sense(Sense::click()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(format!("Fiches avec #{tag}"));
+                        if r.clicked() {
+                            clicked = Some(tag.clone());
+                        }
+                        ui.weak(n.to_string());
+                    });
+                }
+            });
+        clicked
+    }
+
     /// Place l'éditeur sur une section (`Titre`) ou un paragraphe (`^id`)
     /// de la fiche ouverte.
     fn reveal_section(&mut self, id: &NoteId, section: Option<&str>) {
@@ -812,10 +870,17 @@ impl Workspace {
                         .on_hover_text(
                             "Rechercher dans le texte de toutes les fiches (Ctrl+Maj+F)",
                         );
+                    ui.selectable_value(&mut self.left_tab, LeftTab::Tags, "Tags")
+                        .on_hover_text("Tous les #tags du projet");
                 });
                 ui.separator();
                 match self.left_tab {
                     LeftTab::Notes => self.list_ui(ui, notices),
+                    LeftTab::Tags => {
+                        if let Some(tag) = self.tags_ui(ui) {
+                            self.search_tag(&tag);
+                        }
+                    }
                     LeftTab::Search => {
                         if let Some((id, at)) = self.search.ui(ui, &self.project) {
                             self.view = View::Note;
@@ -1431,6 +1496,9 @@ impl Workspace {
         }
         if edited || body.edited || insert_table.is_some() {
             self.mark_edited();
+        }
+        if let Some(tag) = body.search_tag {
+            self.search_tag(&tag);
         }
         if let Some(target) = body.open {
             self.select(&target, notices);
@@ -2428,6 +2496,33 @@ mod ui_tests {
         let ws = harness.state().ws.as_ref().unwrap();
         let source = ws.project.resolve_title("Source").unwrap().clone();
         assert_eq!(ws.project.backlinks(&source).len(), 1);
+    }
+
+    #[test]
+    fn callouts_tags_highlights_comments_footnotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        new_note(
+            &mut harness,
+            "Essai",
+            "> [!indice]- Le coffre\n> Code à **4 chiffres**.\n\n> [!attention] Piège\n> Ne pas ouvrir.\n\nUn ==mot clé== %%note perso%% et #lieu/manoir, voir[^1].\n\n%%\nbrouillon\n%%\n\n[^1]: Trouvé le jour 3.",
+        );
+        harness.run_steps(4);
+        snapshot(&mut harness, "43_encadres_replie");
+        // L'encadré replié s'ouvre d'un clic sur son titre.
+        harness.get_by_label("Le coffre").click();
+        harness.run_steps(4);
+        snapshot(&mut harness, "44_encadres");
+        // Onglet Tags : le tag et son parent ; clic : recherche.
+        harness.get_by_label("Tags").click();
+        harness.run_steps(4);
+        assert!(harness.query_by_label("#lieu").is_some());
+        harness.get_by_label("#manoir").click();
+        harness.run_steps(4);
+        assert!(
+            harness.query_by_label("Essai").is_some(),
+            "résultat de tag:lieu/manoir"
+        );
     }
 
     #[test]

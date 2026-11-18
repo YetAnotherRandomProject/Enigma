@@ -110,6 +110,12 @@ pub struct InlineStyle {
     pub emphasis: bool,
     pub code: bool,
     pub strike: bool,
+    /// Surlignage `==texte==`.
+    pub highlight: bool,
+    /// Commentaire `%%texte%%` (affiché atténué).
+    pub comment: bool,
+    /// Appel de note `[^1]` (en exposant).
+    pub sup: bool,
 }
 
 /// Lien porté par un morceau de texte.
@@ -123,6 +129,10 @@ pub enum InlineLink {
     },
     /// Lien Markdown classique.
     Url(String),
+    /// Tag `#nom`.
+    Tag(String),
+    /// Appel de note de bas de page `[^nom]`.
+    Footnote(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,8 +273,81 @@ impl Builder<'_> {
         });
     }
 
+    /// Surlignage `==…==`, commentaires `%%…%%` et tags `#nom` dans les
+    /// morceaux de texte ordinaire du bloc.
+    fn inline_marks(&mut self) {
+        let spans = std::mem::take(&mut self.spans);
+        let mut out: Vec<Inline> = Vec::with_capacity(spans.len());
+        let (mut highlight, mut comment) = (false, false);
+        let push = |out: &mut Vec<Inline>, text: &str, style: InlineStyle, link| {
+            if text.is_empty() {
+                return;
+            }
+            if let Some(last) = out.last_mut()
+                && last.style == style
+                && last.link == link
+                && link.is_none()
+            {
+                last.text.push_str(text);
+                return;
+            }
+            out.push(Inline {
+                text: text.to_owned(),
+                style,
+                link,
+            });
+        };
+        for span in spans {
+            let mut style = span.style;
+            if span.link.is_some() || span.style.code {
+                style.highlight |= highlight;
+                style.comment |= comment;
+                out.push(Inline { style, ..span });
+                continue;
+            }
+            let text = span.text.as_str();
+            let mut at = 0;
+            while at <= text.len() {
+                let next = [text[at..].find("=="), text[at..].find("%%")]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                let end = next.map_or(text.len(), |n| at + n);
+                let piece = &text[at..end];
+                style.highlight = span.style.highlight || highlight;
+                style.comment = span.style.comment || comment;
+                // Tags du morceau.
+                let mut p = 0;
+                for tag in crate::markdown::tags_in_plain(piece) {
+                    push(&mut out, &piece[p..tag.range.start], style, None);
+                    push(
+                        &mut out,
+                        &piece[tag.range.clone()],
+                        style,
+                        Some(InlineLink::Tag(tag.name)),
+                    );
+                    p = tag.range.end;
+                }
+                push(&mut out, &piece[p..], style, None);
+                match next {
+                    Some(_) => {
+                        if text[end..].starts_with("==") {
+                            highlight = !highlight;
+                        } else {
+                            comment = !comment;
+                        }
+                        at = end + 2;
+                    }
+                    None => break,
+                }
+            }
+        }
+        self.spans = out;
+    }
+
     /// Termine le bloc en cours (texte accumulé).
     fn flush(&mut self) {
+        self.inline_marks();
         // Identifiant de paragraphe `^id` en fin de texte : masqué.
         if let Some(last) = self.spans.last_mut()
             && last.link.is_none()
@@ -306,9 +389,51 @@ impl Builder<'_> {
     }
 }
 
+/// Appels de note `[^nom]` sans définition dans `text` (une ligne isolée
+/// de la fiche, par exemple).
+fn undefined_footnotes(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut from = 0;
+    while let Some(i) = text[from..].find("[^") {
+        let start = from + i + 2;
+        let Some(end) = text[start..].find(']').map(|e| start + e) else {
+            break;
+        };
+        let label = &text[start..end];
+        let def = format!("[^{label}]:");
+        if !label.is_empty()
+            && !label.contains([' ', '['])
+            && !text[end..].starts_with("]:")
+            && !text.contains(&def)
+            && !out.contains(&label)
+        {
+            out.push(label);
+        }
+        from = end;
+    }
+    out
+}
+
 /// Découpe une fiche en blocs pour le mode Lecture. Les images deviennent
-/// des blocs à part ; les `[[liens]]` sont des morceaux cliquables.
+/// des blocs à part ; les `[[liens]]` sont des morceaux cliquables. Les
+/// appels de note dont la définition est ailleurs (lignes analysées une à
+/// une) restent reconnus.
 pub fn blocks(text: &str) -> Vec<Block> {
+    let missing = undefined_footnotes(text);
+    if missing.is_empty() {
+        return blocks_of(text, text.len());
+    }
+    let mut full = text.to_owned();
+    full.push_str("\n\n");
+    for l in missing {
+        full.push_str(&format!("[^{l}]: .\n"));
+    }
+    blocks_of(&full, text.len())
+}
+
+/// Blocs de `text`, en ignorant ce qui commence après `keep` octets.
+fn blocks_of(text: &str, keep: usize) -> Vec<Block> {
+    let mut cutoff = None;
     let mut b = Builder {
         text,
         wiki: wiki_links(text),
@@ -326,6 +451,10 @@ pub fn blocks(text: &str) -> Vec<Block> {
     let mut image: Option<(Range<usize>, String, String)> = None;
     let mut code: Option<String> = None;
     for (event, range) in Parser::new_ext(text, options()).into_offset_iter() {
+        if cutoff.is_none() && range.start >= keep && keep < text.len() {
+            b.flush();
+            cutoff = Some(b.blocks.len());
+        }
         if let Some((_, _, alt)) = &mut image {
             match event {
                 Event::End(TagEnd::Image) => {
@@ -400,6 +529,11 @@ pub fn blocks(text: &str) -> Vec<Block> {
                 Tag::Strong => b.style.strong = true,
                 Tag::Strikethrough => b.style.strike = true,
                 Tag::Link { dest_url, .. } => b.url = Some(dest_url.to_string()),
+                Tag::FootnoteDefinition(label) => {
+                    b.flush();
+                    b.container = Some(Container::Item);
+                    b.item_marker = format!("[{label}]");
+                }
                 Tag::Image { dest_url, .. } => {
                     image = Some((range, dest_url.to_string(), String::new()));
                 }
@@ -439,6 +573,10 @@ pub fn blocks(text: &str) -> Vec<Block> {
                 TagEnd::Strong => b.style.strong = false,
                 TagEnd::Strikethrough => b.style.strike = false,
                 TagEnd::Link => b.url = None,
+                TagEnd::FootnoteDefinition => {
+                    b.flush();
+                    b.container = None;
+                }
                 _ => {}
             },
             Event::Text(t) => b.push_text(&t, range),
@@ -446,6 +584,16 @@ pub fn blocks(text: &str) -> Vec<Block> {
                 let saved = b.style;
                 b.style.code = true;
                 b.push_plain(&t);
+                b.style = saved;
+            }
+            Event::FootnoteReference(label) => {
+                let saved = b.style;
+                b.style.sup = true;
+                b.spans.push(Inline {
+                    text: format!("[{label}]"),
+                    style: b.style,
+                    link: Some(InlineLink::Footnote(label.to_string())),
+                });
                 b.style = saved;
             }
             Event::SoftBreak => b.push_plain(" "),
@@ -461,6 +609,9 @@ pub fn blocks(text: &str) -> Vec<Block> {
     }
     b.flush();
     let _ = b.text;
+    if let Some(n) = cutoff {
+        b.blocks.truncate(n);
+    }
     b.blocks
 }
 
@@ -586,6 +737,43 @@ mod tests {
         assert!(
             last.iter()
                 .any(|s| s.link == Some(InlineLink::Url("https://x.y".into())) && s.text == "web")
+        );
+    }
+
+    #[test]
+    fn highlights_comments_tags_and_footnotes() {
+        let b =
+            blocks("Un ==mot clé== et %%secret%% avec #indice/salle fin[^1].\n\n[^1]: La note.");
+        let Block::Paragraph(p) = &b[0] else {
+            panic!("{:?}", b[0])
+        };
+        assert!(p.iter().any(|s| s.style.highlight && s.text == "mot clé"));
+        assert!(p.iter().any(|s| s.style.comment && s.text == "secret"));
+        assert!(
+            p.iter()
+                .any(|s| s.link == Some(InlineLink::Tag("indice/salle".into())))
+        );
+        assert!(
+            p.iter()
+                .any(|s| s.style.sup && s.link == Some(InlineLink::Footnote("1".into())))
+        );
+        assert_eq!(texts(p), "Un mot clé et secret avec #indice/salle fin[1].");
+        assert!(
+            matches!(&b[1], Block::ListItem { marker, spans, .. } if marker == "[1]" && texts(spans) == "La note.")
+        );
+    }
+
+    #[test]
+    fn footnote_defined_elsewhere() {
+        let b = blocks("voir[^1] et[^x].");
+        assert_eq!(b.len(), 1);
+        let Block::Paragraph(p) = &b[0] else {
+            panic!("{:?}", b[0])
+        };
+        assert_eq!(texts(p), "voir[1] et[x].");
+        assert!(
+            p.iter()
+                .any(|s| s.link == Some(InlineLink::Footnote("x".into())))
         );
     }
 

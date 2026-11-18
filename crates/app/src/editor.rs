@@ -86,6 +86,8 @@ pub struct BodyOutcome {
     pub open: Option<NoteId>,
     /// Section ou paragraphe (`^id`) où se placer dans la fiche ouverte.
     pub open_section: Option<String>,
+    /// Chercher les fiches qui portent ce tag.
+    pub search_tag: Option<String>,
     /// Ouvrir le sélecteur « Insérer une image ou un fichier ».
     pub insert_file: bool,
 }
@@ -819,7 +821,7 @@ impl Editor {
                             let mut layouter =
                                 |ui: &egui::Ui, b: &dyn egui::TextBuffer, wrap_width: f32| {
                                     let mut job = match kind {
-                                        UnitKind::Line => {
+                                        UnitKind::Line | UnitKind::Callout | UnitKind::Comment => {
                                             highlighter.job(b.as_str(), project_ref, &visuals)
                                         }
                                         _ => mono_job(b.as_str(), kind, &visuals),
@@ -1079,6 +1081,7 @@ impl Editor {
                 outcome.open = self.open_or_create(&title, project, notices);
                 outcome.open_section = section;
             }
+            Some(ViewAction::SearchTag(t)) => outcome.search_tag = Some(t),
             Some(ViewAction::OpenFile(path)) => {
                 if let Err(e) = crate::system_open::open(&path) {
                     notices.error(format!("Impossible d'ouvrir « {} » : {e}", path.display()));
@@ -1375,7 +1378,7 @@ impl Editor {
             let off = line.char_indices().nth(col).map_or(line.len(), |(i, _)| i);
             r.start + start + off
         };
-        let in_list = kind == UnitKind::Line && !selecting;
+        let in_list = matches!(kind, UnitKind::Line | UnitKind::Callout) && !selecting;
         let enter = in_list.then(|| md_edit::list_enter(body, cursor)).flatten();
         let indent = in_list
             .then(|| md_edit::list_indent(body, cursor, false))
