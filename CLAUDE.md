@@ -25,6 +25,7 @@ graphe 2D/3D filtrable. Réutilisable pour d'autres jeux via des **packs de jeu*
 |---|---|---|
 | `crates/core` (`enigma-core`) | modèle, parsing des fiches, index des liens, filtres, packs, stockage disque | **non** |
 | `crates/graph` (`enigma-graph`) | layout en forces 2D/3D, caméra, projection, picking | **non** |
+| `crates/typeset` (`enigma-typeset`) | formules LaTeX → Typst → SVG, Mermaid → SVG, fiche → PDF | **non** |
 | `crates/app` (`enigma-app`, binaire `enigma`) | application eframe : panneaux, éditeur, rendu du graphe, raccourcis | oui |
 | `packs/` | packs de jeu déclaratifs (`packs/blue_prince/pack.json`) | — |
 
@@ -247,6 +248,17 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
   clic dedans l'échange avec `editor`). Chaque éditeur a un `salt` (id du
   `TextEdit`), deux volets pouvant montrer la même fiche. `select` =
   navigation dans l'onglet courant (historique retour/suivant).
+- **Formules, Mermaid, PDF** (`enigma-typeset`) : `$…$` et `$$…$$`
+  (option `ENABLE_MATH` de pulldown ; `$$` sur plusieurs lignes =
+  `UnitKind::Math`) sont convertis de LaTeX vers Typst par
+  `latex_to_typst` (sous-ensemble courant, pas de dépendance `mitex`),
+  composés par Typst avec les polices de `typst-assets`, puis affichés en
+  SVG (`bytes://enigma-<hash>.svg`, cache `Drags::svgs`, taille lue dans
+  les attributs `width`/`height`). ```` ```mermaid ```` →
+  `mermaid-rs-renderer`, texte converti en tracés par `usvg` (le chargeur
+  SVG d'egui n'a aucune police : sans cela le texte disparaît). Export
+  PDF : Markdown → source Typst (`markdown_to_typst`) → `typst-pdf`.
+  Coût : l'exécutable release passe d'environ 24 Mo à 74 Mo.
 - **Versions** (`enigma_core::versions`) : `Project::save` garde le
   contenu *remplacé* (pas le nouveau) dans `.enigma/versions/<id>/`.
 - **Dans kittest** : l'indication (`placeholder`) d'un champ n'existe que
@@ -355,5 +367,5 @@ jalons suivants n'est codé avant validation.
   commandes « / », champs date/liste/lien, modèles à variables, onglets,
   côte à côte, retour/suivant, tableau d'enquête enrichi, versions,
   fusion/extraction.
-- [ ] **10. Export PDF, maths, Mermaid** — options à valider (dépendances
-  lourdes).
+- [x] **10. Export PDF, maths, Mermaid** — Typst (formules en SVG, PDF)
+  et mermaid-rs-renderer, dans la crate `enigma-typeset`.
