@@ -1612,7 +1612,7 @@ mod ui_tests {
             let state = harness.state_mut();
             state.ws = Some(Workspace::open(dir, &packs, &ctx, &mut state.notices).unwrap());
         }
-        harness.run();
+        harness.run_steps(8);
         harness
     }
 
@@ -1624,7 +1624,7 @@ mod ui_tests {
 
         // Ouvrir une fiche depuis la liste.
         harness.get_by_label("Salle des Archives").click();
-        harness.run();
+        harness.run_steps(8);
         let path = dir.path().join("Salle des Archives.md");
         {
             let ws = harness.state().ws.as_ref().unwrap();
@@ -1635,21 +1635,21 @@ mod ui_tests {
 
         // Ajouter une catégorie par sa pastille, puis annuler.
         harness.get_by_label("👤 Personnage").click();
-        harness.run();
+        harness.run_steps(8);
         flush(&mut harness);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("personnage"), "{text}");
         snapshot(&mut harness, "2_categorie");
 
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
-        harness.run();
+        harness.run_steps(8);
         flush(&mut harness);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("personnage"), "{text}");
 
         // Refaire.
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Y);
-        harness.run();
+        harness.run_steps(8);
         flush(&mut harness);
         assert!(
             std::fs::read_to_string(&path)
@@ -1659,11 +1659,11 @@ mod ui_tests {
 
         // Taper dans le corps : l'en-tête reste intact.
         harness.get_by_role(Role::MultilineTextInput).focus();
-        harness.run();
+        harness.run_steps(8);
         harness
             .get_by_role(Role::MultilineTextInput)
             .type_text("\nAjout [[Majordome]]");
-        harness.run();
+        harness.run_steps(8);
         flush(&mut harness);
         let saved = enigma_core::Note::parse(&std::fs::read_to_string(&path).unwrap(), "").unwrap();
         assert!(saved.body.contains("Ajout [[Majordome]]"), "{}", saved.body);
@@ -1683,18 +1683,18 @@ mod ui_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut harness = setup(dir.path());
         harness.get_by_label("Salle des Archives").click();
-        harness.run();
+        harness.run_steps(8);
 
         // Renommer via le champ titre : fichier renommé, liens réécrits.
         let is_title = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
             n.role() == Role::TextInput && n.value().as_deref() == Some("Salle des Archives")
         };
         harness.get_by(is_title).focus();
-        harness.run();
+        harness.run_steps(8);
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
         harness.get_by(is_title).type_text("Archives secrètes");
         harness.key_press(egui::Key::Enter);
-        harness.run();
+        harness.run_steps(8);
         let new_path = dir.path().join("Archives secrètes.md");
         assert!(new_path.exists());
         assert!(!dir.path().join("Salle des Archives.md").exists());
@@ -1714,7 +1714,7 @@ id: "
         let mut reloaded = false;
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            harness.run();
+            harness.run_steps(8);
             let ws = harness.state().ws.as_ref().unwrap();
             if ws
                 .editor
@@ -1750,20 +1750,20 @@ id: "
         let dir = tempfile::tempdir().unwrap();
         let mut harness = setup(dir.path());
         harness.get_by_label("Salle des Archives").click();
-        harness.run();
+        harness.run_steps(8);
         harness.get_by_role(Role::MultilineTextInput).focus();
-        harness.run();
+        harness.run_steps(8);
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
-        harness.run();
+        harness.run_steps(8);
 
         // [[cof → Tab : titre inséré, puis suggestions de type.
         harness
             .get_by_role(Role::MultilineTextInput)
             .type_text("\nPiste : [[cof");
-        harness.run();
+        harness.run_steps(8);
         snapshot(&mut harness, "5_suggestions_titre");
         harness.key_press(egui::Key::Tab);
-        harness.run();
+        harness.run_steps(8);
         assert!(
             body_text(&harness).ends_with("[[Coffre du bureau|]]"),
             "{}",
@@ -1772,10 +1772,10 @@ id: "
         harness
             .get_by_role(Role::MultilineTextInput)
             .type_text("ou");
-        harness.run();
+        harness.run_steps(8);
         snapshot(&mut harness, "6_suggestions_type");
         harness.key_press(egui::Key::Enter);
-        harness.run();
+        harness.run_steps(8);
         assert!(
             body_text(&harness).ends_with("Piste : [[Coffre du bureau|ouvre]]"),
             "{}",
@@ -1786,9 +1786,9 @@ id: "
         harness
             .get_by_role(Role::MultilineTextInput)
             .type_text(" et [[Nouvelle piste");
-        harness.run();
+        harness.run_steps(8);
         harness.key_press(egui::Key::Enter);
-        harness.run();
+        harness.run_steps(8);
         assert!(body_text(&harness).ends_with("et [[Nouvelle piste]]"));
         assert!(
             harness
@@ -1805,12 +1805,12 @@ id: "
         harness
             .get_by_role(Role::MultilineTextInput)
             .type_text(" [[maj");
-        harness.run();
+        harness.run_steps(8);
         harness.key_press(egui::Key::Escape);
-        harness.run();
+        harness.run_steps(8);
         assert!(body_text(&harness).ends_with(" [[maj"));
         harness.key_press(egui::Key::Enter);
-        harness.run();
+        harness.run_steps(8);
         assert!(
             body_text(&harness).ends_with(" [[maj\n"),
             "Entrée normale après Échap : {:?}",
@@ -1828,13 +1828,13 @@ id: "
         let coffre_links: Vec<_> = harness.get_all_by(is_link("Coffre du bureau")).collect();
         assert_eq!(coffre_links.len(), 2);
         coffre_links[0].click();
-        harness.run();
+        harness.run_steps(8);
         assert_eq!(open_title(&harness), "Coffre du bureau");
         harness.get_by_label("Rétroliens (2)");
         let back: Vec<_> = harness.get_all_by(is_link("Salle des Archives")).collect();
         assert_eq!(back.len(), 2);
         back[0].click();
-        harness.run();
+        harness.run_steps(8);
         assert_eq!(open_title(&harness), "Salle des Archives");
         // Le lien cassé de la démo est listé.
         harness.get_by_label("Cassés (1)");
@@ -1855,46 +1855,46 @@ id: "
 
         // Filtres : inclure, exclure, neutre.
         harness.get_by_label("Filtres").click();
-        harness.run();
+        harness.run_steps(8);
         harness.get_by_label("Pièce").click();
-        harness.run();
+        harness.run_steps(8);
         assert_eq!(listed(&harness), ["Salle des Archives"]);
         snapshot(&mut harness, "8_filtres");
         harness.get_by_label("Pièce").click();
-        harness.run();
+        harness.run_steps(8);
         assert_eq!(listed(&harness), ["Coffre du bureau", "Majordome"]);
         harness.get_by_label("− Pièce").click();
-        harness.run();
+        harness.run_steps(8);
         assert_eq!(listed(&harness).len(), 3);
 
         // Statut, type de lien, liens cassés.
         harness.get_by_label("Confirmé").click();
-        harness.run();
+        harness.run_steps(8);
         assert_eq!(listed(&harness), ["Coffre du bureau"]);
         harness.get_by_label("Réinitialiser les filtres").click();
-        harness.run();
+        harness.run_steps(8);
         harness.get_by_label("indique").click();
-        harness.run();
+        harness.run_steps(8);
         assert_eq!(listed(&harness), ["Coffre du bureau", "Salle des Archives"]);
         harness.get_by_label("Réinitialiser les filtres").click();
         harness.get_by_label("Avec liens cassés").click();
-        harness.run();
+        harness.run_steps(8);
         assert_eq!(listed(&harness), ["Salle des Archives"]);
         harness.get_by_label("Avec liens cassés").click();
-        harness.run();
+        harness.run_steps(8);
 
         // Nouvelle fiche à partir d'un modèle.
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
-        harness.run();
+        harness.run_steps(8);
         harness
             .get_by(|n| n.role() == Role::TextInput && n.placeholder() == Some("Titre"))
             .type_text("Serre");
         harness.get_by_label("Modèle").click();
-        harness.run();
+        harness.run_steps(8);
         harness.get_by_label("Nouvelle pièce").click();
-        harness.run();
+        harness.run_steps(8);
         harness.get_by_label("Créer").click();
-        harness.run();
+        harness.run_steps(8);
         {
             let ws = harness.state().ws.as_ref().unwrap();
             let id = ws.project.resolve_title("Serre").unwrap();
@@ -1909,9 +1909,9 @@ id: "
             let ws = state.ws.as_mut().unwrap();
             ws.pack_editor = Some(PackEditor::edit_current(&ws.project, None));
         }
-        harness.run();
+        harness.run_steps(8);
         harness.get_by_label("+ Ajouter une catégorie").click();
-        harness.run();
+        harness.run_steps(8);
         let field = |placeholder: &'static str| {
             move |n: &egui_kittest::kittest::AccessKitNode<'_>| {
                 n.role() == Role::TextInput
@@ -1920,16 +1920,16 @@ id: "
             }
         };
         harness.get_by(field("id")).focus();
-        harness.run();
+        harness.run_steps(8);
         harness.get_by(field("id")).type_text("lieu");
-        harness.run();
+        harness.run_steps(8);
         harness.get_by(field("libellé")).focus();
-        harness.run();
+        harness.run_steps(8);
         harness.get_by(field("libellé")).type_text("Lieu");
-        harness.run();
+        harness.run_steps(8);
         snapshot(&mut harness, "9_editeur_pack");
         harness.get_by_label("Enregistrer").click();
-        harness.run();
+        harness.run_steps(8);
         let ws = harness.state().ws.as_ref().unwrap();
         assert!(ws.pack_editor.is_none());
         assert_eq!(
