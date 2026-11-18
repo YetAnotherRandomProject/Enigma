@@ -116,6 +116,8 @@ pub struct InlineStyle {
     pub comment: bool,
     /// Appel de note `[^1]` (en exposant).
     pub sup: bool,
+    /// Formule `$…$` (le texte est le LaTeX).
+    pub math: bool,
 }
 
 /// Lien porté par un morceau de texte.
@@ -159,6 +161,8 @@ pub enum Block {
     },
     Quote(Vec<Inline>),
     Code(String),
+    /// Formule centrée `$$…$$` (LaTeX).
+    Math(String),
     Rule,
     Image(ImageRef),
     /// Paragraphe réduit à un lien vers un fichier local (son, vidéo,
@@ -299,7 +303,7 @@ impl Builder<'_> {
         };
         for span in spans {
             let mut style = span.style;
-            if span.link.is_some() || span.style.code {
+            if span.link.is_some() || span.style.code || span.style.math {
                 style.highlight |= highlight;
                 style.comment |= comment;
                 out.push(Inline { style, ..span });
@@ -586,6 +590,21 @@ fn blocks_of(text: &str, keep: usize) -> Vec<Block> {
                 b.push_plain(&t);
                 b.style = saved;
             }
+            Event::InlineMath(t) => {
+                let mut style = b.style;
+                style.math = true;
+                b.spans.push(Inline {
+                    text: t.to_string(),
+                    style,
+                    link: None,
+                });
+            }
+            Event::DisplayMath(t) => {
+                let keep = b.container;
+                b.flush();
+                b.container = keep;
+                b.blocks.push(Block::Math(t.trim().to_owned()));
+            }
             Event::FootnoteReference(label) => {
                 let saved = b.style;
                 b.style.sup = true;
@@ -604,7 +623,6 @@ fn blocks_of(text: &str, keep: usize) -> Vec<Block> {
             }
             Event::TaskListMarker(done) => b.item_task = Some(done),
             Event::Html(t) | Event::InlineHtml(t) => b.push_plain(&t),
-            _ => {}
         }
     }
     b.flush();
@@ -761,6 +779,16 @@ mod tests {
         assert!(
             matches!(&b[1], Block::ListItem { marker, spans, .. } if marker == "[1]" && texts(spans) == "La note.")
         );
+    }
+
+    #[test]
+    fn inline_and_display_math() {
+        let b = blocks("Aire $\\pi r^2$ ici.\n\n$$\\frac{a}{b}$$");
+        let Block::Paragraph(p) = &b[0] else {
+            panic!("{:?}", b[0])
+        };
+        assert!(p.iter().any(|s| s.style.math && s.text == "\\pi r^2"));
+        assert!(b.contains(&Block::Math("\\frac{a}{b}".into())));
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub enum UnitKind {
     Callout,
     /// Commentaire sur plusieurs lignes `%%` … `%%`.
     Comment,
+    /// Formule centrée sur plusieurs lignes `$$` … `$$`.
+    Math,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +99,11 @@ fn comment_open(line: &str) -> bool {
     line.trim_start().starts_with("%%") && line.matches("%%").count() % 2 == 1
 }
 
+/// Ligne qui ouvre une formule sur plusieurs lignes (`$$` non refermé).
+fn math_open(line: &str) -> bool {
+    line.trim_start().starts_with("$$") && line.matches("$$").count() % 2 == 1
+}
+
 /// Découpe le texte en unités d'édition.
 pub fn units(text: &str) -> Vec<Unit> {
     let lines = line_ranges(text);
@@ -127,6 +134,19 @@ pub fn units(text: &str) -> Vec<Unit> {
                 kind: UnitKind::Callout,
             });
             i = j;
+            continue;
+        }
+        if math_open(line(i)) {
+            let mut j = i + 1;
+            while j < lines.len() && !line(j).contains("$$") {
+                j += 1;
+            }
+            let last = j.min(lines.len() - 1);
+            out.push(Unit {
+                range: lines[i].start..lines[last].end,
+                kind: UnitKind::Math,
+            });
+            i = last + 1;
             continue;
         }
         if comment_open(line(i)) {
@@ -310,6 +330,13 @@ mod tests {
             Some(("note".into(), None, String::new()))
         );
         assert!(callout_header("> texte").is_none());
+        assert_eq!(
+            kinds("$$\n\\frac{a}{b}\n$$\n$$x$$"),
+            [
+                (UnitKind::Math, "$$\n\\frac{a}{b}\n$$"),
+                (UnitKind::Line, "$$x$$")
+            ]
+        );
     }
 
     #[test]

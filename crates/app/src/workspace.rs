@@ -466,6 +466,7 @@ impl Workspace {
             | Command::VersionHistory
             | Command::MergeNote
             | Command::ExtractSelection
+            | Command::ExportPdf
             | Command::CloseTab
             | Command::SplitView
             | Command::FindInNote => self.editor.is_some(),
@@ -514,6 +515,28 @@ impl Workspace {
                 }
             }
             Command::ExtractSelection => self.open_extract_dialog(notices),
+            Command::ExportPdf => {
+                let Some(ed) = &self.editor else {
+                    return;
+                };
+                let title = self
+                    .project
+                    .note(&ed.id)
+                    .map(|n| n.meta.title.clone())
+                    .unwrap_or_default();
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Exporter la fiche en PDF")
+                    .add_filter("PDF", &["pdf"])
+                    .set_file_name(format!(
+                        "{}.pdf",
+                        enigma_core::storage::file_stem_for_title(&title)
+                    ))
+                    .save_file()
+                {
+                    let id = ed.id.clone();
+                    self.export_pdf(&id, &path, notices);
+                }
+            }
             Command::InsertTemplate => {
                 if self.editor.is_some() {
                     self.view = View::Note;
@@ -1156,6 +1179,31 @@ impl Workspace {
             e.set_salt(salt);
             e
         })
+    }
+
+    /// Écrit une fiche en PDF (images de la fiche, formules et diagrammes
+    /// compris).
+    pub fn export_pdf(&mut self, id: &NoteId, path: &Path, notices: &mut Notices) {
+        let Some(note) = self.project.note(id) else {
+            return;
+        };
+        let root = self.project.root().to_owned();
+        let note_path = self
+            .project
+            .entry(id)
+            .map(|e| e.path.clone())
+            .unwrap_or_default();
+        let load = |src: &str| {
+            enigma_core::import::resolve_image(&root, &note_path, src)
+                .and_then(|p| std::fs::read(p).ok())
+        };
+        match enigma_typeset::note_pdf(&note.meta.title, &note.body, &load) {
+            Ok(bytes) => match enigma_core::storage::write_atomic(path, &bytes) {
+                Ok(()) => notices.info(format!("PDF enregistré : {}", path.display())),
+                Err(e) => notices.error(format!("PDF non enregistré : {e}")),
+            },
+            Err(e) => notices.error(format!("Export PDF impossible : {e}")),
+        }
     }
 
     /// Demande le titre de la fiche à extraire de la sélection.
@@ -3658,6 +3706,34 @@ mod ui_tests {
         assert!(ws.project.resolve_title("Essai").is_none());
         assert_eq!(open_title(&harness), "Majordome");
         assert!(body_text(&harness).contains("## Essai\n\nIntro\n[[ligne à extraire]]"));
+    }
+
+    #[test]
+    fn math_mermaid_and_pdf_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        egui_extras::install_image_loaders(&harness.ctx);
+        new_note(
+            &mut harness,
+            "Calculs",
+            "L'aire vaut $\\pi r^2$ pour le bassin.\n\n$$\n\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}\n$$\n\n```mermaid\nflowchart LR\n  A[Clé] --> B[Coffre]\n```",
+        );
+        for _ in 0..10 {
+            harness.run_steps(2);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        snapshot(&mut harness, "51_maths_mermaid");
+        assert!(harness.query_by_label_contains("illisible").is_none());
+        // Aucune formule en échec (le LaTeX brut serait affiché en rouge).
+        assert!(harness.query_by_label_contains("$\\pi").is_none());
+        let out = dir.path().join("Calculs.pdf");
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            let id = ws.project.resolve_title("Calculs").unwrap().clone();
+            ws.export_pdf(&id, &out, &mut state.notices);
+        }
+        assert!(std::fs::read(&out).unwrap().starts_with(b"%PDF"));
     }
 
     #[test]

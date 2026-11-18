@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 enigma-core = { path = "crates/core" }
 enigma-graph = { path = "crates/graph" }
+enigma-typeset = { path = "crates/typeset" }
 
 anyhow = "1.0.104"
 # Presse-papiers (fichiers et images collés) ; déjà dans l'arbre via egui-winit, mêmes fonctions.

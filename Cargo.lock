@@ -1360,6 +1360,7 @@ dependencies = [
  "egui_kittest",
  "enigma-core",
  "enigma-graph",
+ "enigma-typeset",
  "image",
  "notify-debouncer-full",
  "png 0.18.1",

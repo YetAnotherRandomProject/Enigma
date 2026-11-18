@@ -67,6 +67,7 @@ pub(crate) fn options() -> Options {
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH
 }
 
 /// Analyse complète : styles et liens.

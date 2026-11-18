@@ -105,6 +105,10 @@ pub enum Content {
     },
     /// Commentaire `%%` … `%%` : affiché atténué.
     Comment { text: String },
+    /// Formule centrée `$$` … `$$` sur plusieurs lignes.
+    Math { latex: String, start: usize },
+    /// Bloc ```mermaid : diagramme.
+    Diagram { src: String, start: usize },
     /// Ligne réduite à `![[Fiche]]`, `![[Fiche#Section]]` ou
     /// `![[Fiche#^id]]` : contenu de l'autre fiche inséré.
     Embed {
@@ -143,6 +147,8 @@ pub struct Drags {
     depth: usize,
     /// Encadrés ouverts ou repliés par l'utilisateur (début → ouvert).
     callouts: std::collections::HashMap<usize, bool>,
+    /// Images SVG (formules, diagrammes) : clé → adresse et taille.
+    svgs: std::collections::HashMap<String, Result<(String, Vec2), String>>,
     /// Notes de bas de page de la fiche : nom → (texte, octet).
     pub footnotes: std::collections::HashMap<String, (String, usize)>,
     /// Sections repliées (texte du titre).
@@ -213,6 +219,27 @@ pub fn file_uri(path: &Path) -> String {
     } else {
         format!("file://{p}")
     }
+}
+
+/// Taille d'affichage d'un SVG (attributs `width`/`height`, en px ; `pt`
+/// converti).
+fn svg_size(svg: &str) -> Option<Vec2> {
+    let head = &svg[..svg.find('>')?];
+    let attr = |name: &str| -> Option<f32> {
+        let i = head.find(&format!(" {name}=\""))? + name.len() + 3;
+        let rest = &head[i..];
+        let num: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let v: f32 = num.parse().ok()?;
+        Some(if rest[num.len()..].starts_with("pt") {
+            v * 4.0 / 3.0
+        } else {
+            v
+        })
+    };
+    Some(Vec2::new(attr("width")?, attr("height")?))
 }
 
 fn hash_text(s: &str) -> u64 {
@@ -314,9 +341,31 @@ fn build(body: &str) -> Vec<CachedUnit> {
                         .last()
                         .filter(|l| lines.len() > 1 && text[(*l).clone()].trim().len() >= 3)
                         .map_or(text.len(), |l| l.start.saturating_sub(1).max(first));
-                    Content::Code {
-                        code: text[first..last.max(first)].to_owned(),
-                        start: base + first,
+                    let lang = text[lines[0].clone()]
+                        .trim_start()
+                        .trim_start_matches(['`', '~'])
+                        .trim()
+                        .to_lowercase();
+                    let code = text[first..last.max(first)].to_owned();
+                    if lang == "mermaid" {
+                        Content::Diagram {
+                            src: code,
+                            start: base + first,
+                        }
+                    } else {
+                        Content::Code {
+                            code,
+                            start: base + first,
+                        }
+                    }
+                }
+                UnitKind::Math => {
+                    let t = text.trim();
+                    let inner = t.strip_prefix("$$").unwrap_or(t);
+                    let inner = inner.strip_suffix("$$").unwrap_or(inner);
+                    Content::Math {
+                        latex: inner.trim().to_owned(),
+                        start: base + 2.min(text.len()),
                     }
                 }
                 UnitKind::Table => match table::parse(text) {
@@ -449,6 +498,8 @@ impl Drags {
                 self.line_ui(ui, cu, *indent, blocks, src, project, note_path, menu)
             }
             Content::Code { code, start } => self.code_ui(ui, code, *start),
+            Content::Math { latex, start } => self.math_block_ui(ui, latex, *start),
+            Content::Diagram { src, start } => self.diagram_ui(ui, src, *start),
             Content::Table { cols, rows } => {
                 self.table_ui(ui, &cu.unit.range, *cols, rows, project, note_path, menu)
             }
@@ -919,6 +970,7 @@ impl Drags {
                     out
                 }
                 Block::Code(code) => self.code_ui(ui, code, src.base),
+                Block::Math(latex) => self.math_block_ui(ui, latex, src.base + 2),
                 Block::Rule => {
                     let resp = ui
                         .allocate_exact_size(
@@ -945,6 +997,101 @@ impl Drags {
             }
         }
         action
+    }
+
+    /// Image SVG produite par Typst ou Mermaid, mise en cache (une fois par
+    /// source, couleur et taille).
+    fn svg_image(
+        &mut self,
+        ui: &mut egui::Ui,
+        key: String,
+        make: impl FnOnce() -> Result<String, enigma_typeset::TypesetError>,
+    ) -> Result<(String, Vec2), String> {
+        if let Some(r) = self.svgs.get(&key) {
+            return r.clone();
+        }
+        let made = make().map_err(|e| e.to_string()).and_then(|svg| {
+            let size = svg_size(&svg).ok_or_else(|| "taille inconnue".to_owned())?;
+            let uri = format!("bytes://enigma-{}.svg", hash_text(&key));
+            ui.ctx().include_bytes(uri.clone(), svg.into_bytes());
+            Ok((uri, size))
+        });
+        self.svgs.insert(key, made.clone());
+        made
+    }
+
+    /// Formule rendue par Typst ; une erreur montre le LaTeX en rouge.
+    fn math_image(&mut self, ui: &mut egui::Ui, latex: &str, display: bool) -> egui::Response {
+        let v = ui.visuals();
+        let c = v.text_color();
+        let color = format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
+        let size = BODY_SIZE * if display { 0.9 } else { 0.85 };
+        let key = format!("math|{display}|{color}|{size}|{latex}");
+        let owned = latex.to_owned();
+        match self.svg_image(ui, key, move || {
+            enigma_typeset::math_svg(&owned, display, &color, size)
+        }) {
+            Ok((uri, size)) => ui.add(
+                egui::Image::new(uri)
+                    .fit_to_exact_size(size)
+                    .sense(Sense::click()),
+            ),
+            Err(e) => ui
+                .add(
+                    egui::Label::new(
+                        RichText::new(format!("${latex}$"))
+                            .monospace()
+                            .color(ui.visuals().error_fg_color),
+                    )
+                    .sense(Sense::click()),
+                )
+                .on_hover_text(e),
+        }
+    }
+
+    /// Formule centrée ; un clic la modifie.
+    fn math_block_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        latex: &str,
+        start: usize,
+    ) -> Option<ViewAction> {
+        let resp = ui
+            .vertical_centered(|ui| self.math_image(ui, latex, true))
+            .inner
+            .on_hover_cursor(CursorIcon::Text);
+        resp.clicked().then_some(ViewAction::EditAt(start))
+    }
+
+    /// Diagramme Mermaid ; un clic montre sa source.
+    fn diagram_ui(&mut self, ui: &mut egui::Ui, src: &str, start: usize) -> Option<ViewAction> {
+        let dark = ui.visuals().dark_mode;
+        let key = format!("mermaid|{dark}|{src}");
+        let owned = src.to_owned();
+        let made = self.svg_image(ui, key, move || enigma_typeset::mermaid_svg(&owned, dark));
+        let max_w = ui.available_width();
+        let resp = match made {
+            Ok((uri, size)) => {
+                let scale = (max_w / size.x).min(1.0);
+                ui.vertical_centered(|ui| {
+                    ui.add(
+                        egui::Image::new(uri)
+                            .fit_to_exact_size(size * scale)
+                            .sense(Sense::click()),
+                    )
+                })
+                .inner
+            }
+            Err(e) => {
+                let r = ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("Diagramme Mermaid illisible : {e}"),
+                );
+                r.interact(Sense::click())
+            }
+        };
+        let resp = resp.on_hover_text("Clic : modifier le diagramme");
+        resp.clicked().then_some(ViewAction::EditAt(start))
     }
 
     fn code_ui(&mut self, ui: &mut egui::Ui, code: &str, start: usize) -> Option<ViewAction> {
@@ -1209,6 +1356,10 @@ impl Drags {
                         ui.label(RichText::new(code).monospace());
                         None
                     }
+                    Block::Math(latex) => {
+                        self.math_image(ui, latex, true);
+                        None
+                    }
                     Block::Rule => None,
                 };
                 if a.is_some() {
@@ -1353,6 +1504,39 @@ impl Drags {
         src: &Src<'_>,
         menu: &mut Menu<'_>,
     ) -> Option<ViewAction> {
+        // Formules dans le texte : morceaux de texte et images à la suite.
+        if spans.iter().any(|s| s.style.math) {
+            let mut action = None;
+            let mut offset = src.offset;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let mut i = 0;
+                while i < spans.len() {
+                    if spans[i].style.math {
+                        let r = self.math_image(ui, &spans[i].text, false);
+                        if r.clicked() {
+                            action = Some(ViewAction::EditAt(Src { offset, ..*src }.byte(0)));
+                        }
+                        offset += spans[i].text.chars().count();
+                        i += 1;
+                        continue;
+                    }
+                    let end = spans[i..]
+                        .iter()
+                        .position(|s| s.style.math)
+                        .map_or(spans.len(), |p| i + p);
+                    let part = Src { offset, ..*src };
+                    if let Some(a) =
+                        self.rich_text(ui, &spans[i..end], size, color, project, &part, menu)
+                    {
+                        action = Some(a);
+                    }
+                    offset += spans_chars(&spans[i..end]);
+                    i = end;
+                }
+            });
+            return action;
+        }
         let visuals = ui.visuals().clone();
         let base = color.unwrap_or(visuals.text_color());
         let mut job = LayoutJob::default();
