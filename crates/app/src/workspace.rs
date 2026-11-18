@@ -786,7 +786,13 @@ impl Workspace {
                         .auto_shrink(false)
                         .show(ui, |ui| {
                             let edited = match &mut self.editor {
-                                Some(ed) => ed.fields_ui(ui, &mut self.project, now_ms),
+                                Some(ed) => ed.fields_ui(
+                                    ui,
+                                    &mut self.project,
+                                    now_ms,
+                                    notices,
+                                    self.user_packs_dir.as_deref(),
+                                ),
                                 None => {
                                     ui.weak(match self.view {
                                         View::Board => {
@@ -1285,7 +1291,13 @@ impl Workspace {
             return;
         };
 
-        let edited = editor.header_ui(ui, &mut self.project, now_ms, notices);
+        let edited = editor.header_ui(
+            ui,
+            &mut self.project,
+            now_ms,
+            notices,
+            self.user_packs_dir.as_deref(),
+        );
         let mut insert_image = false;
 
         if self
@@ -1373,6 +1385,21 @@ impl Workspace {
                     self.mark_edited();
                 }
                 Err(e) => notices.error(format!("Épinglage impossible : {e}")),
+            }
+        }
+        if let Some(item) = outcome.new_link_type {
+            let mut id = String::new();
+            match self
+                .project
+                .update_pack(self.user_packs_dir.as_deref(), |p| {
+                    id = p.add_link_type(&item.label, item.color, item.directed);
+                }) {
+                Ok(()) => {
+                    self.graph.set_dialog_kind(Some(id));
+                    self.disk_changed = true;
+                    notices.info(format!("Type de lien « {} » ajouté au pack.", item.label));
+                }
+                Err(e) => notices.error(format!("Type de lien non créé : {e}")),
             }
         }
         for op in outcome.link_ops {
@@ -1852,7 +1879,12 @@ mod ui_tests {
 
     fn setup(dir: &Path) -> Harness<'static, State> {
         copy_demo(dir);
-        let packs = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs")];
+        // Premier dossier = packs de « l'utilisateur » : dossier jetable,
+        // pour que les tests ne modifient jamais les packs du dépôt.
+        let packs = vec![
+            dir.join(".packs-utilisateur"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs"),
+        ];
         let mut harness = Harness::builder()
             .with_size([1200.0, 760.0])
             // 60 images/s : délais réalistes (double-clic < 0,3 s).
@@ -2779,6 +2811,55 @@ id: "
             .click();
         harness.run_steps(4);
         assert!(harness.state().ws.as_ref().unwrap().editor_body().is_some());
+    }
+
+    #[test]
+    fn quick_add_category_status_and_field_from_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        harness.get_by_label("Majordome").click();
+        harness.run_steps(8);
+        // « + » des catégories (le premier de l'en-tête).
+        harness.get_by_label("+ Catégorie").click();
+        harness.run_steps(6);
+        harness
+            .get_by(|n| n.role() == Role::TextInput && n.placeholder() == Some("Libellé"))
+            .type_text("Suspect");
+        harness.run_steps(2);
+        snapshot(&mut harness, "25_nouvelle_categorie");
+        harness.get_by_label("Créer").click();
+        harness.run_steps(6);
+        {
+            let ws = harness.state().ws.as_ref().unwrap();
+            assert!(ws.project.pack().category("suspect").is_some());
+            let id = ws.project.resolve_title("Majordome").unwrap();
+            assert!(ws.project.note(id).unwrap().meta.has_category("suspect"));
+        }
+        // Copie locale du pack fourni, l'original reste intact.
+        let local = dir.path().join(".enigma/packs/blue_prince/pack.json");
+        assert!(std::fs::read_to_string(&local).unwrap().contains("Suspect"));
+        let original =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/blue_prince/pack.json");
+        assert!(
+            !std::fs::read_to_string(original)
+                .unwrap()
+                .contains("Suspect")
+        );
+
+        // Nouveau statut (deuxième « + »).
+        harness.get_by_label("+ Statut").click();
+        harness.run_steps(6);
+        harness
+            .get_by(|n| n.role() == Role::TextInput && n.placeholder() == Some("Libellé"))
+            .type_text("Fausse piste");
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(6);
+        let ws = harness.state().ws.as_ref().unwrap();
+        let id = ws.project.resolve_title("Majordome").unwrap();
+        assert_eq!(
+            ws.project.note(id).unwrap().meta.status.as_deref(),
+            Some("fausse_piste")
+        );
     }
 
     #[test]

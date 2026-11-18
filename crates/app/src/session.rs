@@ -273,7 +273,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let work = d.path().join("work");
         let demo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../exemples/blue_prince_demo");
-        let packs = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs")];
+        let packs = vec![
+            d.path().join("packs-utilisateur"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs"),
+        ];
         let file = d.path().join("Démo.enigma");
         let svg = d.path().join("plan.svg");
         std::fs::write(

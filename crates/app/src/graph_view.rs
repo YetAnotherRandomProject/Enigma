@@ -72,6 +72,8 @@ pub struct GraphOutcome {
     pub pins: Vec<(NoteId, Option<Pos>)>,
     /// Créations / modifications / suppressions de liens.
     pub link_ops: Vec<LinkOp>,
+    /// Type de lien à créer dans le pack (formulaire « + » du dialogue).
+    pub new_link_type: Option<crate::quick_add::NewItem>,
 }
 
 /// Modification d'un lien demandée depuis le graphe.
@@ -193,6 +195,7 @@ pub struct GraphView {
     link_dialog: Option<LinkDialog>,
     /// Dernier type choisi pour un nouveau lien.
     last_kind: Option<Option<String>>,
+    quick_link: crate::quick_add::QuickAdd,
     /// Projection de chaque nœud (dernière image) ; `None` : hors champ.
     proj: Vec<Option<Projected>>,
     /// Ordre de dessin (du plus loin au plus proche en 3D).
@@ -227,6 +230,7 @@ impl Default for GraphView {
             pending_wire: None,
             link_dialog: None,
             last_kind: None,
+            quick_link: crate::quick_add::QuickAdd::default(),
         }
     }
 }
@@ -1178,6 +1182,13 @@ impl GraphView {
         });
     }
 
+    /// Choisit le type du lien dans le dialogue ouvert (type tout juste créé).
+    pub fn set_dialog_kind(&mut self, kind: Option<String>) {
+        if let Some(d) = &mut self.link_dialog {
+            d.kind = kind;
+        }
+    }
+
     /// Le dialogue de lien est-il ouvert ?
     pub fn link_dialog_open(&self) -> bool {
         self.link_dialog.is_some()
@@ -1192,6 +1203,7 @@ impl GraphView {
         let Some(d) = &mut self.link_dialog else {
             return;
         };
+        let quick = &mut self.quick_link;
         let title = |id: &NoteId| {
             project
                 .note(id)
@@ -1221,18 +1233,28 @@ impl GraphView {
                 None => "Sans type".to_owned(),
                 Some(k) => pack.link_type(k).map_or(k.clone(), |t| t.label.clone()),
             };
-            egui::ComboBox::new("graph_link_type", "Type")
-                .selected_text(label_of(&d.kind))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut d.kind, None, "Sans type");
-                    for lt in &pack.link_types {
-                        ui.selectable_value(
-                            &mut d.kind,
-                            Some(lt.id.clone()),
-                            RichText::new(&lt.label).color(c32(lt.color)),
-                        );
-                    }
-                });
+            ui.horizontal(|ui| {
+                egui::ComboBox::new("graph_link_type", "Type")
+                    .selected_text(label_of(&d.kind))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut d.kind, None, "Sans type");
+                        for lt in &pack.link_types {
+                            ui.selectable_value(
+                                &mut d.kind,
+                                Some(lt.id.clone()),
+                                RichText::new(&lt.label).color(c32(lt.color)),
+                            );
+                        }
+                    });
+                if let Some(item) = quick.menu(
+                    ui,
+                    "+ Type",
+                    "Créer un type de lien (ajouté au pack du projet)",
+                    crate::quick_add::Kind::LinkType,
+                ) {
+                    outcome.new_link_type = Some(item);
+                }
+            });
             let note = ui.add_sized(
                 [360.0, 22.0],
                 egui::TextEdit::singleline(&mut d.note).hint_text("Note (facultative)"),

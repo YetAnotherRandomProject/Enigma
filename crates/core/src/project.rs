@@ -820,6 +820,54 @@ impl Project {
         Ok(())
     }
 
+    /// Dossier où enregistrer le pack actuel sans toucher aux packs fournis
+    /// avec l'application : sur place s'il vient du projet ou du dossier
+    /// de l'utilisateur, sinon une copie dans `.enigma/packs/<id>`
+    /// (prioritaire sur l'original).
+    pub fn editable_pack_dir(&self, user_dir: Option<&Path>) -> PathBuf {
+        let local = self.local_packs_dir();
+        self.pack_dir()
+            .filter(|d| d.starts_with(&local) || user_dir.is_some_and(|u| d.starts_with(u)))
+            .map_or_else(|| local.join(&self.pack.id), Path::to_path_buf)
+    }
+
+    /// Modifie le pack du projet et l'enregistre (voir
+    /// [`Project::editable_pack_dir`]). Sans pack, un « Pack du projet »
+    /// est créé dans le projet et choisi.
+    pub fn update_pack(
+        &mut self,
+        user_dir: Option<&Path>,
+        change: impl FnOnce(&mut Pack),
+    ) -> Result<(), ProjectError> {
+        let mut pack = self.pack.clone();
+        let new_pack = pack.id.is_empty();
+        if new_pack {
+            pack = Pack::empty();
+            pack.id = "projet".to_owned();
+            pack.name = "Pack du projet".to_owned();
+        }
+        change(&mut pack);
+        let dir = if new_pack {
+            self.local_packs_dir().join(&pack.id)
+        } else {
+            self.editable_pack_dir(user_dir)
+        };
+        let problems = pack.problems();
+        if !problems.is_empty() {
+            return Err(ProjectError::Pack(problems.join(" ; ")));
+        }
+        self.save_pack(&pack, &dir)?;
+        if new_pack {
+            std::fs::create_dir_all(self.root.join(META_DIR))
+                .map_err(io_err("créer", &self.root.join(META_DIR)))?;
+            self.set_pack(Some(pack.id.clone()))?;
+        } else {
+            self.reload_pack();
+        }
+        self.generation += 1;
+        Ok(())
+    }
+
     /// Compteur incrémenté à chaque modification de contenu (corps,
     /// métadonnées, liens) : sert à invalider les caches qui en dépendent.
     pub fn content_version(&self) -> u64 {
@@ -1150,6 +1198,61 @@ mod tests {
         assert!(p.outgoing_links(&a).is_empty());
         assert!(p.backlinks(&c).is_empty());
         assert!(p.dirty_ids().contains(&a));
+    }
+
+    #[test]
+    fn quick_pack_edits_copy_bundled_pack_and_create_one_if_missing() {
+        let d = tempfile::tempdir().unwrap();
+        let packs = tempfile::tempdir().unwrap();
+        let src = packs_dir().join("blue_prince");
+        std::fs::create_dir_all(packs.path().join("blue_prince")).unwrap();
+        std::fs::copy(
+            src.join("pack.json"),
+            packs.path().join("blue_prince/pack.json"),
+        )
+        .unwrap();
+        write(
+            d.path(),
+            ".enigma/project.json",
+            r#"{"version": 1, "pack": "blue_prince"}"#,
+        );
+        let mut p = Project::open(d.path(), &[packs.path().to_path_buf()]).unwrap();
+        let before = std::fs::read(packs.path().join("blue_prince/pack.json")).unwrap();
+        let red = crate::Color::parse("#ff0000").unwrap();
+        let mut new_id = String::new();
+        p.update_pack(None, |pack| new_id = pack.add_category("Lieu secret", red))
+            .unwrap();
+        assert_eq!(new_id, "lieu_secret");
+        assert!(p.pack().category("lieu_secret").is_some());
+        assert_eq!(
+            std::fs::read(packs.path().join("blue_prince/pack.json")).unwrap(),
+            before,
+            "pack d'origine intact"
+        );
+        assert!(
+            d.path()
+                .join(".enigma/packs/blue_prince/pack.json")
+                .is_file()
+        );
+        // Deuxième ajout : modifié sur place (copie locale).
+        p.update_pack(None, |pack| {
+            pack.add_status("Fausse piste", red);
+            pack.add_category("Lieu secret", red);
+        })
+        .unwrap();
+        assert!(p.pack().status("fausse_piste").is_some());
+        assert!(p.pack().category("lieu_secret_2").is_some());
+
+        // Projet sans pack : un pack de projet est créé.
+        let d2 = tempfile::tempdir().unwrap();
+        let mut p2 = open(d2.path());
+        p2.update_pack(None, |pack| {
+            pack.add_link_type("Mène à", red, true);
+        })
+        .unwrap();
+        assert_eq!(p2.pack().id, "projet");
+        assert!(p2.pack().link_type("mene_a").is_some());
+        assert_eq!(p2.config().pack.as_deref(), Some("projet"));
     }
 
     #[test]

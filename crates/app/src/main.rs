@@ -21,6 +21,7 @@ mod pack_editor;
 mod palette;
 mod paths;
 mod project_file;
+mod quick_add;
 mod reading;
 mod session;
 mod shortcuts_ui;

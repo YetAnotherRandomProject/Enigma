@@ -176,7 +176,84 @@ pub enum PackError {
     },
 }
 
+/// Identifiant dérivé d'un libellé : minuscules sans accents, `_` à la
+/// place des autres caractères (« Code / Énigme » → `code_enigme`).
+pub fn slug(label: &str) -> String {
+    let mut out = String::new();
+    for c in label.chars().map(crate::fuzzy::fold) {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('_') && !out.is_empty() {
+            out.push('_');
+        }
+    }
+    let out = out.trim_end_matches('_').to_owned();
+    if out.is_empty() {
+        "element".to_owned()
+    } else {
+        out
+    }
+}
+
+/// Premier identifiant libre (`slug`, `slug_2`…).
+fn unique_id(label: &str, taken: impl Fn(&str) -> bool) -> String {
+    let base = slug(label);
+    if !taken(&base) {
+        return base;
+    }
+    (2..)
+        .map(|k| format!("{base}_{k}"))
+        .find(|id| !taken(id))
+        .unwrap_or(base)
+}
+
 impl Pack {
+    /// Ajoute une catégorie ; rend son identifiant.
+    pub fn add_category(&mut self, label: &str, color: Color) -> String {
+        let id = unique_id(label, |id| self.categories.iter().any(|c| c.id == id));
+        self.categories.push(Category {
+            id: id.clone(),
+            label: label.trim().to_owned(),
+            color,
+            icon: None,
+        });
+        id
+    }
+
+    /// Ajoute un statut ; rend son identifiant.
+    pub fn add_status(&mut self, label: &str, color: Color) -> String {
+        let id = unique_id(label, |id| self.statuses.iter().any(|c| c.id == id));
+        self.statuses.push(Status {
+            id: id.clone(),
+            label: label.trim().to_owned(),
+            color,
+        });
+        id
+    }
+
+    /// Ajoute un type de lien ; rend son identifiant.
+    pub fn add_link_type(&mut self, label: &str, color: Color, directed: bool) -> String {
+        let id = unique_id(label, |id| self.link_types.iter().any(|c| c.id == id));
+        self.link_types.push(LinkType {
+            id: id.clone(),
+            label: label.trim().to_owned(),
+            color,
+            directed,
+        });
+        id
+    }
+
+    /// Ajoute un champ ; rend son identifiant.
+    pub fn add_field(&mut self, label: &str, kind: FieldKind) -> String {
+        let id = unique_id(label, |id| self.fields.iter().any(|c| c.id == id));
+        self.fields.push(FieldDef {
+            id: id.clone(),
+            label: label.trim().to_owned(),
+            kind,
+        });
+        id
+    }
+
     /// Pack vide, utilisé quand le projet n'en référence aucun.
     pub fn empty() -> Pack {
         Pack {
@@ -391,6 +468,25 @@ pub fn discover_packs(roots: &[PathBuf]) -> Vec<DiscoveredPack> {
         }
     }
     found
+}
+
+#[cfg(test)]
+mod quick_tests {
+    use super::*;
+
+    #[test]
+    fn slugs_and_unique_ids() {
+        assert_eq!(slug("Code / Énigme"), "code_enigme");
+        assert_eq!(slug("  !!! "), "element");
+        assert_eq!(slug("Jour de découverte"), "jour_de_decouverte");
+        let mut p = Pack::empty();
+        p.id = "essai".into();
+        let c = Color::parse("#112233").unwrap();
+        assert_eq!(p.add_category("Pièce", c), "piece");
+        assert_eq!(p.add_category("Piece", c), "piece_2");
+        assert_eq!(p.add_field("Étage", FieldKind::Number), "etage");
+        assert!(p.problems().is_empty(), "{:?}", p.problems());
+    }
 }
 
 #[cfg(test)]

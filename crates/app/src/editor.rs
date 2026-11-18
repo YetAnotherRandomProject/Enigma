@@ -15,6 +15,7 @@ use crate::colors::{c32, text_on};
 use crate::completion::{self, ItemKind, Nav, Popup};
 use crate::highlight::Highlighter;
 use crate::notices::Notices;
+use crate::quick_add::{self, NewItem, QuickAdd};
 use crate::reading::{ReadingAction, ReadingState};
 
 /// État complet annulable d'une fiche (le titre est exclu : il ne change
@@ -53,6 +54,10 @@ pub struct Editor {
     pending_anchor: Option<usize>,
     /// État du mode Lecture (blocs en cache, redimensionnement en cours).
     reading: ReadingState,
+    /// Formulaires « + » pour enrichir le pack depuis la fiche.
+    quick_category: QuickAdd,
+    quick_status: QuickAdd,
+    quick_field: QuickAdd,
 }
 
 /// Résultat de l'affichage du corps.
@@ -220,6 +225,9 @@ impl Editor {
             last_sel: None,
             pending_anchor: None,
             reading: ReadingState::default(),
+            quick_category: QuickAdd::default(),
+            quick_status: QuickAdd::default(),
+            quick_field: QuickAdd::default(),
         };
         editor.refresh_field_bufs();
         Some(editor)
@@ -326,6 +334,7 @@ impl Editor {
         project: &mut Project,
         now_ms: u64,
         notices: &mut Notices,
+        user_packs: Option<&std::path::Path>,
     ) -> bool {
         let mut edited = false;
 
@@ -372,6 +381,8 @@ impl Editor {
         // Catégories et statut.
         let mut toggle: Option<String> = None;
         let mut new_status: Option<Option<String>> = None;
+        let mut add_category: Option<NewItem> = None;
+        let mut add_status: Option<NewItem> = None;
         ui.horizontal_wrapped(|ui| {
             let pack = project.pack();
             for cat in &pack.categories {
@@ -412,9 +423,12 @@ impl Editor {
                     }
                 }
             }
-            if pack.categories.is_empty() && self.snap.meta.categories.is_empty() {
-                ui.weak("Aucun pack : choisissez-en un en haut pour avoir des catégories.");
-            }
+            add_category = self.quick_category.menu(
+                ui,
+                "+ Catégorie",
+                "Créer une catégorie (ajoutée au pack du projet) et l'attribuer à la fiche",
+                quick_add::Kind::Category,
+            );
 
             ui.separator();
             let status = self.snap.meta.status.clone();
@@ -442,7 +456,36 @@ impl Editor {
                         }
                     }
                 });
+            add_status = self.quick_status.menu(
+                ui,
+                "+ Statut",
+                "Créer un statut (ajouté au pack du projet) et l'attribuer à la fiche",
+                quick_add::Kind::Status,
+            );
         });
+
+        if let Some(item) = add_category {
+            let mut id = String::new();
+            match project.update_pack(user_packs, |p| id = p.add_category(&item.label, item.color))
+            {
+                Ok(()) => {
+                    let mut meta = self.snap.meta.clone();
+                    if !meta.has_category(&id) {
+                        meta.toggle_category(&id);
+                    }
+                    edited |= self.commit_meta(project, meta, now_ms);
+                    notices.info(format!("Catégorie « {} » ajoutée au pack.", item.label));
+                }
+                Err(e) => notices.error(format!("Catégorie non créée : {e}")),
+            }
+        }
+        if let Some(item) = add_status {
+            let mut id = String::new();
+            match project.update_pack(user_packs, |p| id = p.add_status(&item.label, item.color)) {
+                Ok(()) => new_status = Some(Some(id)),
+                Err(e) => notices.error(format!("Statut non créé : {e}")),
+            }
+        }
 
         if let Some(cat) = toggle {
             let mut meta = self.snap.meta.clone();
@@ -893,13 +936,37 @@ impl Editor {
     }
 
     /// Panneau latéral : champs personnalisés du pack et informations.
-    pub fn fields_ui(&mut self, ui: &mut egui::Ui, project: &mut Project, now_ms: u64) -> bool {
-        let defs = project.pack().fields.clone();
+    pub fn fields_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        project: &mut Project,
+        now_ms: u64,
+        notices: &mut Notices,
+        user_packs: Option<&std::path::Path>,
+    ) -> bool {
         let mut new_meta: Option<NoteMeta> = None;
 
-        ui.heading("Champs");
+        let mut add_field = None;
+        ui.horizontal(|ui| {
+            ui.heading("Champs");
+            add_field = self.quick_field.menu(
+                ui,
+                "+ Champ",
+                "Créer un champ (ajouté au pack du projet, pour toutes les fiches)",
+                quick_add::Kind::Field,
+            );
+        });
+        if let Some(item) = add_field {
+            match project.update_pack(user_packs, |p| {
+                p.add_field(&item.label, item.field_kind);
+            }) {
+                Ok(()) => notices.info(format!("Champ « {} » ajouté au pack.", item.label)),
+                Err(e) => notices.error(format!("Champ non créé : {e}")),
+            }
+        }
+        let defs = project.pack().fields.clone();
         if defs.is_empty() {
-            ui.weak("Le pack ne définit aucun champ.");
+            ui.weak("Aucun champ : « + » pour en créer un.");
         }
         egui::Grid::new("fields")
             .num_columns(2)
