@@ -1,0 +1,29 @@
+[package]
+name = "enigma-typeset"
+description = "Composition Typst (formules, export PDF) et diagrammes Mermaid, rendus en SVG ou PDF (sans UI)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pulldown-cmark.workspace = true
+thiserror.workspace = true
+# Composition : formules mathématiques (SVG) et export PDF des fiches.
+typst = "0.15.1"
+typst-layout = "0.15.1"
+typst-pdf = "0.15.1"
+typst-svg = "0.15.1"
+typst-assets = { version = "0.15.1", features = ["fonts"] }
+# Diagrammes Mermaid en Rust pur (sans la ligne de commande ni le PNG).
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
+# Texte des SVG Mermaid converti en tracés (le chargeur SVG d'egui n'a pas
+# de polices) ; même version que celle apportée par typst-pdf.
+usvg = "0.47.0"
+
+[dev-dependencies]
+# Captures des tests (déjà dans l'arbre via typst-pdf).
+resvg = "0.47.0"
+
+[lints]
+workspace = true
