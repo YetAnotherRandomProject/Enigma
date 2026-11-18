@@ -26,6 +26,7 @@ pub mod links;
 pub mod live;
 pub mod markdown;
 pub mod md_edit;
+pub mod mentions;
 pub mod note;
 pub mod pack;
 pub mod project;

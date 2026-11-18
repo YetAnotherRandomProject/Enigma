@@ -138,6 +138,8 @@ pub struct Workspace {
     rows_key: Option<(u64, bool, Vec<String>)>,
     pub left_tab: LeftTab,
     search: crate::search_ui::SearchPanel,
+    /// Mentions non liées de la fiche ouverte (fiche, génération, contenu).
+    mentions: Option<((NoteId, u64, u64), Vec<enigma_core::mentions::Mention>)>,
 }
 
 impl Workspace {
@@ -210,6 +212,7 @@ impl Workspace {
             rows_key: None,
             left_tab: LeftTab::Notes,
             search: crate::search_ui::SearchPanel::default(),
+            mentions: None,
         };
         ws.refresh_packs();
         Ok(ws)
@@ -1570,6 +1573,92 @@ impl Workspace {
             });
         }
 
+        // Mentions non liées (recalculées seulement si le projet change).
+        let key = (
+            id.clone(),
+            self.project.generation(),
+            self.project.content_version(),
+        );
+        if self.mentions.as_ref().map(|(k, _)| k) != Some(&key) {
+            let found = self.project.unlinked_mentions(&id);
+            self.mentions = Some((key, found));
+        }
+        let mentions = self
+            .mentions
+            .as_ref()
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default();
+        let mut to_link: Vec<enigma_core::mentions::Mention> = Vec::new();
+        egui::CollapsingHeader::new(format!("Mentions non liées ({})", mentions.len()))
+            .id_salt(("mentions", id.as_str()))
+            .default_open(!mentions.is_empty() && mentions.len() <= 8)
+            .show(ui, |ui| {
+                if mentions.is_empty() {
+                    ui.weak("Aucune : le titre n'est cité nulle part sans lien.");
+                    return;
+                }
+                if mentions.len() > 1 && ui.button("Tout lier").clicked() {
+                    to_link = mentions.clone();
+                }
+                let accent = crate::theme::accent(ui.visuals());
+                for m in &mentions {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .link(RichText::new(&m.from_title).strong())
+                            .on_hover_text("Ouvrir cette fiche")
+                            .clicked()
+                        {
+                            open = Some(m.from.clone());
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("Lier")
+                                .on_hover_text("Remplacer ce texte par un lien [[…]]")
+                                .clicked()
+                            {
+                                to_link.push(m.clone());
+                            }
+                        });
+                    });
+                    let mut job = egui::text::LayoutJob::default();
+                    let small = egui::FontId::proportional(12.0);
+                    let color = ui.visuals().text_color();
+                    let fmt = egui::text::TextFormat::simple(small.clone(), color);
+                    let mut hl = fmt.clone();
+                    hl.background = accent.gamma_multiply(0.45);
+                    let line = &m.line;
+                    let s = line[..m.in_line.start]
+                        .char_indices()
+                        .rev()
+                        .nth(40)
+                        .map_or(0, |(b, _)| b);
+                    let e = line[m.in_line.end..]
+                        .char_indices()
+                        .nth(60)
+                        .map_or(line.len(), |(b, _)| m.in_line.end + b);
+                    job.append(if s > 0 { "…" } else { "" }, 0.0, fmt.clone());
+                    job.append(&line[s..m.in_line.start], 0.0, fmt.clone());
+                    job.append(&line[m.in_line.clone()], 0.0, hl);
+                    job.append(&line[m.in_line.end..e], 0.0, fmt.clone());
+                    job.append(if e < line.len() { "…" } else { "" }, 0.0, fmt);
+                    job.wrap.max_width = ui.available_width();
+                    ui.label(job);
+                    ui.add_space(4.0);
+                }
+            });
+        if !to_link.is_empty() {
+            match self.project.link_mentions(&to_link) {
+                Ok(n) => {
+                    notices.info(format!("{n} mention(s) transformée(s) en lien."));
+                    self.mark_edited();
+                    if let Some(ed) = &mut self.editor {
+                        ed.sync_from_project(&self.project, self.now_ms);
+                    }
+                }
+                Err(e) => notices.error(format!("Lien impossible : {e}")),
+            }
+        }
+
         if let Some(title) = create {
             match self.project.create_note(&title, Vec::new(), String::new()) {
                 Ok(new_id) => {
@@ -2262,6 +2351,31 @@ mod ui_tests {
         harness.key_press(egui::Key::Enter);
         harness.run_steps(6);
         assert_eq!(open_title(&harness), "Nouvelle piste");
+    }
+
+    #[test]
+    fn unlinked_mentions_can_be_linked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        new_note(
+            &mut harness,
+            "Journal",
+            "Trouvé la Lanterne rouge près du puits.",
+        );
+        new_note(&mut harness, "Lanterne rouge", "");
+        harness.run_steps(4);
+        assert!(harness.query_by_label("Mentions non liées (1)").is_some());
+        snapshot(&mut harness, "41_mentions");
+        harness.get_by_label("Lier").click();
+        harness.run_steps(4);
+        let ws = harness.state().ws.as_ref().unwrap();
+        let journal = ws.project.resolve_title("Journal").unwrap();
+        assert_eq!(
+            ws.project.note(journal).unwrap().body,
+            "Trouvé la [[Lanterne rouge]] près du puits."
+        );
+        assert!(harness.query_by_label("Mentions non liées (0)").is_some());
+        assert!(harness.query_by_label("Rétroliens (1)").is_some());
     }
 
     #[test]

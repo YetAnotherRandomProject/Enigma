@@ -1605,6 +1605,38 @@ fn draw_pie(painter: &egui::Painter, center: Pos2, r: f32, colors: &[Color32], e
 
 /// Aperçu d'une fiche au survol.
 fn note_preview(ui: &mut egui::Ui, project: &Project, id: &NoteId, z_field: Option<&str>) {
+    note_summary(ui, project, id);
+    let Some(note) = project.note(id) else {
+        return;
+    };
+    let pack = project.pack();
+    if let Some(field) = z_field {
+        let label = pack
+            .fields
+            .iter()
+            .find(|f| f.id == field)
+            .map_or(field, |f| f.label.as_str());
+        let value = note
+            .meta
+            .fields
+            .get(field)
+            .and_then(|v| v.as_f64())
+            .map_or_else(|| "—".to_owned(), fmt_num);
+        ui.label(RichText::new(format!("{label} : {value}")).small());
+    }
+    ui.separator();
+    ui.label(
+        RichText::new(
+            "Clic : sélectionner · double-clic : ouvrir · glisser : épingler · Ctrl+glisser : lier",
+        )
+        .small()
+        .weak(),
+    );
+}
+
+/// Résumé d'une fiche (titre, catégories, statut, début du texte) : aperçu
+/// au survol dans le graphe et sur les liens du texte.
+pub fn note_summary(ui: &mut egui::Ui, project: &Project, id: &NoteId) {
     let Some(note) = project.note(id) else {
         return;
     };
@@ -1627,20 +1659,6 @@ fn note_preview(ui: &mut egui::Ui, project: &Project, id: &NoteId, z_field: Opti
             ui.label(RichText::new(format!("• {label}")).color(color).small());
         }
     });
-    if let Some(field) = z_field {
-        let label = pack
-            .fields
-            .iter()
-            .find(|f| f.id == field)
-            .map_or(field, |f| f.label.as_str());
-        let value = note
-            .meta
-            .fields
-            .get(field)
-            .and_then(|v| v.as_f64())
-            .map_or_else(|| "—".to_owned(), fmt_num);
-        ui.label(RichText::new(format!("{label} : {value}")).small());
-    }
     let excerpt: String = note
         .body
         .lines()
@@ -1653,12 +1671,4 @@ fn note_preview(ui: &mut egui::Ui, project: &Project, id: &NoteId, z_field: Opti
         let short: String = excerpt.chars().take(400).collect();
         ui.label(RichText::new(short).small());
     }
-    ui.separator();
-    ui.label(
-        RichText::new(
-            "Clic : sélectionner · double-clic : ouvrir · glisser : épingler · Ctrl+glisser : lier",
-        )
-        .small()
-        .weak(),
-    );
 }

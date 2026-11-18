@@ -967,6 +967,18 @@ impl Drags {
         let index_at = |pos: Pos2| galley.cursor_from_pos(pos - rect.min).index.0;
         let link_at = |i: usize| links.iter().find(|(r, _)| r.contains(&i)).map(|(_, l)| *l);
         match resp.hover_pos().and_then(|p| link_at(index_at(p))) {
+            Some(InlineLink::Wiki { target, .. })
+                if let Some(id) = project.resolve_title(target) =>
+            {
+                // Aperçu de la fiche liée.
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                let id = id.clone();
+                resp.clone().on_hover_ui_at_pointer(|ui| {
+                    crate::graph_view::note_summary(ui, project, &id);
+                    ui.separator();
+                    ui.label(RichText::new("Clic : ouvrir la fiche").small().weak());
+                });
+            }
             Some(link) => {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                 let tip = match link {
