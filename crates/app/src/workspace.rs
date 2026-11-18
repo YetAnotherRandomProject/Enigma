@@ -348,6 +348,18 @@ impl Workspace {
         }
     }
 
+    /// Pose une image sur le tableau d'enquête (copiée dans `assets/`).
+    pub fn add_board_image(&mut self, file: &Path, notices: &mut Notices) {
+        match enigma_core::import::add_asset(self.project.root(), file) {
+            Ok(rel) => {
+                self.board_view.add_image(&mut self.board, &rel);
+                self.disk_changed = true;
+                self.save_board(notices);
+            }
+            Err(e) => notices.error(format!("Image non ajoutée : {e}")),
+        }
+    }
+
     /// Image collée (Ctrl+V) : enregistrée en PNG dans le projet et insérée.
     fn handle_pasted_images(&mut self, ctx: &egui::Context, notices: &mut Notices) {
         if self.view != View::Note || self.editor.is_none() {
@@ -1830,6 +1842,14 @@ impl Workspace {
             );
             if out.changed {
                 self.save_board(notices);
+            }
+            if out.add_image
+                && let Some(file) = rfd::FileDialog::new()
+                    .set_title("Poser une image sur le tableau")
+                    .add_filter("Images", enigma_core::import::IMAGE_EXTENSIONS)
+                    .pick_file()
+            {
+                self.add_board_image(&file, notices);
             }
             if let Some(id) = out.select {
                 self.select(&id, notices);
@@ -4351,6 +4371,103 @@ id: "
             ws.run_command(Command::AddToBoard, &ctx, &mut state.notices);
         }
         assert!(Board::load(&board_file).unwrap().contains(&coffre));
+    }
+
+    #[test]
+    fn board_texts_images_groups_and_arrows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        egui_extras::install_image_loaders(&harness.ctx);
+        harness.state_mut().ws.as_mut().unwrap().view = View::Board;
+        harness.run_steps(4);
+        harness
+            .get_by_label("Ajouter les fiches de la liste (3)")
+            .click();
+        harness.run_steps(6);
+        let field = |hint: &'static str| {
+            move |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+                n.role() == Role::TextInput && n.placeholder() == Some(hint)
+            }
+        };
+        // Carte de texte : saisie directe.
+        harness.get_by_label("+ Texte").click();
+        harness.run_steps(4);
+        harness
+            .get_by(|n| {
+                n.role() == Role::MultilineTextInput && n.placeholder() == Some("Texte libre…")
+            })
+            .type_text("Indice : 1945");
+        harness.run_steps(2);
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(3);
+        let text_key = {
+            let ws = harness.state().ws.as_ref().unwrap();
+            assert_eq!(ws.board().texts[0].text, "Indice : 1945");
+            ws.board().texts[0].key.clone()
+        };
+        // Flèche : du point à droite du texte jusqu'à une carte de fiche.
+        let coffre = note_id(&harness, "Coffre du bureau");
+        let (from, to) = {
+            let ws = harness.state().ws.as_ref().unwrap();
+            (
+                ws.board_view().connector(ws.board(), &text_key).unwrap(),
+                ws.board_view().card_center(ws.board(), &coffre).unwrap(),
+            )
+        };
+        harness.hover_at(from);
+        harness.run_steps(1);
+        harness.drag_at(from);
+        harness.run_steps(1);
+        for k in 1..=6 {
+            harness.hover_at(from + (to - from) * (k as f32 / 6.0));
+            harness.run_steps(1);
+        }
+        harness.drop_at(to);
+        harness.run_steps(4);
+        harness
+            .get_by(field("Étiquette de la flèche"))
+            .type_text("ouvre");
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(3);
+        // Groupe nommé, image.
+        harness.get_by_label("+ Groupe").click();
+        harness.run_steps(4);
+        // Champ prérempli « Groupe » : tout sélectionner puis remplacer.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness
+            .get_by(|n| n.role() == Role::TextInput && n.value().as_deref() == Some("Groupe"))
+            .type_text("Bureau");
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(3);
+        let svg = dir.path().join("plan.svg");
+        std::fs::write(
+            &svg,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="#4aa3ff"/></svg>"##,
+        )
+        .unwrap();
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            ws.add_board_image(&svg, &mut state.notices);
+        }
+        for _ in 0..10 {
+            harness.run_steps(2);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        snapshot(&mut harness, "49_tableau_enrichi");
+        let saved = Board::load(
+            &dir.path()
+                .join(enigma_core::project::META_DIR)
+                .join(enigma_core::board::BOARD_FILE),
+        )
+        .unwrap();
+        assert_eq!(saved.edges.len(), 1, "{saved:?}");
+        assert_eq!(saved.edges[0].from, text_key);
+        assert_eq!(saved.edges[0].to, coffre.as_str());
+        assert_eq!(saved.edges[0].label, "ouvre");
+        assert_eq!(saved.groups[0].label, "Bureau");
+        assert_eq!(saved.images.len(), 1);
+        assert!(saved.images[0].src.starts_with("assets/"));
     }
 
     #[test]
