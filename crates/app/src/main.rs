@@ -26,6 +26,7 @@ mod reading;
 mod search_ui;
 mod session;
 mod shortcuts_ui;
+mod slash;
 mod system_open;
 mod theme;
 mod update;

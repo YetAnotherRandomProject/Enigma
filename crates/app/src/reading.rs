@@ -46,6 +46,8 @@ pub enum ViewAction {
     EditAt(usize),
     /// Chercher les fiches qui portent ce tag.
     SearchTag(String),
+    /// Replier ou déplier la section de ce titre.
+    ToggleFold(String),
     /// Début d'une sélection à la souris à cet octet.
     DragFrom(usize),
     /// Cocher/décocher la tâche de cette ligne.
@@ -143,6 +145,8 @@ pub struct Drags {
     callouts: std::collections::HashMap<usize, bool>,
     /// Notes de bas de page de la fiche : nom → (texte, octet).
     pub footnotes: std::collections::HashMap<String, (String, usize)>,
+    /// Sections repliées (texte du titre).
+    pub folded: std::collections::HashSet<String>,
 }
 
 /// Couleur et libellé par défaut d'un type d'encadré.
@@ -766,6 +770,58 @@ impl Drags {
             let a = match block {
                 Block::Heading { level, spans } => {
                     ui.add_space(if *level <= 2 { 6.0 } else { 2.0 });
+                    // Triangle de repli dans la marge de gauche.
+                    let key = src
+                        .source
+                        .trim_start_matches('#')
+                        .trim()
+                        .trim_end_matches('#')
+                        .trim()
+                        .to_owned();
+                    let folded = self.folded.contains(&key);
+                    let y = ui.cursor().top() + heading_size(*level) * 0.6;
+                    let tri = Rect::from_center_size(
+                        Pos2::new(ui.max_rect().left() - 9.0, y),
+                        Vec2::splat(14.0),
+                    );
+                    let row = Rect::from_min_max(
+                        Pos2::new(tri.left(), ui.cursor().top()),
+                        Pos2::new(ui.max_rect().right(), y + heading_size(*level)),
+                    );
+                    let t = ui
+                        .interact(tri, ui.scope_id().with(("fold", &key)), Sense::click())
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text(if folded {
+                            "Déplier la section"
+                        } else {
+                            "Replier la section"
+                        });
+                    if folded || ui.rect_contains_pointer(row) {
+                        let c = tri.center();
+                        let color = if t.hovered() {
+                            crate::theme::accent(ui.visuals())
+                        } else {
+                            ui.visuals().weak_text_color()
+                        };
+                        let pts = if folded {
+                            vec![
+                                c + Vec2::new(-2.0, -4.0),
+                                c + Vec2::new(3.0, 0.0),
+                                c + Vec2::new(-2.0, 4.0),
+                            ]
+                        } else {
+                            vec![
+                                c + Vec2::new(-4.0, -2.0),
+                                c + Vec2::new(4.0, -2.0),
+                                c + Vec2::new(0.0, 3.0),
+                            ]
+                        };
+                        ui.painter()
+                            .add(Shape::convex_polygon(pts, color, Stroke::NONE));
+                    }
+                    if t.clicked() {
+                        action = Some(ViewAction::ToggleFold(key.clone()));
+                    }
                     let strong = ui.visuals().strong_text_color();
                     let a = self.rich_text(
                         ui,

@@ -72,10 +72,56 @@ pub struct Editor {
     unit_rects: Vec<(Range<usize>, egui::Rangef)>,
     /// Faire défiler jusqu'au texte en édition (résultat de recherche…).
     reveal: bool,
+    /// Barre « Rechercher / remplacer dans la fiche ».
+    find: Option<FindBar>,
+    /// Commandes « / » proposées.
+    slash: Option<crate::slash::SlashPopup>,
+    slash_rect: Option<egui::Rect>,
+    /// `/` dont les propositions ont été fermées (Échap).
+    slash_dismissed: Option<usize>,
     /// Formulaires « + » pour enrichir le pack depuis la fiche.
     quick_category: QuickAdd,
     quick_status: QuickAdd,
     quick_field: QuickAdd,
+}
+
+/// Recherche dans la fiche.
+#[derive(Default)]
+struct FindBar {
+    query: String,
+    replace: String,
+    /// Respecter la casse (sinon : ni casse ni accents).
+    case: bool,
+    current: usize,
+    focus: bool,
+}
+
+/// Occurrences de `q` dans `text` (octets).
+fn find_all(text: &str, q: &str, case: bool) -> Vec<Range<usize>> {
+    if q.is_empty() {
+        return Vec::new();
+    }
+    if case {
+        return text.match_indices(q).map(|(i, m)| i..i + m.len()).collect();
+    }
+    let starts: Vec<usize> = text
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain([text.len()])
+        .collect();
+    let hay = enigma_core::search::fold(text);
+    let needle = enigma_core::search::fold(q);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        if hay[i..i + needle.len()] == *needle {
+            out.push(starts[i]..starts[i + needle.len()]);
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Résultat de l'affichage du corps.
@@ -422,6 +468,10 @@ impl Editor {
             drag_anchor: None,
             unit_rects: Vec::new(),
             reveal: false,
+            find: None,
+            slash: None,
+            slash_rect: None,
+            slash_dismissed: None,
             quick_category: QuickAdd::default(),
             quick_status: QuickAdd::default(),
             quick_field: QuickAdd::default(),
@@ -730,9 +780,53 @@ impl Editor {
         self.resolve_active();
         let focused = ctx.memory(|m| m.has_focus(te_id));
 
+        if self.find.is_some() {
+            outcome.edited |= self.find_ui(ui, &ctx, te_id, project, now_ms);
+        }
+
         // 2. Touches consommées avant le TextEdit : suggestions, passage
         //    d'une unité à l'autre, cellules de tableau.
-        if focused && self.popup.is_some() {
+        if focused && let Some(sp) = &self.slash {
+            let n = crate::slash::items(&sp.query).len().max(1);
+            let nav = ctx.input_mut(|i| {
+                use egui::{Key, Modifiers};
+                if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                    Some(Nav::Down)
+                } else if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                    Some(Nav::Up)
+                } else if i.consume_key(Modifiers::NONE, Key::Enter)
+                    || i.consume_key(Modifiers::NONE, Key::Tab)
+                {
+                    Some(Nav::Accept)
+                } else if i.consume_key(Modifiers::NONE, Key::Escape) {
+                    Some(Nav::Dismiss)
+                } else {
+                    None
+                }
+            });
+            match nav {
+                Some(Nav::Down) => {
+                    if let Some(sp) = &mut self.slash {
+                        sp.selected = (sp.selected + 1) % n;
+                    }
+                }
+                Some(Nav::Up) => {
+                    if let Some(sp) = &mut self.slash {
+                        sp.selected = (sp.selected + n - 1) % n;
+                    }
+                }
+                Some(Nav::Dismiss) => {
+                    self.slash_dismissed = Some(sp.start);
+                    self.slash = None;
+                }
+                Some(_) => {
+                    let i = sp.selected;
+                    outcome.edited |=
+                        self.accept_slash(i, project, now_ms, &mut outcome.insert_file);
+                }
+                None => {}
+            }
+        } else if focused && self.popup.is_some() {
             let nav = ctx.input_mut(|i| {
                 use egui::{Key, Modifiers};
                 if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
@@ -790,35 +884,88 @@ impl Editor {
                 .id_salt("body_scroll")
                 .auto_shrink(false)
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    for cu in &units {
-                        let range = cu.unit.range.clone();
-                        let top = ui.cursor().top();
-                        let covered = active
-                            .as_ref()
-                            .is_some_and(|a| a.start <= range.start && range.end <= a.end);
-                        if !covered {
-                            if action.is_none() {
-                                action = drags.unit_ui(ui, cu, project_ref, &note_path, &mut menu);
-                            } else {
-                                drags.unit_ui(ui, cu, project_ref, &note_path, &mut menu);
-                            }
-                            unit_rects.push((range, egui::Rangef::new(top, ui.cursor().top())));
-                            continue;
-                        }
-                        let Some(range) = active.clone().filter(|a| a.start == range.start) else {
-                            continue;
-                        };
-                        // Plusieurs unités sélectionnées : texte Markdown ordinaire.
-                        let single = range == cu.unit.range;
-                        let kind = if single { cu.unit.kind } else { UnitKind::Line };
-                        let scope = ui.scope(|ui| {
-                            if kind == UnitKind::Table {
-                                table_op = table_toolbar(ui);
-                            }
-                            let mut buf = body[range.clone()].to_owned();
-                            let visuals = ui.visuals().clone();
-                            let mut layouter =
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin {
+                            left: 16,
+                            ..Default::default()
+                        })
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            // Section repliée : ses unités sont sautées jusqu'au
+                            // titre suivant de même niveau ou plus haut.
+                            let mut fold_level: Option<usize> = None;
+                            for cu in &units {
+                                let range = cu.unit.range.clone();
+                                let heading = match &cu.content {
+                                    reading::Content::Line { source, .. }
+                                        if source.starts_with('#') =>
+                                    {
+                                        let level =
+                                            source.bytes().take_while(|&b| b == b'#').count();
+                                        source[level..].starts_with(' ').then(|| {
+                                            (
+                                                level,
+                                                source[level..]
+                                                    .trim()
+                                                    .trim_end_matches('#')
+                                                    .trim()
+                                                    .to_owned(),
+                                            )
+                                        })
+                                    }
+                                    _ => None,
+                                };
+                                if let (Some(l), Some((h, _))) = (fold_level, &heading)
+                                    && *h <= l
+                                {
+                                    fold_level = None;
+                                }
+                                let touches_active = active.as_ref().is_some_and(|a| {
+                                    a.start <= range.start && range.start <= a.end
+                                });
+                                if fold_level.is_some() && !touches_active {
+                                    continue;
+                                }
+                                if let Some((h, text)) = &heading
+                                    && drags.folded.contains(text)
+                                {
+                                    fold_level = Some(*h);
+                                }
+                                let top = ui.cursor().top();
+                                let covered = active
+                                    .as_ref()
+                                    .is_some_and(|a| a.start <= range.start && range.end <= a.end);
+                                if !covered {
+                                    if action.is_none() {
+                                        action = drags.unit_ui(
+                                            ui,
+                                            cu,
+                                            project_ref,
+                                            &note_path,
+                                            &mut menu,
+                                        );
+                                    } else {
+                                        drags.unit_ui(ui, cu, project_ref, &note_path, &mut menu);
+                                    }
+                                    unit_rects
+                                        .push((range, egui::Rangef::new(top, ui.cursor().top())));
+                                    continue;
+                                }
+                                let Some(range) = active.clone().filter(|a| a.start == range.start)
+                                else {
+                                    continue;
+                                };
+                                // Plusieurs unités sélectionnées : texte Markdown ordinaire.
+                                let single = range == cu.unit.range;
+                                let kind = if single { cu.unit.kind } else { UnitKind::Line };
+                                let scope =
+                                    ui.scope(|ui| {
+                                        if kind == UnitKind::Table {
+                                            table_op = table_toolbar(ui);
+                                        }
+                                        let mut buf = body[range.clone()].to_owned();
+                                        let visuals = ui.visuals().clone();
+                                        let mut layouter =
                                 |ui: &egui::Ui, b: &dyn egui::TextBuffer, wrap_width: f32| {
                                     let mut job = match kind {
                                         UnitKind::Line | UnitKind::Callout | UnitKind::Comment => {
@@ -829,80 +976,94 @@ impl Editor {
                                     job.wrap.max_width = wrap_width;
                                     ui.fonts_mut(|f| f.layout_job(job))
                                 };
-                            let bg = ui.painter().add(egui::Shape::Noop);
-                            let mut te = egui::TextEdit::multiline(&mut buf)
-                                .id(te_id)
-                                .layouter(&mut layouter)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(1)
-                                .frame(egui::Frame::NONE)
-                                // Tab : cellules de tableau ou indentation ;
-                                // Échap ferme les suggestions sans faire
-                                // perdre le focus quand elles sont ouvertes.
-                                .event_filter(egui::EventFilter {
-                                    tab: true,
-                                    horizontal_arrows: true,
-                                    vertical_arrows: true,
-                                    escape: popup_open,
-                                });
-                            if empty {
-                                te = te.hint_text(
+                                        let bg = ui.painter().add(egui::Shape::Noop);
+                                        let mut te = egui::TextEdit::multiline(&mut buf)
+                                            .id(te_id)
+                                            .layouter(&mut layouter)
+                                            .desired_width(f32::INFINITY)
+                                            .desired_rows(1)
+                                            .frame(egui::Frame::NONE)
+                                            // Tab : cellules de tableau ou indentation ;
+                                            // Échap ferme les suggestions sans faire
+                                            // perdre le focus quand elles sont ouvertes.
+                                            .event_filter(egui::EventFilter {
+                                                tab: true,
+                                                horizontal_arrows: true,
+                                                vertical_arrows: true,
+                                                escape: popup_open,
+                                            });
+                                        if empty {
+                                            te = te.hint_text(
                                     "Écrivez ici… Markdown accepté. Tapez [[ pour lier une \
                                      fiche, Ctrl+clic sur un lien pour l'ouvrir.",
                                 );
-                            }
-                            let output = te.show(ui);
-                            if reveal {
-                                ui.scroll_to_rect(output.response.rect, Some(egui::Align::Center));
-                            }
-                            let r = output.response.rect.expand2(egui::vec2(6.0, 2.0));
-                            ui.painter().set(
-                                bg,
-                                egui::Shape::Vec(vec![
-                                    egui::Shape::rect_filled(r, 0.0, visuals.extreme_bg_color),
-                                    egui::Shape::rect_filled(
-                                        egui::Rect::from_min_size(
-                                            r.min,
-                                            egui::vec2(2.0, r.height()),
-                                        ),
-                                        0.0,
-                                        crate::theme::accent(&visuals),
-                                    ),
-                                ]),
-                            );
-                            // Images de la ligne, toujours visibles et
-                            // redimensionnables pendant la modification.
-                            if single
-                                && cu.has_images()
-                                && let reading::Content::Line { blocks, .. } = &cu.content
-                            {
-                                ui.horizontal_wrapped(|ui| {
-                                    for b in blocks {
-                                        if let enigma_core::render::Block::Image(img) = b
-                                            && let Some(a) =
-                                                drags.image_ui(ui, img, project_ref, &note_path)
-                                        {
-                                            action = Some(a);
                                         }
-                                    }
-                                });
+                                        let output = te.show(ui);
+                                        if reveal {
+                                            ui.scroll_to_rect(
+                                                output.response.rect,
+                                                Some(egui::Align::Center),
+                                            );
+                                        }
+                                        let r = output.response.rect.expand2(egui::vec2(6.0, 2.0));
+                                        ui.painter().set(
+                                            bg,
+                                            egui::Shape::Vec(vec![
+                                                egui::Shape::rect_filled(
+                                                    r,
+                                                    0.0,
+                                                    visuals.extreme_bg_color,
+                                                ),
+                                                egui::Shape::rect_filled(
+                                                    egui::Rect::from_min_size(
+                                                        r.min,
+                                                        egui::vec2(2.0, r.height()),
+                                                    ),
+                                                    0.0,
+                                                    crate::theme::accent(&visuals),
+                                                ),
+                                            ]),
+                                        );
+                                        // Images de la ligne, toujours visibles et
+                                        // redimensionnables pendant la modification.
+                                        if single
+                                            && cu.has_images()
+                                            && let reading::Content::Line { blocks, .. } =
+                                                &cu.content
+                                        {
+                                            ui.horizontal_wrapped(|ui| {
+                                                for b in blocks {
+                                                    if let enigma_core::render::Block::Image(img) =
+                                                        b
+                                                        && let Some(a) = drags.image_ui(
+                                                            ui,
+                                                            img,
+                                                            project_ref,
+                                                            &note_path,
+                                                        )
+                                                    {
+                                                        action = Some(a);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        (output, buf)
+                                    });
+                                active_rect = Some(scope.response.rect);
+                                unit_rects.push((range.clone(), scope.response.rect.y_range()));
+                                let (output, buf) = scope.inner;
+                                edit = Some((output, buf, range, kind));
                             }
-                            (output, buf)
+                            // Sous le texte : clic = écrire à la fin.
+                            let rest = ui.available_size_before_wrap();
+                            let (_, resp) = ui.allocate_exact_size(
+                                egui::vec2(rest.x, rest.y.max(40.0)),
+                                egui::Sense::click(),
+                            );
+                            if resp.on_hover_cursor(egui::CursorIcon::Text).clicked() {
+                                action = Some(ViewAction::EditAt(body.len()));
+                            }
                         });
-                        active_rect = Some(scope.response.rect);
-                        unit_rects.push((range.clone(), scope.response.rect.y_range()));
-                        let (output, buf) = scope.inner;
-                        edit = Some((output, buf, range, kind));
-                    }
-                    // Sous le texte : clic = écrire à la fin.
-                    let rest = ui.available_size_before_wrap();
-                    let (_, resp) = ui.allocate_exact_size(
-                        egui::vec2(rest.x, rest.y.max(40.0)),
-                        egui::Sense::click(),
-                    );
-                    if resp.on_hover_cursor(egui::CursorIcon::Text).clicked() {
-                        action = Some(ViewAction::EditAt(body.len()));
-                    }
                 });
         }
         self.preview.units = units;
@@ -1000,6 +1161,50 @@ impl Editor {
             } else if !pointer_on_popup {
                 self.popup = None;
             }
+            let pointer_on_slash = self
+                .slash_rect
+                .zip(ctx.input(|i| i.pointer.hover_pos()))
+                .is_some_and(|(r, p)| r.contains(p));
+            let slash_ctx = cursor_byte
+                .filter(|_| self.popup.is_none() && output.response.has_focus())
+                .filter(|_| matches!(kind, UnitKind::Line | UnitKind::Callout))
+                .and_then(|b| crate::slash::context(&self.body, b));
+            match slash_ctx {
+                Some((start, query))
+                    if self.slash_dismissed != Some(start)
+                        && !crate::slash::items(&query).is_empty() =>
+                {
+                    let anchor = output
+                        .cursor_range
+                        .map(|r| {
+                            output.galley_pos
+                                + output
+                                    .galley
+                                    .pos_from_cursor(r.primary)
+                                    .left_bottom()
+                                    .to_vec2()
+                        })
+                        .unwrap_or(output.galley_pos);
+                    let selected = match &self.slash {
+                        Some(s) if s.start == start && s.query == query => s.selected,
+                        _ => 0,
+                    };
+                    self.slash = Some(crate::slash::SlashPopup {
+                        start,
+                        query,
+                        selected,
+                        anchor: anchor + egui::vec2(0.0, 2.0),
+                    });
+                }
+                _ if pointer_on_slash => {}
+                Some(_) => self.slash = None,
+                None => {
+                    self.slash = None;
+                    if cursor_byte.is_some() {
+                        self.slash_dismissed = None;
+                    }
+                }
+            }
 
             // Fin de la modification : clic ailleurs dans la fiche (pas
             // dans un menu), Échap, ou focus donné à un autre champ.
@@ -1032,6 +1237,17 @@ impl Editor {
                 }
             } else {
                 self.drag_anchor = None;
+            }
+        }
+
+        // Fenêtre des commandes « / ».
+        self.slash_rect = None;
+        if let Some(sp) = &self.slash {
+            let (clicked, rect) = sp.show(&ctx);
+            self.slash_rect = Some(rect);
+            if let Some(i) = clicked {
+                outcome.edited |= self.accept_slash(i, project, now_ms, &mut outcome.insert_file);
+                ctx.request_repaint();
             }
         }
 
@@ -1082,6 +1298,11 @@ impl Editor {
                 outcome.open_section = section;
             }
             Some(ViewAction::SearchTag(t)) => outcome.search_tag = Some(t),
+            Some(ViewAction::ToggleFold(key)) => {
+                if !self.preview.drags.folded.remove(&key) {
+                    self.preview.drags.folded.insert(key);
+                }
+            }
             Some(ViewAction::OpenFile(path)) => {
                 if let Err(e) = crate::system_open::open(&path) {
                     notices.error(format!("Impossible d'ouvrir « {} » : {e}", path.display()));
@@ -1119,6 +1340,221 @@ impl Editor {
             None => {}
         }
         outcome
+    }
+
+    /// Applique la commande « / » numéro `i` : retire `/requête` puis
+    /// insère. Rend `true` si le texte a changé.
+    fn accept_slash(
+        &mut self,
+        i: usize,
+        project: &mut Project,
+        now_ms: u64,
+        insert_file: &mut bool,
+    ) -> bool {
+        let Some(sp) = self.slash.take() else {
+            return false;
+        };
+        let Some(item) = crate::slash::items(&sp.query).into_iter().nth(i) else {
+            return false;
+        };
+        let end = (sp.start + 1 + sp.query.len()).min(self.body.len());
+        self.body.replace_range(sp.start..end, "");
+        self.history.break_group();
+        let at = sp.start;
+        match item.action {
+            crate::slash::SlashAction::Format(f) => {
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                self.last_sel = Some(at..at);
+                self.last_cursor = Some(at);
+                self.format(f, project, now_ms);
+            }
+            crate::slash::SlashAction::Snippet { text, cursor } => {
+                self.body.insert_str(at, text);
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                self.pending_cursor = Some(self.body[..at + cursor].chars().count());
+            }
+            crate::slash::SlashAction::InsertFile => {
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                self.last_cursor = Some(at);
+                self.pending_cursor = Some(self.body[..at].chars().count());
+                *insert_file = true;
+            }
+        }
+        true
+    }
+
+    /// Ouvre la barre « Rechercher / remplacer dans la fiche ».
+    pub fn open_find(&mut self) {
+        let sel = self.selected_text();
+        let find = self.find.get_or_insert_with(FindBar::default);
+        if !sel.is_empty() && !sel.contains('\n') {
+            find.query = sel;
+        }
+        find.focus = true;
+    }
+
+    /// Correspondances de la recherche dans la fiche (octets).
+    fn find_matches(&self) -> Vec<Range<usize>> {
+        let Some(f) = &self.find else {
+            return Vec::new();
+        };
+        find_all(&self.body, &f.query, f.case)
+    }
+
+    /// Barre de recherche/remplacement ; rend `true` si le texte a changé.
+    fn find_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        te_id: egui::Id,
+        project: &mut Project,
+        now_ms: u64,
+    ) -> bool {
+        let matches = self.find_matches();
+        let Some(f) = &mut self.find else {
+            return false;
+        };
+        enum Act {
+            Go(usize),
+            Replace,
+            ReplaceAll,
+            Close,
+        }
+        let mut act = None;
+        let n = matches.len();
+        if n > 0 {
+            f.current = f.current.min(n - 1);
+        }
+        egui::Frame::new()
+            .fill(ui.visuals().extreme_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .inner_margin(6)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let q = ui.add(
+                        egui::TextEdit::singleline(&mut f.query)
+                            .hint_text("Rechercher dans la fiche")
+                            .desired_width(180.0),
+                    );
+                    if f.focus {
+                        q.request_focus();
+                        f.focus = false;
+                    }
+                    if q.changed() {
+                        f.current = 0;
+                    }
+                    let enter = q.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let shift = ui.input(|i| i.modifiers.shift);
+                    if q.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        act = Some(Act::Close);
+                    }
+                    ui.label(if f.query.is_empty() {
+                        String::new()
+                    } else if n == 0 {
+                        "aucun résultat".to_owned()
+                    } else {
+                        format!("{} / {n}", f.current + 1)
+                    });
+                    if (ui.button("Préc.").clicked() || (enter && shift)) && n > 0 {
+                        act = Some(Act::Go((f.current + n - 1) % n));
+                    }
+                    if (ui.button("Suiv.").clicked() || (enter && !shift)) && n > 0 {
+                        act = Some(Act::Go((f.current + 1) % n));
+                    }
+                    ui.toggle_value(&mut f.case, "Aa")
+                        .on_hover_text("Respecter la casse");
+                    ui.separator();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut f.replace)
+                            .hint_text("Remplacer par")
+                            .desired_width(140.0),
+                    );
+                    if ui
+                        .add_enabled(n > 0, egui::Button::new("Remplacer"))
+                        .clicked()
+                    {
+                        act = Some(Act::Replace);
+                    }
+                    if ui
+                        .add_enabled(n > 0, egui::Button::new("Tout"))
+                        .on_hover_text("Tout remplacer")
+                        .clicked()
+                    {
+                        act = Some(Act::ReplaceAll);
+                    }
+                    if ui.button("Fermer").clicked() {
+                        act = Some(Act::Close);
+                    }
+                });
+            });
+        let replace = f.replace.clone();
+        match act {
+            None => false,
+            Some(Act::Close) => {
+                self.find = None;
+                false
+            }
+            Some(Act::Go(i)) => {
+                f.current = i;
+                if let Some(r) = matches.get(i) {
+                    self.activate(ctx, te_id, r.end, Some(r.start));
+                    self.last_cursor = Some(r.end);
+                    self.last_sel = Some(r.clone());
+                    self.reveal = true;
+                }
+                false
+            }
+            Some(Act::Replace) => {
+                let Some(r) = matches.get(f.current).cloned() else {
+                    return false;
+                };
+                self.body.replace_range(r.clone(), &replace);
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                let next = r.start + replace.len();
+                self.activate(ctx, te_id, next, Some(r.start));
+                self.reveal = true;
+                true
+            }
+            Some(Act::ReplaceAll) => {
+                for r in matches.iter().rev() {
+                    self.body.replace_range(r.clone(), &replace);
+                }
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                true
+            }
+        }
+    }
+
+    /// Plan de la fiche (titres de section) ; un clic place l'éditeur sur
+    /// la section.
+    pub fn outline_ui(&mut self, ui: &mut egui::Ui) {
+        let heads = enigma_core::sections::headings(&self.body);
+        egui::CollapsingHeader::new(format!("Plan ({})", heads.len()))
+            .id_salt("outline")
+            .default_open(true)
+            .show(ui, |ui| {
+                if heads.is_empty() {
+                    ui.weak("Aucun titre (# Titre).");
+                }
+                let mut go = None;
+                for h in &heads {
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0 * f32::from(h.level.saturating_sub(1)));
+                        let folded = self.preview.drags.folded.contains(&h.text);
+                        let text = if folded {
+                            format!("{} (replié)", h.text)
+                        } else {
+                            h.text.clone()
+                        };
+                        if ui.link(text).clicked() {
+                            go = Some(h.line.end);
+                        }
+                    });
+                }
+                if let Some(b) = go {
+                    self.reveal(b);
+                }
+            });
     }
 
     /// Fiche liée : ouverte, ou créée si elle n'existe pas.
@@ -1322,6 +1758,8 @@ impl Editor {
         use egui::{Key, Modifiers};
         enum Move {
             To(usize),
+            /// Échange le texte en édition avec l'unité voisine (plage).
+            Swap(Range<usize>),
             Select(usize, usize),
             Join(Range<usize>, usize),
             Table(table::Op),
@@ -1391,6 +1829,16 @@ impl Editor {
         let mv = ctx.input_mut(|i| {
             if i.consume_key(Modifiers::COMMAND, Key::A) {
                 return Some(Move::Select(0, body.len()));
+            }
+            if let Some(p) = &prev
+                && i.consume_key(Modifiers::ALT, Key::ArrowUp)
+            {
+                return Some(Move::Swap(p.clone()));
+            }
+            if let Some(nx) = &next
+                && i.consume_key(Modifiers::ALT, Key::ArrowDown)
+            {
+                return Some(Move::Swap(nx.clone()));
             }
             if i.consume_key(shift_cmd, Key::Home) {
                 return Some(Move::Select(anchor, 0));
@@ -1480,6 +1928,26 @@ impl Editor {
                 self.activate(ctx, te_id, b, None);
                 false
             }
+            Some(Move::Swap(other)) => {
+                let mine = self.body[range.clone()].to_owned();
+                let theirs = self.body[other.clone()].to_owned();
+                let offset = cursor - range.start;
+                let new_start = if other.start < range.start {
+                    let sep = self.body[other.end..range.start].to_owned();
+                    self.body
+                        .replace_range(other.start..range.end, &format!("{mine}{sep}{theirs}"));
+                    other.start
+                } else {
+                    let sep = self.body[range.end..other.start].to_owned();
+                    self.body
+                        .replace_range(range.start..other.end, &format!("{theirs}{sep}{mine}"));
+                    range.start + theirs.len() + sep.len()
+                };
+                self.history.break_group();
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                self.activate(ctx, te_id, new_start + offset, None);
+                true
+            }
             Some(Move::Select(a, b)) => {
                 self.activate(ctx, te_id, b, Some(a));
                 self.last_cursor = Some(b);
@@ -1524,6 +1992,14 @@ impl Editor {
     #[cfg(test)]
     pub fn edit_at_end(&mut self) {
         self.pending_cursor = Some(self.body.chars().count());
+    }
+
+    /// Replie ou déplie une section (tests).
+    #[cfg(test)]
+    pub fn toggle_fold(&mut self, title: &str) {
+        if !self.preview.drags.folded.remove(title) {
+            self.preview.drags.folded.insert(title.to_owned());
+        }
     }
 
     /// Commence à écrire à cet octet (tests).

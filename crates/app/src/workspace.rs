@@ -398,9 +398,11 @@ impl Workspace {
                 .editor
                 .as_ref()
                 .is_some_and(|e| self.board.contains(&e.id)),
-            Command::DeleteNote | Command::Undo | Command::Redo | Command::InsertImage => {
-                self.editor.is_some()
-            }
+            Command::DeleteNote
+            | Command::Undo
+            | Command::Redo
+            | Command::InsertImage
+            | Command::FindInNote => self.editor.is_some(),
             c if commands::format_of(c).is_some() => self.editor.is_some(),
             // Association de fichiers : Windows seulement pour l'instant.
             Command::AssociateFiles => cfg!(windows),
@@ -427,6 +429,12 @@ impl Workspace {
             Command::SearchAll => {
                 self.left_tab = LeftTab::Search;
                 self.search.focus = true;
+            }
+            Command::FindInNote => {
+                self.view = View::Note;
+                if let Some(ed) = &mut self.editor {
+                    ed.open_find();
+                }
             }
             Command::NewNote => self.open_new_note_dialog(),
             Command::Save => self.flush(notices),
@@ -931,6 +939,9 @@ impl Workspace {
                                 self.mark_edited();
                             }
                             ui.add_space(12.0);
+                            if let Some(ed) = &mut self.editor {
+                                ed.outline_ui(ui);
+                            }
                             if let Some(target) = self.links_ui(ui, notices) {
                                 self.select(&target, notices);
                             }
@@ -2523,6 +2534,91 @@ mod ui_tests {
             harness.query_by_label("Essai").is_some(),
             "résultat de tag:lieu/manoir"
         );
+    }
+
+    #[test]
+    fn slash_commands_move_lines_find_replace_and_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        new_note(&mut harness, "Essai", "# Partie\nun\ndeux\n## Sous\ntrois");
+        let edit_at = |h: &mut Harness<'_, State>, b: usize| {
+            h.state_mut()
+                .ws
+                .as_mut()
+                .unwrap()
+                .editor
+                .as_mut()
+                .unwrap()
+                .edit_at(b);
+            h.run_steps(4);
+        };
+        // Alt+Haut : la ligne « deux » remonte.
+        edit_at(&mut harness, 16);
+        harness.key_press_modifiers(egui::Modifiers::ALT, egui::Key::ArrowUp);
+        harness.run_steps(4);
+        assert_eq!(body_text(&harness), "# Partie\ndeux\nun\n## Sous\ntrois");
+        assert_eq!(editing_text(&harness).as_deref(), Some("deux"));
+
+        // « / » en fin de fiche : commandes, filtrées ; Entrée insère.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
+        harness.run_steps(4);
+        harness
+            .get_by_role(Role::MultilineTextInput)
+            .type_text("\n/tabl");
+        harness.run_steps(4);
+        assert!(
+            harness.query_by_label("Insérer").is_some(),
+            "commandes proposées"
+        );
+        snapshot(&mut harness, "45_commandes_slash");
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(4);
+        let body = body_text(&harness);
+        assert!(body.contains("| Colonne 1 |"), "{body}");
+        assert!(!body.contains("/tabl"), "{body}");
+
+        // Rechercher / remplacer (Ctrl+H) : sans accents ni casse.
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::H);
+        harness.run_steps(4);
+        let field = |hint: &'static str| {
+            move |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+                n.role() == Role::TextInput && n.placeholder() == Some(hint)
+            }
+        };
+        harness
+            .get_by(field("Rechercher dans la fiche"))
+            .type_text("TROIS");
+        harness.get_by(field("Remplacer par")).focus();
+        harness.run_steps(1);
+        harness.get_by(field("Remplacer par")).type_text("3");
+        harness.run_steps(2);
+        assert!(harness.query_by_label("1 / 1").is_some());
+        harness.get_by_label("Tout").click();
+        harness.run_steps(4);
+        assert!(
+            body_text(&harness).contains("## Sous\n3"),
+            "{}",
+            body_text(&harness)
+        );
+        harness.get_by_label("Fermer").click();
+        harness.run_steps(2);
+
+        // Plan : les titres ; repli d'une section.
+        assert!(harness.query_by_label("Plan (2)").is_some());
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .toggle_fold("Partie");
+        harness.run_steps(4);
+        assert!(harness.query_by_label("Partie (replié)").is_some());
+        snapshot(&mut harness, "46_section_repliee");
     }
 
     #[test]
