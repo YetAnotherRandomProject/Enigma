@@ -14,13 +14,17 @@ use crate::colors::WIKI_LINK;
 pub const LIST_MARKER: Color32 = Color32::from_rgb(0xff, 0xb8, 0x6b);
 pub const BODY_SIZE: f32 = 15.0;
 
-/// Cache du dernier `LayoutJob` calculé : l'analyse n'est refaite que si le
-/// texte, le projet (titres → liens cassés) ou le thème changent.
+/// Cache des `LayoutJob` calculés (un par morceau de texte) : l'analyse n'est
+/// refaite que si le texte, le projet (titres → liens cassés) ou le thème
+/// changent. Plusieurs champs de texte s'alternent à chaque image en mode
+/// édition, d'où plusieurs entrées.
 #[derive(Default)]
 pub struct Highlighter {
-    key: Option<u64>,
-    job: LayoutJob,
+    jobs: std::collections::HashMap<u64, LayoutJob>,
 }
+
+/// Nombre d'entrées gardées avant de repartir de zéro.
+const MAX_CACHED: usize = 64;
 
 impl Highlighter {
     pub fn job(&mut self, text: &str, project: &Project, visuals: &Visuals) -> LayoutJob {
@@ -29,11 +33,13 @@ impl Highlighter {
         project.generation().hash(&mut h);
         visuals.dark_mode.hash(&mut h);
         let key = h.finish();
-        if self.key != Some(key) {
-            self.job = build(text, project, visuals);
-            self.key = Some(key);
+        if self.jobs.len() >= MAX_CACHED && !self.jobs.contains_key(&key) {
+            self.jobs.clear();
         }
-        self.job.clone()
+        self.jobs
+            .entry(key)
+            .or_insert_with(|| build(text, project, visuals))
+            .clone()
     }
 }
 

@@ -1349,7 +1349,7 @@ checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
 name = "enigma-app"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "enigma-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "pulldown-cmark",
  "regex",
@@ -1394,11 +1394,11 @@ dependencies = [
 
 [[package]]
 name = "enigma-graph"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "enigma-typeset"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "mermaid-rs-renderer",
  "pulldown-cmark",

@@ -124,16 +124,6 @@ pub struct CachedUnit {
     pub content: Content,
 }
 
-impl CachedUnit {
-    /// Images de l'unité (plages dans la fiche).
-    pub fn has_images(&self) -> bool {
-        match &self.content {
-            Content::Line { blocks, .. } => blocks.iter().any(|b| matches!(b, Block::Image(_))),
-            _ => false,
-        }
-    }
-}
-
 /// Glissers en cours et position du dernier clic droit.
 #[derive(Default)]
 pub struct Drags {
@@ -158,6 +148,99 @@ pub struct Drags {
     pub footnotes: std::collections::HashMap<String, (String, usize)>,
     /// Sections repliées (texte du titre).
     pub folded: std::collections::HashSet<String>,
+    /// Case de tableau qui a le focus à cette image : (début du tableau,
+    /// ligne, colonne). Remis à zéro par l'éditeur avant chaque image.
+    pub focused_cell: Option<(usize, usize, usize)>,
+    /// Case à focaliser à la prochaine image : (début, ligne, colonne,
+    /// caractère du curseur).
+    pub pending_focus: Option<(usize, usize, usize, usize)>,
+    /// Texte en cours de frappe dans la case qui a le focus (garde les
+    /// espaces de fin, que le tableau réécrit supprime).
+    pub cell_buf: Option<((usize, usize, usize), String)>,
+    /// Modification d'une case à cette image.
+    pub cell_change: Option<CellChange>,
+    /// Identifiants des champs de saisie des cases de cette image.
+    pub cell_ids: Vec<egui::Id>,
+}
+
+/// Une case de tableau modifiée.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CellChange {
+    /// Plage du tableau dans la fiche.
+    pub range: Range<usize>,
+    /// Ligne (0 : en-tête) et colonne.
+    pub r: usize,
+    pub c: usize,
+    pub text: String,
+}
+
+/// Rôle d'un segment de la fiche en mode édition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegKind {
+    /// Texte Markdown (lignes, listes, citations, code, encadrés…), fusionné
+    /// avec ses voisins en un seul champ de saisie.
+    Run,
+    /// Ligne qui contient une image ou une formule : texte + aperçus.
+    Media,
+    /// Formule `$$…$$` sur plusieurs lignes : texte + aperçu.
+    Math,
+    /// Bloc mermaid : texte + diagramme.
+    Diagram,
+    /// `![[Fiche]]` : texte + contenu inséré.
+    Embed,
+    /// Tableau : cases modifiables.
+    Table,
+}
+
+/// Morceau de la fiche affiché en mode édition. Toute la fiche est éditable
+/// à la fois ; les images, formules, diagrammes, insertions et tableaux
+/// gardent leur rendu à côté de leur texte.
+#[derive(Clone, Debug)]
+pub struct Seg {
+    pub range: Range<usize>,
+    pub kind: SegKind,
+    /// Unités (de `Preview::units`) couvertes.
+    pub units: Range<usize>,
+}
+
+/// Découpe les unités en segments : les unités de texte consécutives
+/// forment un seul segment.
+pub fn segments(units: &[CachedUnit]) -> Vec<Seg> {
+    let mut out: Vec<Seg> = Vec::new();
+    for (i, u) in units.iter().enumerate() {
+        let kind = match &u.content {
+            Content::Line { blocks, .. }
+                if blocks.iter().any(|b| {
+                    matches!(
+                        b,
+                        Block::Image(_) | Block::Math(_) | Block::Attachment { .. }
+                    )
+                }) =>
+            {
+                SegKind::Media
+            }
+            Content::Line { .. }
+            | Content::Code { .. }
+            | Content::Callout { .. }
+            | Content::Comment { .. } => SegKind::Run,
+            Content::Embed { .. } => SegKind::Embed,
+            Content::Table { .. } => SegKind::Table,
+            Content::Math { .. } => SegKind::Math,
+            Content::Diagram { .. } => SegKind::Diagram,
+        };
+        match out.last_mut() {
+            Some(l) if kind == SegKind::Run && l.kind == SegKind::Run => {
+                l.range.end = u.unit.range.end;
+                l.units.end = i + 1;
+            }
+            _ => out.push(Seg {
+                range: u.unit.range.clone(),
+                kind,
+                units: i..i + 1,
+            }),
+        }
+    }
+    out
 }
 
 /// Couleur et libellé par défaut d'un type d'encadré.
@@ -212,6 +295,8 @@ fn embed_of(line: &str) -> Option<(String, Option<String>)> {
 pub struct Preview {
     key: Option<u64>,
     pub units: Vec<CachedUnit>,
+    /// Segments du mode édition (voir [`segments`]).
+    pub segs: Vec<Seg>,
     pub drags: Drags,
 }
 
@@ -416,6 +501,7 @@ impl Preview {
         let key = hash_text(body);
         if self.key != Some(key) {
             self.units = build(body);
+            self.segs = segments(&self.units);
             self.key = Some(key);
             // Notes de bas de page : `[^nom]: texte`.
             self.drags.footnotes.clear();
@@ -433,11 +519,12 @@ impl Preview {
         }
     }
 
-    pub fn unit_at(&self, b: usize) -> usize {
-        self.units
+    /// Segment contenant l'octet `b`.
+    pub fn seg_at(&self, b: usize) -> usize {
+        self.segs
             .iter()
-            .position(|u| b <= u.unit.range.end)
-            .unwrap_or(self.units.len().saturating_sub(1))
+            .position(|s| b <= s.range.end)
+            .unwrap_or(self.segs.len().saturating_sub(1))
     }
 }
 
@@ -505,9 +592,16 @@ impl Drags {
             Content::Code { code, start } => self.code_ui(ui, code, *start),
             Content::Math { latex, start } => self.math_block_ui(ui, latex, *start),
             Content::Diagram { src, start } => self.diagram_ui(ui, src, *start),
-            Content::Table { cols, rows } => {
-                self.table_ui(ui, &cu.unit.range, *cols, rows, project, note_path, menu)
-            }
+            Content::Table { cols, rows } => self.table_ui(
+                ui,
+                &cu.unit.range,
+                *cols,
+                rows,
+                project,
+                note_path,
+                menu,
+                None,
+            ),
             Content::Embed { target, section } => {
                 self.embed_ui(ui, cu, target, section.as_deref(), project, menu)
             }
@@ -1026,7 +1120,7 @@ impl Drags {
     }
 
     /// Formule rendue par Typst ; une erreur montre le LaTeX en rouge.
-    fn math_image(&mut self, ui: &mut egui::Ui, latex: &str, display: bool) -> egui::Response {
+    pub fn math_image(&mut self, ui: &mut egui::Ui, latex: &str, display: bool) -> egui::Response {
         let v = ui.visuals();
         let c = v.text_color();
         let color = format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
@@ -1070,6 +1164,12 @@ impl Drags {
 
     /// Diagramme Mermaid ; un clic montre sa source.
     fn diagram_ui(&mut self, ui: &mut egui::Ui, src: &str, start: usize) -> Option<ViewAction> {
+        let resp = self.diagram_view(ui, src);
+        resp.clicked().then_some(ViewAction::EditAt(start))
+    }
+
+    /// Diagramme Mermaid seul (aperçu).
+    pub fn diagram_view(&mut self, ui: &mut egui::Ui, src: &str) -> egui::Response {
         let dark = ui.visuals().dark_mode;
         let key = format!("mermaid|{dark}|{src}");
         let owned = src.to_owned();
@@ -1095,8 +1195,7 @@ impl Drags {
                 r.interact(Sense::click())
             }
         };
-        let resp = resp.on_hover_text("Clic : modifier le diagramme");
-        resp.clicked().then_some(ViewAction::EditAt(start))
+        resp.on_hover_text("Clic : modifier le diagramme")
     }
 
     fn code_ui(&mut self, ui: &mut egui::Ui, code: &str, start: usize) -> Option<ViewAction> {
@@ -1140,8 +1239,11 @@ impl Drags {
         None
     }
 
+    /// Tableau (lecture), ou modifiable avec `edit` (identifiant de base des
+    /// champs de saisie) : on écrit dans les cases, la poignée du coin
+    /// ajoute ou retire des lignes et des colonnes.
     #[allow(clippy::too_many_arguments)]
-    fn table_ui(
+    pub fn table_ui(
         &mut self,
         ui: &mut egui::Ui,
         range: &Range<usize>,
@@ -1150,8 +1252,38 @@ impl Drags {
         project: &Project,
         note_path: &Path,
         menu: &mut Menu<'_>,
+        edit: Option<egui::Id>,
     ) -> Option<ViewAction> {
         let mut action = None;
+        // Largeur de chaque colonne : celle de son texte le plus large.
+        let widths: Vec<f32> = if edit.is_some() {
+            (0..cols)
+                .map(|c| {
+                    rows.iter()
+                        .enumerate()
+                        .filter_map(|(r, row)| row.get(c).map(|cell| (r, cell)))
+                        .map(|(r, cell)| {
+                            let text = match &self.cell_buf {
+                                Some((k, b)) if *k == (range.start, r, c) => b.as_str(),
+                                _ => cell.source.as_str(),
+                            };
+                            let w = ui.fonts_mut(|f| {
+                                f.layout_no_wrap(
+                                    text.to_owned(),
+                                    FontId::proportional(BODY_SIZE),
+                                    Color32::WHITE,
+                                )
+                                .size()
+                                .x
+                            });
+                            w + 8.0
+                        })
+                        .fold(CELL_MIN.x, f32::max)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let bg = ui.painter().add(Shape::Noop);
         let mut rects: Vec<Vec<Rect>> = Vec::with_capacity(rows.len());
         // Cases de l'image précédente : zones cliquables sous le contenu
@@ -1160,7 +1292,7 @@ impl Drags {
         // toujours juste la taille de leur contenu.
         let cells_id = ui.scope_id().with(("table_cells", range.start));
         let prev_cells: Vec<Rect> = ui.data(|d| d.get_temp(cells_id)).unwrap_or_default();
-        for (k, r) in prev_cells.iter().enumerate() {
+        for (k, r) in prev_cells.iter().enumerate().filter(|_| edit.is_none()) {
             let resp = ui
                 .interact(
                     *r,
@@ -1194,6 +1326,19 @@ impl Drags {
                                 .show(ui, |ui| {
                                     ui.set_min_size(CELL_MIN);
                                     let cell = cell?;
+                                    if let Some(base) = edit {
+                                        return self.cell_edit_ui(
+                                            ui,
+                                            base,
+                                            range,
+                                            r,
+                                            c,
+                                            cell,
+                                            widths.get(c).copied().unwrap_or(CELL_MIN.x),
+                                            project,
+                                            note_path,
+                                        );
+                                    }
                                     let strong = (r == 0).then(|| ui.visuals().strong_text_color());
                                     self.cell_ui(ui, cell, strong, project, note_path, menu)
                                 })
@@ -1340,6 +1485,73 @@ impl Drags {
             }
         }
         ui.add_space(4.0);
+        action
+    }
+
+    /// Case modifiable : champ de saisie (texte Markdown de la case) et
+    /// aperçu des images qu'elle contient.
+    #[allow(clippy::too_many_arguments)]
+    fn cell_edit_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        base: egui::Id,
+        range: &Range<usize>,
+        r: usize,
+        c: usize,
+        cell: &CellView,
+        width: f32,
+        project: &Project,
+        note_path: &Path,
+    ) -> Option<ViewAction> {
+        let key = (range.start, r, c);
+        let mut text = match &self.cell_buf {
+            Some((k, b)) if *k == key => b.clone(),
+            _ => cell.source.clone(),
+        };
+        let id = base.with(key);
+        self.cell_ids.push(id);
+        if let Some((s, pr, pc, off)) = self.pending_focus
+            && (s, pr, pc) == key
+        {
+            self.pending_focus = None;
+            let mut st = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(off),
+            )));
+            st.store(ui.ctx(), id);
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        let mut te = egui::TextEdit::singleline(&mut text)
+            .id(id)
+            .font(FontId::proportional(BODY_SIZE))
+            .frame(egui::Frame::NONE);
+        if r == 0 {
+            te = te.text_color(ui.visuals().strong_text_color());
+        }
+        // `add_sized` : la grille limite la largeur d'une case à celle de la
+        // colonne à l'image précédente, ce qui empêcherait la colonne de
+        // suivre son texte.
+        let resp = ui.add_sized([width, BODY_SIZE + 6.0], te);
+        if resp.has_focus() {
+            self.focused_cell = Some(key);
+        }
+        if resp.changed() {
+            self.cell_buf = Some((key, text.clone()));
+            self.cell_change = Some(CellChange {
+                range: range.clone(),
+                r,
+                c,
+                text,
+            });
+        }
+        let mut action = None;
+        for b in &cell.blocks {
+            if let Block::Image(img) = b
+                && let Some(a) = self.image_ui(ui, img, project, note_path)
+            {
+                action = Some(a);
+            }
+        }
         action
     }
 
@@ -1733,7 +1945,7 @@ fn task_box(ui: &mut egui::Ui, done: bool) -> bool {
 }
 
 /// Pièce jointe (son, vidéo, document) : carte avec bouton « Ouvrir ».
-fn attachment_ui(
+pub fn attachment_ui(
     ui: &mut egui::Ui,
     label: &str,
     src: &str,

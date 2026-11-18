@@ -378,7 +378,7 @@ pub fn cell_at(text: &str, p: &Parsed, b: usize) -> (usize, usize, usize) {
 }
 
 /// Ligne de texte → index dans `Table::rows` (`None` : séparateur).
-fn row_of_line(line: usize) -> Option<usize> {
+pub fn row_of_line(line: usize) -> Option<usize> {
     match line {
         0 => Some(0),
         1 => None,
@@ -388,6 +388,48 @@ fn row_of_line(line: usize) -> Option<usize> {
 
 fn line_of_row(row: usize) -> usize {
     if row == 0 { 0 } else { row + 1 }
+}
+
+/// Octet (dans `text`) où commence le contenu de la case de la ligne `row`
+/// (0 : en-tête) et de la colonne `col`.
+pub fn cell_start(text: &str, row: usize, col: usize) -> Option<usize> {
+    let p = parse(text)?;
+    p.cells
+        .get(line_of_row(row))?
+        .get(col)
+        .map(|c| c.content.start)
+}
+
+/// Protège les `|` qui couperaient la case (hors liens `[[…]]`, code et
+/// légendes d'image, que l'analyse sait déjà reconnaître).
+pub fn escape_cell(text: &str) -> String {
+    let line = format!("|{text}|");
+    let cells = split_cells(&line);
+    if cells.len() <= 1 {
+        return text.to_owned();
+    }
+    let mut out = text.to_owned();
+    // Positions des séparateurs, dans `text` (décalées du `|` initial).
+    let seps: Vec<usize> = cells[..cells.len() - 1].iter().map(|r| r.end - 1).collect();
+    for p in seps.into_iter().rev() {
+        out.insert(p, '\\');
+    }
+    out
+}
+
+/// Remplace le contenu de la case (`row`, `col`) et réécrit le tableau
+/// aligné. `None` si `text` n'est pas un tableau.
+pub fn set_cell(text: &str, row: usize, col: usize, content: &str) -> Option<String> {
+    let mut t = parse(text)?.table;
+    t.normalize();
+    if col >= t.cols() {
+        return None;
+    }
+    while t.rows.len() <= row {
+        t.rows.push(vec![String::new(); t.cols()]);
+    }
+    t.rows[row][col] = escape_cell(content.trim());
+    Some(t.to_markdown())
 }
 
 /// Applique une opération au tableau `text`, le curseur étant à l'octet
@@ -600,6 +642,22 @@ mod tests {
         let (t, c) = edit(&t, c, Op::PrevCell).unwrap();
         let p = parse(&t).unwrap();
         assert_eq!(cell_at(&t, &p, c), (2, 1, 0));
+    }
+
+    #[test]
+    fn sets_and_escapes_cells() {
+        let t = "| a | b |
+| --- | --- |
+| 1 | 2 |";
+        let out = set_cell(t, 1, 0, "x | y").unwrap();
+        assert_eq!(parse(&out).unwrap().table.rows[1], ["x \\| y", "2"]);
+        let out = set_cell(&out, 0, 1, "  ![p|80](a.png) ").unwrap();
+        assert_eq!(parse(&out).unwrap().table.rows[0], ["a", "![p|80](a.png)"]);
+        // Ligne de données absente : créée.
+        let out = set_cell(t, 3, 1, "z").unwrap();
+        assert_eq!(parse(&out).unwrap().table.body_rows(), 3);
+        assert_eq!(cell_start(t, 1, 1), Some(t.find("2").unwrap()));
+        assert!(set_cell("pas un tableau", 0, 0, "x").is_none());
     }
 
     #[test]

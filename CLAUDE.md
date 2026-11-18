@@ -197,41 +197,54 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
   `Area` avec un `id_salt` propre à l'élément (sinon la perte de focus de
   la saisie précédente ferme la nouvelle). Une carte de fiche supprimée est
   gardée mais masquée. Fichier illisible → tableau non enregistré.
-- **Édition en direct** (`enigma_core::live`, `app/reading.rs`, `Editor::body_ui`) :
-  plus de bascule Édition/Lecture. La fiche est découpée en unités (une
-  ligne, ou un tableau / bloc de code entier) ; toutes sont mises en forme
-  sauf l'unité active, montrée dans un seul `TextEdit` (même id) avec son
-  Markdown. Clic sur une unité → `ViewAction::EditAt(octet)` (position
-  retrouvée par `live::source_offset`) ; ↑/↓/←/→, Retour arrière et Suppr
-  aux bords passent à l'unité voisine (ou fusionnent les lignes),
-  Ctrl+Début/Fin vont aux extrémités ; Échap, un clic ailleurs dans la même
-  couche (pas dans un menu) ou le focus donné à un autre champ terminent
-  l'édition. Une fiche vide est toujours en édition. Unités et blocs
-  recalculés seulement si le texte change ; images via `egui_extras` (URI
-  `file:///C:/…` sous Windows, SVG rendu par resvg) ; tirer le coin d'une
-  image réécrit sa largeur (Ctrl+Z). Une ligne faite seulement d'images les
-  affiche côte à côte. Un paragraphe réduit à un lien vers un fichier local
-  = pièce jointe (`app/system_open.rs`). Cases de tâches cliquables. Dans
-  les tests, pas de `MultilineTextInput` tant que rien n'est en édition :
-  `Editor::edit_at_end()` / `edit_at(octet)`.
+- **Édition de la fiche** (`enigma_core::live`, `app/reading.rs`,
+  `Editor::body_ui`) : deux états. **Aperçu** : la fiche est découpée en
+  unités (ligne, tableau, bloc de code, encadré…), toutes mises en forme.
+  Un clic sur un élément (`ViewAction::EditAt(octet)`, position retrouvée
+  par `live::source_offset`) passe **toute la fiche en édition**
+  (`Editor::active` = segment actif ; `Some` = mode édition ; fiche vide :
+  toujours en édition). **Édition** : les unités sont regroupées en
+  segments (`reading::segments`) : `Run` (les unités de texte consécutives
+  fusionnées en un seul champ de saisie : sélection, Ctrl+A, listes… comme
+  un éditeur de texte), `Media` (ligne avec image, formule ou pièce jointe :
+  texte + aperçus, images redimensionnables), `Math` (`$$` multi-lignes),
+  `Diagram` (mermaid), `Embed` (`![[…]]`) : texte + rendu ; `Table` : pas
+  de texte brut, des **cases modifiables** (`Drags::table_ui(…, Some(id))`).
+  Un champ de saisie par segment (`Editor::seg_id(i)`), `activate(b)` donne
+  le focus au bon (ou à la bonne case : `Drags::pending_focus`). ↑/↓/←/→,
+  Retour arrière et Suppr aux bords passent au segment voisin, Alt+↑/↓
+  déplace la ligne. Échap, un clic hors de la zone de la fiche ou le focus
+  donné à un autre champ reviennent à l'aperçu ; `activated` évite de
+  terminer l'édition dans l'image où on vient de la (re)démarrer. Une
+  frappe qui change la structure (une ligne devient une image…) re-cible le
+  focus d'après le curseur. Unités et segments recalculés seulement si le
+  texte change ; images via `egui_extras` (URI `file:///C:/…` sous Windows,
+  SVG rendu par resvg) ; tirer le coin d'une image réécrit sa largeur
+  (Ctrl+Z). Une ligne faite seulement d'images les affiche côte à côte. Un
+  paragraphe réduit à un lien vers un fichier local = pièce jointe
+  (`app/system_open.rs`). Cases de tâches cliquables. Le surligneur garde un
+  cache par texte (plusieurs champs). Dans les tests : sans édition, pas de
+  `MultilineTextInput` ; `Editor::edit_at_end()` / `edit_at(octet)` ;
+  `focused_cell()`.
 - **Tableaux** (`enigma_core::table`) : un `|` dans `[[A|type]]`, dans du
   code, échappé ou dans une légende d'image `![a|300](…)` ne sépare pas les
   cellules (on peut donc mettre des images côte à côte dans un tableau).
-  Chaque frappe réaligne les colonnes (largeur en caractères, police à
-  chasse fixe en édition) en gardant le curseur dans sa cellule et les
-  espaces de fin de cette cellule. Tab/Maj+Tab/Entrée : cellule suivante /
-  précédente / ligne suivante (ajoute une ligne à la fin). Barre d'outils
-  en édition ; en lecture, poignée au coin bas-droit pour ajouter/retirer
-  lignes et colonnes ; cases vides toujours visibles.
+  En édition, chaque case est un champ de saisie (`add_sized` : une grille
+  limite la largeur d'une case à celle de la colonne de l'image
+  précédente) ; la frappe réécrit le tableau aligné (`table::set_cell`,
+  `|` protégés par `escape_cell`) ; `Drags::cell_buf` garde le texte en
+  cours (espaces de fin compris, que la réécriture supprime). Tab/Maj+Tab/
+  Entrée : case suivante / précédente / ligne suivante (ajoute une ligne à
+  la fin), ↑/↓ : case au-dessus / en dessous. Barre d'outils (agit sur
+  `last_cell`, un clic sur un bouton prenant le focus à la case) et poignée
+  au coin bas-droit pour ajouter/retirer lignes et colonnes ; cases vides
+  toujours visibles. Colonnes et lignes ont la taille de leur contenu
+  (aucune hauteur mémorisée ; les zones cliquables des cases en lecture
+  viennent des rectangles de l'image précédente, posés sous le contenu).
 - **Apparence** (`app/theme.rs`) : angles droits partout, contours 1 px,
   marges de boutons larges, gris neutres et accent bleu (`theme::accent`,
   à utiliser plutôt que `selection.stroke`, qui est la couleur du texte
   sélectionné).
-- **Sélection sur plusieurs lignes** : l'unité active peut couvrir
-  plusieurs unités (`Editor::active` = plage de la première à la
-  dernière) ; glisser (`drag_anchor`, rectangles des unités de l'image
-  précédente), Maj+clic, Maj+flèches aux bords, Ctrl+A. Sans sélection,
-  seule l'unité du curseur reste active.
 - **Syntaxe enrichie** : `[[Fiche#Section]]`, `[[Fiche#^id]]`
   (`enigma_core::sections`, `WikiLink::section`) ; `![[Fiche…]]` seul sur
   une ligne = insertion (contenu reconstruit par `reading::build`, deux

@@ -20,7 +20,7 @@ use crate::completion::{self, ItemKind, Nav, Popup};
 use crate::highlight::Highlighter;
 use crate::notices::Notices;
 use crate::quick_add::{self, NewItem, QuickAdd};
-use crate::reading::{self, Preview, ViewAction};
+use crate::reading::{self, Preview, SegKind, ViewAction};
 
 /// État complet annulable d'une fiche (le titre est exclu : il ne change
 /// que par renommage).
@@ -65,9 +65,13 @@ pub struct Editor {
     last_galley: Option<Arc<egui::Galley>>,
     /// Position de ce texte à l'écran.
     last_galley_pos: egui::Pos2,
-    /// Sélection à la souris commencée à cet octet (glisser sur plusieurs
-    /// lignes : elles passent toutes en édition).
-    drag_anchor: Option<usize>,
+    /// Dernière case de tableau modifiée (début du tableau, ligne, colonne) :
+    /// la barre d'outils agit dessus même si un clic sur un bouton a pris le
+    /// focus.
+    last_cell: Option<(usize, usize, usize)>,
+    /// Un segment a été activé pendant cette image (le focus n'a pas encore
+    /// changé de main : ne pas terminer l'édition).
+    activated: bool,
     /// Position verticale de chaque unité à l'image précédente.
     unit_rects: Vec<(Range<usize>, egui::Rangef)>,
     /// Faire défiler jusqu'au texte en édition (résultat de recherche…).
@@ -420,6 +424,71 @@ fn table_toolbar(ui: &mut egui::Ui) -> Option<table::Op> {
     op
 }
 
+/// Champ de saisie d'un segment de texte : Markdown mis en forme pendant la
+/// frappe (ou police fixe pour une formule / un diagramme), fond et barre
+/// d'accent quand il a le focus. Rend la sortie du champ et le texte.
+#[allow(clippy::too_many_arguments)]
+fn seg_text_edit(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    body: &str,
+    range: Range<usize>,
+    mono: bool,
+    highlighter: &mut Highlighter,
+    project: &Project,
+    hint: bool,
+    popup_open: bool,
+) -> (egui::text_edit::TextEditOutput, String) {
+    let mut buf = body[range].to_owned();
+    let visuals = ui.visuals().clone();
+    let mut layouter = |ui: &egui::Ui, b: &dyn egui::TextBuffer, wrap_width: f32| {
+        let mut job = if mono {
+            mono_job(b.as_str(), UnitKind::Math, &visuals)
+        } else {
+            highlighter.job(b.as_str(), project, &visuals)
+        };
+        job.wrap.max_width = wrap_width;
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let mut te = egui::TextEdit::multiline(&mut buf)
+        .id(id)
+        .layouter(&mut layouter)
+        .desired_width(f32::INFINITY)
+        .desired_rows(1)
+        .frame(egui::Frame::NONE)
+        // Tab : indentation de liste ; Échap ferme les suggestions sans
+        // faire perdre le focus quand elles sont ouvertes.
+        .event_filter(egui::EventFilter {
+            tab: true,
+            horizontal_arrows: true,
+            vertical_arrows: true,
+            escape: popup_open,
+        });
+    if hint {
+        te = te.hint_text(
+            "Écrivez ici… Markdown accepté. Tapez [[ pour lier une fiche, / pour insérer, \
+             Ctrl+clic sur un lien pour l'ouvrir.",
+        );
+    }
+    let output = te.show(ui);
+    if output.response.has_focus() {
+        let r = output.response.rect.expand2(egui::vec2(6.0, 1.0));
+        ui.painter().set(
+            bg,
+            egui::Shape::Vec(vec![
+                egui::Shape::rect_filled(r, 0.0, visuals.extreme_bg_color),
+                egui::Shape::rect_filled(
+                    egui::Rect::from_min_size(r.min, egui::vec2(2.0, r.height())),
+                    0.0,
+                    crate::theme::accent(&visuals),
+                ),
+            ]),
+        );
+    }
+    (output, buf)
+}
+
 /// Texte d'un tableau ou d'un bloc de code en cours de modification :
 /// police à chasse fixe (colonnes alignées), syntaxe atténuée.
 fn mono_job(text: &str, kind: UnitKind, v: &egui::Visuals) -> egui::text::LayoutJob {
@@ -481,7 +550,8 @@ impl Editor {
             active: None,
             last_galley: None,
             last_galley_pos: egui::Pos2::ZERO,
-            drag_anchor: None,
+            last_cell: None,
+            activated: false,
             unit_rects: Vec::new(),
             reveal: false,
             find: None,
@@ -774,10 +844,13 @@ impl Editor {
         edited
     }
 
-    /// Corps de la fiche, toujours mis en forme ; seule l'unité en cours de
-    /// modification (ligne, tableau, bloc de code) montre son Markdown, mis
-    /// en forme pendant la frappe. Suggestions de liens, Ctrl+clic pour
-    /// suivre un lien depuis le texte.
+    /// Corps de la fiche. Au repos, tout est mis en forme (aperçu). Dès qu'on
+    /// modifie un élément, **toute la fiche passe en édition** : le texte
+    /// Markdown est partout modifiable (mis en forme pendant la frappe), et
+    /// les images, formules, diagrammes, insertions `![[…]]` et tableaux
+    /// gardent leur rendu à côté de leur texte ; les tableaux se modifient
+    /// dans leurs cases, avec leur poignée et leur barre d'outils.
+    /// Échap, ou un clic hors de la fiche, revient à l'aperçu.
     pub fn body_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -786,9 +859,9 @@ impl Editor {
         notices: &mut Notices,
     ) -> BodyOutcome {
         let mut outcome = BodyOutcome::default();
-        let te_id = egui::Id::unique(("body", self.id.as_str(), self.salt));
         let ctx = ui.ctx().clone();
         self.preview.sync(&self.body);
+        self.activated = false;
 
         // 1. Édition demandée (insertion, mise en forme, annuler…).
         if let Some(ci) = self.pending_cursor.take() {
@@ -797,17 +870,22 @@ impl Editor {
                 .pending_anchor
                 .take()
                 .map(|a| char_to_byte(&self.body, a));
-            self.activate(&ctx, te_id, b, anchor);
+            self.activate(&ctx, b, anchor);
         }
         self.resolve_active();
-        let focused = ctx.memory(|m| m.has_focus(te_id));
+        // Focus de l'image précédente (les cases le renouvellent pendant le
+        // dessin).
+        let cell_focus = self.preview.drags.focused_cell.take();
+        self.preview.drags.cell_ids.clear();
+        let focused_seg = self.focused_seg(&ctx);
+        let focused = focused_seg.is_some() || cell_focus.is_some();
 
         if self.find.is_some() {
-            outcome.edited |= self.find_ui(ui, &ctx, te_id, project, now_ms);
+            outcome.edited |= self.find_ui(ui, &ctx, project, now_ms);
         }
 
-        // 2. Touches consommées avant le TextEdit : suggestions, passage
-        //    d'une unité à l'autre, cellules de tableau.
+        // 2. Touches consommées avant les champs de saisie : suggestions,
+        //    passage d'un segment à l'autre, cases de tableau.
         if focused && let Some(sp) = &self.slash {
             let n = crate::slash::items(&sp.query).len().max(1);
             let nav = ctx.input_mut(|i| {
@@ -869,40 +947,49 @@ impl Editor {
                 outcome.edited |= self.navigate(nav, project, now_ms, notices);
             }
         } else if focused {
-            outcome.edited |= self.unit_keys(&ctx, te_id, project, now_ms);
+            outcome.edited |= self.seg_keys(&ctx, focused_seg, cell_focus, project, now_ms);
         }
         if let Some(ci) = self.pending_cursor.take() {
             let b = char_to_byte(&self.body, ci);
-            self.activate(&ctx, te_id, b, None);
+            self.activate(&ctx, b, None);
         }
 
-        // 3. Les unités : mises en forme, sauf celle qu'on modifie.
+        // 3. Dessin : aperçu partout, ou segments modifiables.
         let units = std::mem::take(&mut self.preview.units);
-        let active = self.active.clone();
+        let segs = self.preview.segs.clone();
+        let editing = self.active.is_some();
+        let active_start = self.active.as_ref().map(|a| a.start);
+        let seg_ids: Vec<egui::Id> = (0..segs.len()).map(|i| self.seg_id(i)).collect();
+        let cell_base = self.cell_base();
         let popup_open = self.popup.is_some();
         let note_path = project
             .entry(&self.id)
             .map(|e| e.path.clone())
             .unwrap_or_default();
         let mut action: Option<ViewAction> = None;
-        let mut edit: Option<(
+        type EditOut = (
             egui::text_edit::TextEditOutput,
             String,
             Range<usize>,
-            UnitKind,
-        )> = None;
-        let mut active_rect: Option<egui::Rect> = None;
+            SegKind,
+            usize,
+        );
+        // Le champ qui a le focus ; à défaut le segment actif (un menu qui
+        // s'ouvre prend le focus au champ).
+        let mut edit: Option<EditOut> = None;
+        let mut edit_active: Option<EditOut> = None;
         let mut table_op: Option<table::Op> = None;
         let mut menu = |ui: &mut egui::Ui| format_menu(ui, false);
         let mut unit_rects: Vec<(Range<usize>, egui::Rangef)> = Vec::new();
         let reveal = std::mem::take(&mut self.reveal);
+        let scroll_rect;
         {
             let project_ref: &Project = project;
             let body = &self.body;
             let highlighter = &mut self.highlighter;
             let drags = &mut self.preview.drags;
             let empty = body.is_empty();
-            egui::ScrollArea::vertical()
+            let scroll = egui::ScrollArea::vertical()
                 .id_salt("body_scroll")
                 .auto_shrink(false)
                 .show(ui, |ui| {
@@ -913,168 +1000,172 @@ impl Editor {
                         })
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 3.0;
-                            // Section repliée : ses unités sont sautées jusqu'au
-                            // titre suivant de même niveau ou plus haut.
-                            let mut fold_level: Option<usize> = None;
-                            for cu in &units {
-                                let range = cu.unit.range.clone();
-                                let heading = match &cu.content {
-                                    reading::Content::Line { source, .. }
-                                        if source.starts_with('#') =>
+                            if !editing {
+                                // Aperçu. Section repliée : ses unités sont
+                                // sautées jusqu'au titre suivant de même
+                                // niveau ou plus haut.
+                                let mut fold_level: Option<usize> = None;
+                                for cu in &units {
+                                    let range = cu.unit.range.clone();
+                                    let heading = match &cu.content {
+                                        reading::Content::Line { source, .. }
+                                            if source.starts_with('#') =>
+                                        {
+                                            let level =
+                                                source.bytes().take_while(|&b| b == b'#').count();
+                                            source[level..].starts_with(' ').then(|| {
+                                                (
+                                                    level,
+                                                    source[level..]
+                                                        .trim()
+                                                        .trim_end_matches('#')
+                                                        .trim()
+                                                        .to_owned(),
+                                                )
+                                            })
+                                        }
+                                        _ => None,
+                                    };
+                                    if let (Some(l), Some((h, _))) = (fold_level, &heading)
+                                        && *h <= l
                                     {
-                                        let level =
-                                            source.bytes().take_while(|&b| b == b'#').count();
-                                        source[level..].starts_with(' ').then(|| {
-                                            (
-                                                level,
-                                                source[level..]
-                                                    .trim()
-                                                    .trim_end_matches('#')
-                                                    .trim()
-                                                    .to_owned(),
-                                            )
-                                        })
+                                        fold_level = None;
                                     }
-                                    _ => None,
-                                };
-                                if let (Some(l), Some((h, _))) = (fold_level, &heading)
-                                    && *h <= l
-                                {
-                                    fold_level = None;
-                                }
-                                let touches_active = active.as_ref().is_some_and(|a| {
-                                    a.start <= range.start && range.start <= a.end
-                                });
-                                if fold_level.is_some() && !touches_active {
-                                    continue;
-                                }
-                                if let Some((h, text)) = &heading
-                                    && drags.folded.contains(text)
-                                {
-                                    fold_level = Some(*h);
-                                }
-                                let top = ui.cursor().top();
-                                let covered = active
-                                    .as_ref()
-                                    .is_some_and(|a| a.start <= range.start && range.end <= a.end);
-                                if !covered {
-                                    if action.is_none() {
-                                        action = drags.unit_ui(
-                                            ui,
-                                            cu,
-                                            project_ref,
-                                            &note_path,
-                                            &mut menu,
-                                        );
-                                    } else {
+                                    if fold_level.is_some() {
+                                        continue;
+                                    }
+                                    if let Some((h, text)) = &heading
+                                        && drags.folded.contains(text)
+                                    {
+                                        fold_level = Some(*h);
+                                    }
+                                    let top = ui.cursor().top();
+                                    let a =
                                         drags.unit_ui(ui, cu, project_ref, &note_path, &mut menu);
+                                    if action.is_none() {
+                                        action = a;
                                     }
                                     unit_rects
                                         .push((range, egui::Rangef::new(top, ui.cursor().top())));
-                                    continue;
                                 }
-                                let Some(range) = active.clone().filter(|a| a.start == range.start)
-                                else {
-                                    continue;
-                                };
-                                // Plusieurs unités sélectionnées : texte Markdown ordinaire.
-                                let single = range == cu.unit.range;
-                                let kind = if single { cu.unit.kind } else { UnitKind::Line };
-                                let scope =
-                                    ui.scope(|ui| {
-                                        if kind == UnitKind::Table {
-                                            table_op = table_toolbar(ui);
-                                        }
-                                        let mut buf = body[range.clone()].to_owned();
-                                        let visuals = ui.visuals().clone();
-                                        let mut layouter =
-                                |ui: &egui::Ui, b: &dyn egui::TextBuffer, wrap_width: f32| {
-                                    let mut job = match kind {
-                                        UnitKind::Line | UnitKind::Callout | UnitKind::Comment => {
-                                            highlighter.job(b.as_str(), project_ref, &visuals)
-                                        }
-                                        _ => mono_job(b.as_str(), kind, &visuals),
-                                    };
-                                    job.wrap.max_width = wrap_width;
-                                    ui.fonts_mut(|f| f.layout_job(job))
-                                };
-                                        let bg = ui.painter().add(egui::Shape::Noop);
-                                        let mut te = egui::TextEdit::multiline(&mut buf)
-                                            .id(te_id)
-                                            .layouter(&mut layouter)
-                                            .desired_width(f32::INFINITY)
-                                            .desired_rows(1)
-                                            .frame(egui::Frame::NONE)
-                                            // Tab : cellules de tableau ou indentation ;
-                                            // Échap ferme les suggestions sans faire
-                                            // perdre le focus quand elles sont ouvertes.
-                                            .event_filter(egui::EventFilter {
-                                                tab: true,
-                                                horizontal_arrows: true,
-                                                vertical_arrows: true,
-                                                escape: popup_open,
-                                            });
-                                        if empty {
-                                            te = te.hint_text(
-                                    "Écrivez ici… Markdown accepté. Tapez [[ pour lier une \
-                                     fiche, Ctrl+clic sur un lien pour l'ouvrir.",
-                                );
-                                        }
-                                        let output = te.show(ui);
-                                        if reveal {
-                                            ui.scroll_to_rect(
-                                                output.response.rect,
-                                                Some(egui::Align::Center),
-                                            );
-                                        }
-                                        let r = output.response.rect.expand2(egui::vec2(6.0, 2.0));
-                                        ui.painter().set(
-                                            bg,
-                                            egui::Shape::Vec(vec![
-                                                egui::Shape::rect_filled(
-                                                    r,
-                                                    0.0,
-                                                    visuals.extreme_bg_color,
-                                                ),
-                                                egui::Shape::rect_filled(
-                                                    egui::Rect::from_min_size(
-                                                        r.min,
-                                                        egui::vec2(2.0, r.height()),
-                                                    ),
-                                                    0.0,
-                                                    crate::theme::accent(&visuals),
-                                                ),
-                                            ]),
-                                        );
-                                        // Images de la ligne, toujours visibles et
-                                        // redimensionnables pendant la modification.
-                                        if single
-                                            && cu.has_images()
-                                            && let reading::Content::Line { blocks, .. } =
-                                                &cu.content
+                            } else {
+                                for (i, seg) in segs.iter().enumerate() {
+                                    let top = ui.cursor().top();
+                                    let cu = &units[seg.units.start];
+                                    if seg.kind == SegKind::Table {
+                                        table_op = table_toolbar(ui).or(table_op);
+                                        if let reading::Content::Table { cols, rows } = &cu.content
+                                            && let Some(a) = drags.table_ui(
+                                                ui,
+                                                &seg.range,
+                                                *cols,
+                                                rows,
+                                                project_ref,
+                                                &note_path,
+                                                &mut menu,
+                                                Some(cell_base),
+                                            )
                                         {
-                                            ui.horizontal_wrapped(|ui| {
-                                                for b in blocks {
-                                                    if let enigma_core::render::Block::Image(img) =
-                                                        b
-                                                        && let Some(a) = drags.image_ui(
-                                                            ui,
-                                                            img,
-                                                            project_ref,
-                                                            &note_path,
-                                                        )
-                                                    {
-                                                        action = Some(a);
-                                                    }
-                                                }
-                                            });
+                                            action = Some(a);
                                         }
-                                        (output, buf)
-                                    });
-                                active_rect = Some(scope.response.rect);
-                                unit_rects.push((range.clone(), scope.response.rect.y_range()));
-                                let (output, buf) = scope.inner;
-                                edit = Some((output, buf, range, kind));
+                                    } else {
+                                        let mono = matches!(seg.kind, SegKind::Math | SegKind::Diagram);
+                                        let (output, buf) = seg_text_edit(
+                                            ui,
+                                            seg_ids[i],
+                                            body,
+                                            seg.range.clone(),
+                                            mono,
+                                            highlighter,
+                                            project_ref,
+                                            empty && i == 0,
+                                            popup_open,
+                                        );
+                                        if reveal
+                                            && active_start == Some(seg.range.start)
+                                            && let Some(r) = output.cursor_range
+                                        {
+                                            let rect = output
+                                                .galley
+                                                .pos_from_cursor(r.primary)
+                                                .translate(output.galley_pos.to_vec2());
+                                            ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                        }
+                                        // Aperçus à côté du texte.
+                                        match (&seg.kind, &cu.content) {
+                                            (SegKind::Media, reading::Content::Line { blocks, .. }) => {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    for b in blocks {
+                                                        match b {
+                                                            enigma_core::render::Block::Image(img) => {
+                                                                if let Some(a) = drags.image_ui(
+                                                                    ui,
+                                                                    img,
+                                                                    project_ref,
+                                                                    &note_path,
+                                                                ) {
+                                                                    action = Some(a);
+                                                                }
+                                                            }
+                                                            enigma_core::render::Block::Math(latex) => {
+                                                                drags.math_image(ui, latex, true);
+                                                            }
+                                                            enigma_core::render::Block::Attachment {
+                                                                label,
+                                                                src,
+                                                            } => {
+                                                                if let Some(a) =
+                                                                    reading::attachment_ui(
+                                                                        ui,
+                                                                        label,
+                                                                        src,
+                                                                        project_ref,
+                                                                        &note_path,
+                                                                        seg.range.start,
+                                                                    )
+                                                                    && matches!(
+                                                                        a,
+                                                                        ViewAction::OpenFile(_)
+                                                                    )
+                                                                {
+                                                                    action = Some(a);
+                                                                }
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                            (SegKind::Math, reading::Content::Math { latex, .. }) => {
+                                                ui.vertical_centered(|ui| {
+                                                    drags.math_image(ui, latex, true);
+                                                });
+                                            }
+                                            (SegKind::Diagram, reading::Content::Diagram { src, .. }) => {
+                                                drags.diagram_view(ui, src);
+                                            }
+                                            (SegKind::Embed, _) => {
+                                                if let Some(a @ (ViewAction::OpenTitle(..)
+                                                | ViewAction::OpenFile(_))) =
+                                                    drags.unit_ui(ui, cu, project_ref, &note_path, &mut menu)
+                                                {
+                                                    action = Some(a);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        if output.response.has_focus() || output.response.changed() {
+                                            edit = Some((output, buf, seg.range.clone(), seg.kind, i));
+                                        } else if active_start == Some(seg.range.start) {
+                                            edit_active =
+                                                Some((output, buf, seg.range.clone(), seg.kind, i));
+                                        }
+                                    }
+                                    unit_rects.push((
+                                        seg.range.clone(),
+                                        egui::Rangef::new(top, ui.cursor().top()),
+                                    ));
+                                }
                             }
                             // Sous le texte : clic = écrire à la fin.
                             let rest = ui.available_size_before_wrap();
@@ -1087,41 +1178,66 @@ impl Editor {
                             }
                         });
                 });
+            scroll_rect = scroll.inner_rect;
         }
         self.preview.units = units;
         self.unit_rects = unit_rects;
 
-        // 4. Résultat de la modification.
+        // Case de tableau qui a le focus : mémoire pour la barre d'outils,
+        // segment actif.
+        if let Some(cell) = self.preview.drags.focused_cell {
+            self.last_cell = Some(cell);
+            if let Some(seg) = segs.iter().find(|s| s.range.start == cell.0) {
+                self.active = Some(seg.range.clone());
+            }
+        }
+        if self
+            .preview
+            .drags
+            .cell_buf
+            .as_ref()
+            .is_some_and(|(k, _)| Some(*k) != self.preview.drags.focused_cell)
+        {
+            self.preview.drags.cell_buf = None;
+        }
+        // Case modifiée : le tableau est réécrit (colonnes alignées).
+        if let Some(ch) = self.preview.drags.cell_change.take()
+            && let Some(t) = self
+                .body
+                .get(ch.range.clone())
+                .and_then(|t| table::set_cell(t, ch.r, ch.c, &ch.text))
+        {
+            self.body.replace_range(ch.range, &t);
+            self.commit_body(project, EditKind::Typing, now_ms);
+            outcome.edited = true;
+        }
+
+        // 4. Résultat de la modification d'un champ de texte.
         let mut cursor_byte = None;
-        if let Some((output, buf, range, kind)) = edit {
+        if let Some((output, buf, range, kind, idx)) = edit.or(edit_active) {
             self.last_galley = Some(output.galley.clone());
             self.last_galley_pos = output.galley_pos;
+            self.active = Some(range.clone());
             let local = |c: usize| range.start + char_to_byte(&buf, c);
             let sel = output
                 .cursor_range
                 .map(|r| (local(r.primary.index.0), local(r.secondary.index.0)));
             if output.response.changed() {
                 self.body.replace_range(range.clone(), &buf);
-                let mut cursor = sel.map_or(range.start + buf.len(), |(p, _)| p);
-                let mut moved = false;
-                if kind == UnitKind::Table
-                    && let Some((t, c)) = table::edit(&buf, cursor - range.start, table::Op::Format)
-                    && t != buf
-                {
-                    self.body
-                        .replace_range(range.start..range.start + buf.len(), &t);
-                    cursor = range.start + c;
-                    moved = true;
-                }
+                let cursor = sel.map_or(range.start + buf.len(), |(p, _)| p);
                 self.commit_body(project, EditKind::Typing, now_ms);
                 outcome.edited = true;
                 self.preview.sync(&self.body);
-                let idx = self.preview.unit_at(cursor);
-                let now = self.preview.units[idx].unit.range.clone();
-                if moved || now.start != range.start {
-                    self.activate(&ctx, te_id, cursor, None);
-                } else {
-                    self.active = Some(now);
+                // La frappe peut changer la structure (une ligne devient une
+                // image, un tableau…) : le focus suit alors le curseur.
+                let now_idx = self.preview.seg_at(cursor);
+                match self.preview.segs.get(now_idx).cloned() {
+                    Some(now)
+                        if now_idx == idx && now.kind == kind && now.range.start == range.start =>
+                    {
+                        self.active = Some(now.range);
+                    }
+                    _ => self.activate(&ctx, cursor, None),
                 }
                 self.last_cursor = Some(cursor);
                 self.last_sel = Some(cursor..cursor);
@@ -1130,28 +1246,6 @@ impl Editor {
                 self.last_cursor = Some(p);
                 self.last_sel = Some(p.min(s)..p.max(s));
                 cursor_byte = (p == s).then_some(p);
-                // Sélection retirée : seule la ligne du curseur reste en
-                // édition.
-                let idx = self.preview.unit_at(p);
-                let single = self.preview.units.get(idx).map(|u| u.unit.range.clone());
-                if p == s
-                    && self.drag_anchor.is_none()
-                    && single.as_ref().is_some_and(|u| *u != range)
-                    && !ctx.input(|i| i.pointer.any_down())
-                {
-                    self.activate(&ctx, te_id, p, None);
-                }
-            }
-            // Glisser depuis le texte au-delà de ses bords : les lignes
-            // survolées passent en édition.
-            if output.response.dragged()
-                && self.drag_anchor.is_none()
-                && let Some((_, s)) = sel
-                && ctx
-                    .input(|i| i.pointer.interact_pos())
-                    .is_some_and(|p| !output.response.rect.y_range().contains(p.y))
-            {
-                self.drag_anchor = Some(s);
             }
 
             // Clic droit : mise en forme de la sélection, ou insertions.
@@ -1189,7 +1283,7 @@ impl Editor {
                 .is_some_and(|(r, p)| r.contains(p));
             let slash_ctx = cursor_byte
                 .filter(|_| self.popup.is_none() && output.response.has_focus())
-                .filter(|_| matches!(kind, UnitKind::Line | UnitKind::Callout))
+                .filter(|_| kind == SegKind::Run)
                 .and_then(|b| crate::slash::context(&self.body, b));
             match slash_ctx {
                 Some((start, query))
@@ -1227,9 +1321,11 @@ impl Editor {
                     }
                 }
             }
+        }
 
-            // Fin de la modification : clic ailleurs dans la fiche (pas
-            // dans un menu), Échap, ou focus donné à un autre champ.
+        // Fin de l'édition (retour à l'aperçu) : Échap, clic hors de la
+        // fiche (pas dans un menu), ou focus donné à un autre champ.
+        if editing && !self.activated && self.pending_cursor.is_none() && !self.body.is_empty() {
             let layer = ui.layer_id();
             let press = ctx.input(|i| {
                 i.pointer
@@ -1238,27 +1334,19 @@ impl Editor {
                     .flatten()
             });
             let pressed_outside = press.is_some_and(|p| {
-                !active_rect.is_some_and(|r| r.contains(p))
-                    && ctx.layer_id_at(p).is_none_or(|l| l == layer)
+                !scroll_rect.contains(p) && ctx.layer_id_at(p).is_none_or(|l| l == layer)
             });
             let escape = !popup_open && ctx.input(|i| i.key_pressed(egui::Key::Escape));
-            let elsewhere = ctx.memory(|m| m.focused().is_some_and(|f| f != te_id));
-            if (pressed_outside || escape || elsewhere) && self.pending_cursor.is_none() {
+            let elsewhere = ctx.memory(|m| {
+                m.focused().is_some_and(|f| {
+                    !seg_ids.contains(&f) && !self.preview.drags.cell_ids.contains(&f)
+                })
+            });
+            if pressed_outside || escape || elsewhere {
                 self.active = None;
                 self.popup = None;
-            }
-        }
-
-        // Sélection à la souris sur plusieurs lignes.
-        if let Some(anchor) = self.drag_anchor {
-            if ctx.input(|i| i.pointer.primary_down()) {
-                if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
-                    let b = self.byte_at_pointer(p, anchor);
-                    self.activate(&ctx, te_id, b, Some(anchor));
-                    ctx.request_repaint();
-                }
-            } else {
-                self.drag_anchor = None;
+                self.slash = None;
+                self.preview.drags.cell_buf = None;
             }
         }
 
@@ -1288,16 +1376,21 @@ impl Editor {
         }
 
         // 6. Barre d'outils du tableau en cours de modification.
-        if let (Some(op), Some(range)) = (table_op, self.active.clone()) {
-            let cursor = self
-                .last_cursor
-                .filter(|c| range.contains(c) || *c == range.end)
-                .unwrap_or(range.start);
-            if let Some((t, c)) = table::edit(&self.body[range.clone()], cursor - range.start, op) {
-                self.body.replace_range(range.clone(), &t);
+        if let (Some(op), Some((start, r, c))) = (table_op, self.last_cell)
+            && let Some(seg) = self
+                .preview
+                .segs
+                .iter()
+                .find(|s| s.range.start == start)
+                .cloned()
+        {
+            let text = self.body[seg.range.clone()].to_owned();
+            let cursor = table::cell_start(&text, r, c).unwrap_or(0);
+            if let Some((t, pos)) = table::edit(&text, cursor, op) {
+                self.body.replace_range(seg.range.clone(), &t);
                 self.commit_body(project, EditKind::Discrete, now_ms);
                 outcome.edited = true;
-                self.activate(&ctx, te_id, range.start + c, None);
+                self.activate(&ctx, seg.range.start + pos, None);
             }
         }
 
@@ -1309,12 +1402,9 @@ impl Editor {
                     .input(|i| i.modifiers.shift)
                     .then(|| self.selection_anchor())
                     .flatten();
-                self.activate(&ctx, te_id, b, anchor);
+                self.activate(&ctx, b, anchor);
             }
-            Some(ViewAction::DragFrom(b)) => {
-                self.activate(&ctx, te_id, b, None);
-                self.drag_anchor = Some(b);
-            }
+            Some(ViewAction::DragFrom(b)) => self.activate(&ctx, b, None),
             Some(ViewAction::OpenTitle(title, section)) => {
                 outcome.open = self.open_or_create(&title, project, notices);
                 outcome.open_section = section;
@@ -1363,6 +1453,21 @@ impl Editor {
         }
         outcome.insert_template = std::mem::take(&mut self.want_template);
         outcome
+    }
+
+    /// Identifiant du champ de saisie du segment `i`.
+    fn seg_id(&self, i: usize) -> egui::Id {
+        egui::Id::unique(("body", self.id.as_str(), self.salt, i))
+    }
+
+    /// Base des identifiants des cases de tableau.
+    fn cell_base(&self) -> egui::Id {
+        egui::Id::unique(("cell", self.id.as_str(), self.salt))
+    }
+
+    /// Segment dont le champ de saisie a le focus.
+    fn focused_seg(&self, ctx: &egui::Context) -> Option<usize> {
+        (0..self.preview.segs.len()).find(|&i| ctx.memory(|m| m.has_focus(self.seg_id(i))))
     }
 
     /// Applique la commande « / » numéro `i` : retire `/requête` puis
@@ -1435,7 +1540,6 @@ impl Editor {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        te_id: egui::Id,
         project: &mut Project,
         now_ms: u64,
     ) -> bool {
@@ -1526,7 +1630,7 @@ impl Editor {
             Some(Act::Go(i)) => {
                 f.current = i;
                 if let Some(r) = matches.get(i) {
-                    self.activate(ctx, te_id, r.end, Some(r.start));
+                    self.activate(ctx, r.end, Some(r.start));
                     self.last_cursor = Some(r.end);
                     self.last_sel = Some(r.clone());
                     self.reveal = true;
@@ -1540,7 +1644,7 @@ impl Editor {
                 self.body.replace_range(r.clone(), &replace);
                 self.commit_body(project, EditKind::Discrete, now_ms);
                 let next = r.start + replace.len();
-                self.activate(ctx, te_id, next, Some(r.start));
+                self.activate(ctx, next, Some(r.start));
                 self.reveal = true;
                 true
             }
@@ -1656,62 +1760,73 @@ impl Editor {
         }
     }
 
-    /// Modifie l'unité contenant l'octet `b`, curseur à cet endroit. Avec
-    /// `anchor` : sélection depuis cet octet, toutes les unités entre les
-    /// deux passent en édition.
-    fn activate(&mut self, ctx: &egui::Context, te_id: egui::Id, b: usize, anchor: Option<usize>) {
+    /// Passe la fiche en édition, curseur à l'octet `b` (dans une case si
+    /// c'est un tableau). Avec `anchor` (dans le même segment) : sélection
+    /// depuis cet octet.
+    fn activate(&mut self, ctx: &egui::Context, b: usize, anchor: Option<usize>) {
         self.preview.sync(&self.body);
         let mut b = b.min(self.body.len());
         while !self.body.is_char_boundary(b) {
             b -= 1;
         }
-        let idx = self.preview.unit_at(b);
-        let ia = anchor.map_or(idx, |a| self.preview.unit_at(a.min(self.body.len())));
-        let (Some(first), Some(last)) = (
-            self.preview.units.get(idx.min(ia)),
-            self.preview.units.get(idx.max(ia)),
-        ) else {
+        if self.preview.segs.is_empty() {
             return;
-        };
-        let range = first.unit.range.start..last.unit.range.end;
+        }
+        let idx = self.preview.seg_at(b);
+        let seg = self.preview.segs[idx].clone();
+        self.activated = true;
+        self.active = Some(seg.range.clone());
+        self.last_cursor = Some(b);
+        if seg.kind == SegKind::Table {
+            let text = &self.body[seg.range.clone()];
+            if let Some(p) = table::parse(text) {
+                let local = b.saturating_sub(seg.range.start).min(text.len());
+                let (line, col, off) = table::cell_at(text, &p, local);
+                let row =
+                    table::row_of_line(line).unwrap_or(1.min(p.table.rows.len().saturating_sub(1)));
+                self.preview.drags.pending_focus = Some((seg.range.start, row, col, off));
+                self.last_cell = Some((seg.range.start, row, col));
+            }
+            return;
+        }
         let local = |x: usize| {
-            let x = x.clamp(range.start, range.end);
+            let x = x.clamp(seg.range.start, seg.range.end);
             self.body
-                .get(range.start..x)
+                .get(seg.range.start..x)
                 .map_or(0, |s| s.chars().count())
         };
         let cursor = egui::text::CCursor::new(local(b));
-        let sel = match anchor.map(local) {
+        let sel = match anchor
+            .filter(|a| (seg.range.start..=seg.range.end).contains(a))
+            .map(local)
+        {
             Some(a) if a != cursor.index.0 => {
                 egui::text::CCursorRange::two(egui::text::CCursor::new(a), cursor)
             }
             _ => egui::text::CCursorRange::one(cursor),
         };
-        let mut state = egui::TextEdit::load_state(ctx, te_id).unwrap_or_default();
+        let id = self.seg_id(idx);
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
         state.cursor.set_char_range(Some(sel));
-        state.store(ctx, te_id);
-        ctx.memory_mut(|m| m.request_focus(te_id));
-        self.active = Some(range);
-        self.last_cursor = Some(b);
+        state.store(ctx, id);
+        ctx.memory_mut(|m| m.request_focus(id));
     }
 
-    /// Recale l'unité modifiée après un changement venu d'ailleurs
-    /// (annuler, rechargement…). Fiche vide : toujours modifiable.
+    /// Recale le segment actif après un changement venu d'ailleurs
+    /// (annuler, rechargement…). Fiche vide : toujours en édition.
     fn resolve_active(&mut self) {
         if self.body.is_empty() {
             self.active = Some(0..0);
             return;
         }
         if let Some(r) = self.active.clone() {
-            let units = &self.preview.units;
-            let ok = units.iter().any(|u| u.unit.range.start == r.start)
-                && units.iter().any(|u| u.unit.range.end == r.end);
-            if !ok {
-                let len = self.body.len();
-                let a = units.get(self.preview.unit_at(r.start.min(len)));
-                let b = units.get(self.preview.unit_at(r.end.min(len)));
-                self.active = a.zip(b).map(|(a, b)| a.unit.range.start..b.unit.range.end);
-            }
+            let segs = &self.preview.segs;
+            self.active = match segs.iter().find(|s| s.range.start == r.start) {
+                Some(s) => Some(s.range.clone()),
+                None => segs
+                    .get(self.preview.seg_at(r.start.min(self.body.len())))
+                    .map(|s| s.range.clone()),
+            };
         }
     }
 
@@ -1723,36 +1838,6 @@ impl Editor {
         } else {
             sel.start
         })
-    }
-
-    /// Octet sous le pointeur pendant une sélection à la souris : dans le
-    /// texte en édition, la position exacte ; sur une autre ligne, son début
-    /// ou sa fin selon le sens.
-    fn byte_at_pointer(&self, p: egui::Pos2, anchor: usize) -> usize {
-        if let (Some(range), Some(g)) = (&self.active, &self.last_galley)
-            && let Some((_, y)) = self.unit_rects.iter().find(|(r, _)| r == range)
-            && y.contains(p.y)
-        {
-            let c = g.cursor_from_pos(p - self.last_galley_pos).index.0;
-            return range.start + char_to_byte(&self.body[range.clone()], c);
-        }
-        let hit = self
-            .unit_rects
-            .iter()
-            .find(|(_, y)| y.contains(p.y))
-            .or_else(|| {
-                let first = self.unit_rects.first()?;
-                if p.y < first.1.min {
-                    Some(first)
-                } else {
-                    self.unit_rects.last()
-                }
-            });
-        match hit {
-            Some((r, _)) if r.start >= anchor => r.end,
-            Some((r, _)) => r.start,
-            None => anchor,
-        }
     }
 
     /// Réaligne le tableau contenant l'octet `b` (après un redimensionnement
@@ -1769,69 +1854,72 @@ impl Editor {
         }
     }
 
-    /// Touches traitées avant le `TextEdit` :
-    /// - flèches, Retour arrière et Suppr aux bords : passage à l'unité
-    ///   voisine (ou fusion des deux lignes) ; avec Maj, la sélection
-    ///   s'étend et les lignes traversées passent en édition ; Ctrl+A
-    ///   sélectionne toute la fiche ;
+    /// Touches traitées avant les champs de saisie :
+    /// - flèches, Retour arrière et Suppr aux bords d'un segment : passage au
+    ///   segment voisin (ou fusion des deux lignes) ; Ctrl+A sélectionne le
+    ///   texte du segment, Ctrl+Début/Fin vont aux extrémités ;
     /// - listes : Entrée reprend la puce, Tab / Maj+Tab changent le niveau ;
-    /// - tableau : Tab, Maj+Tab et Entrée passent d'une cellule à l'autre.
+    /// - Alt+↑/↓ : déplace la ligne ;
+    /// - tableau : Tab, Maj+Tab et Entrée passent d'une case à l'autre, ↑/↓
+    ///   à la case au-dessus ou en dessous.
     ///
     /// Rend `true` si le texte a changé.
-    fn unit_keys(
+    fn seg_keys(
         &mut self,
         ctx: &egui::Context,
-        te_id: egui::Id,
+        focused_seg: Option<usize>,
+        cell: Option<(usize, usize, usize)>,
         project: &mut Project,
         now_ms: u64,
     ) -> bool {
         use egui::{Key, Modifiers};
+        if let Some((start, r, c)) = cell {
+            return self.cell_keys(ctx, start, r, c, project, now_ms);
+        }
         enum Move {
             To(usize),
-            /// Échange le texte en édition avec l'unité voisine (plage).
-            Swap(Range<usize>),
+            /// Échange la ligne du curseur avec la voisine.
+            SwapLine(isize),
             Select(usize, usize),
             Join(Range<usize>, usize),
-            Table(table::Op),
             Text(md_edit::Edit),
         }
-        let Some(range) = self.active.clone() else {
+        let Some(si) = focused_seg else {
             return false;
         };
-        let Some(cr) = egui::TextEdit::load_state(ctx, te_id).and_then(|s| s.cursor.char_range())
+        let Some(seg) = self.preview.segs.get(si).cloned() else {
+            return false;
+        };
+        let id = self.seg_id(si);
+        let Some(cr) = egui::TextEdit::load_state(ctx, id).and_then(|s| s.cursor.char_range())
         else {
             return false;
         };
-        let first = self.preview.unit_at(range.start);
-        let last = self.preview.unit_at(range.end);
-        let units = &self.preview.units;
-        let Some(kind) = units.get(first).map(|u| u.unit.kind) else {
-            return false;
-        };
-        let kind = if first == last { kind } else { UnitKind::Line };
+        let range = seg.range.clone();
+        let prev = si
+            .checked_sub(1)
+            .and_then(|i| self.preview.segs.get(i))
+            .cloned();
+        let next = self.preview.segs.get(si + 1).cloned();
         let text = &self.body[range.clone()];
         let n = text.chars().count();
         let c = cr.primary.index.0.min(n);
         let selecting = cr.primary.index != cr.secondary.index;
         let cursor = range.start + char_to_byte(text, c);
-        let anchor = range.start + char_to_byte(text, cr.secondary.index.0.min(n));
-        let prev = first
-            .checked_sub(1)
-            .and_then(|i| units.get(i))
-            .map(|u| u.unit.range.clone());
-        let next = units.get(last + 1).map(|u| u.unit.range.clone());
         // Ligne affichée du curseur (texte replié compris).
-        let (row, rows, col) = match &self.last_galley {
+        let (row, rows) = match &self.last_galley {
             Some(g) if g.job.text == text => {
                 let l = g.layout_from_cursor(cr.primary);
-                (l.row, g.rows.len(), l.column.0)
+                (l.row, g.rows.len())
             }
             _ => {
                 let before: String = text.chars().take(c).collect();
-                let row = before.matches('\n').count();
-                let col = before.rsplit('\n').next().map_or(0, |s| s.chars().count());
-                (row, text.matches('\n').count() + 1, col)
+                (before.matches('\n').count(), text.matches('\n').count() + 1)
             }
+        };
+        let col = {
+            let before: String = text.chars().take(c).collect();
+            before.rsplit('\n').next().map_or(0, |s| s.chars().count())
         };
         let body = &self.body;
         let line_col = |r: &Range<usize>, last_line: bool| {
@@ -1846,7 +1934,7 @@ impl Editor {
             let off = line.char_indices().nth(col).map_or(line.len(), |(i, _)| i);
             r.start + start + off
         };
-        let in_list = matches!(kind, UnitKind::Line | UnitKind::Callout) && !selecting;
+        let in_list = seg.kind == SegKind::Run && !selecting;
         let enter = in_list.then(|| md_edit::list_enter(body, cursor)).flatten();
         let indent = in_list
             .then(|| md_edit::list_indent(body, cursor, false))
@@ -1854,27 +1942,15 @@ impl Editor {
         let outdent = in_list
             .then(|| md_edit::list_indent(body, cursor, true))
             .flatten();
-        let shift = Modifiers::SHIFT;
-        let shift_cmd = Modifiers::SHIFT | Modifiers::COMMAND;
         let mv = ctx.input_mut(|i| {
             if i.consume_key(Modifiers::COMMAND, Key::A) {
-                return Some(Move::Select(0, body.len()));
+                return Some(Move::Select(range.start, range.end));
             }
-            if let Some(p) = &prev
-                && i.consume_key(Modifiers::ALT, Key::ArrowUp)
-            {
-                return Some(Move::Swap(p.clone()));
+            if i.consume_key(Modifiers::ALT, Key::ArrowUp) {
+                return Some(Move::SwapLine(-1));
             }
-            if let Some(nx) = &next
-                && i.consume_key(Modifiers::ALT, Key::ArrowDown)
-            {
-                return Some(Move::Swap(nx.clone()));
-            }
-            if i.consume_key(shift_cmd, Key::Home) {
-                return Some(Move::Select(anchor, 0));
-            }
-            if i.consume_key(shift_cmd, Key::End) {
-                return Some(Move::Select(anchor, body.len()));
+            if i.consume_key(Modifiers::ALT, Key::ArrowDown) {
+                return Some(Move::SwapLine(1));
             }
             if i.consume_key(Modifiers::COMMAND, Key::Home) {
                 return Some(Move::To(0));
@@ -1882,36 +1958,8 @@ impl Editor {
             if i.consume_key(Modifiers::COMMAND, Key::End) {
                 return Some(Move::To(body.len()));
             }
-            // Maj+flèches au bord : la sélection gagne l'unité voisine.
-            if let Some(p) = &prev {
-                if row == 0 && i.consume_key(shift, Key::ArrowUp) {
-                    return Some(Move::Select(anchor, line_col(p, true)));
-                }
-                if c == 0 && i.consume_key(shift, Key::ArrowLeft) {
-                    return Some(Move::Select(anchor, p.end));
-                }
-            }
-            if let Some(nx) = &next {
-                if row + 1 >= rows && i.consume_key(shift, Key::ArrowDown) {
-                    return Some(Move::Select(anchor, line_col(nx, false)));
-                }
-                if c == n && i.consume_key(shift, Key::ArrowRight) {
-                    return Some(Move::Select(anchor, nx.end.min(nx.start)));
-                }
-            }
             if selecting {
                 return None;
-            }
-            if kind == UnitKind::Table {
-                if i.consume_key(Modifiers::SHIFT, Key::Tab) {
-                    return Some(Move::Table(table::Op::PrevCell));
-                }
-                if i.consume_key(Modifiers::NONE, Key::Tab) {
-                    return Some(Move::Table(table::Op::NextCell));
-                }
-                if i.consume_key(Modifiers::NONE, Key::Enter) {
-                    return Some(Move::Table(table::Op::NextRow));
-                }
             }
             if let Some(e) = &enter
                 && i.consume_key(Modifiers::NONE, Key::Enter)
@@ -1930,24 +1978,32 @@ impl Editor {
             }
             if let Some(p) = &prev {
                 if row == 0 && i.consume_key(Modifiers::NONE, Key::ArrowUp) {
-                    return Some(Move::To(line_col(p, true)));
+                    return Some(Move::To(line_col(&p.range, true)));
                 }
                 if c == 0 && i.consume_key(Modifiers::NONE, Key::ArrowLeft) {
-                    return Some(Move::To(p.end));
+                    return Some(Move::To(p.range.end));
                 }
                 if c == 0 && i.consume_key(Modifiers::NONE, Key::Backspace) {
-                    return Some(Move::Join(p.end..range.start, p.end));
+                    return Some(if p.kind == SegKind::Table {
+                        Move::To(p.range.end)
+                    } else {
+                        Move::Join(p.range.end..range.start, p.range.end)
+                    });
                 }
             }
             if let Some(nx) = &next {
                 if row + 1 >= rows && i.consume_key(Modifiers::NONE, Key::ArrowDown) {
-                    return Some(Move::To(line_col(nx, false)));
+                    return Some(Move::To(line_col(&nx.range, false)));
                 }
                 if c == n && i.consume_key(Modifiers::NONE, Key::ArrowRight) {
-                    return Some(Move::To(nx.start));
+                    return Some(Move::To(nx.range.start));
                 }
                 if c == n && i.consume_key(Modifiers::NONE, Key::Delete) {
-                    return Some(Move::Join(range.end..nx.start, range.end));
+                    return Some(if nx.kind == SegKind::Table {
+                        Move::To(nx.range.start)
+                    } else {
+                        Move::Join(range.end..nx.range.start, range.end)
+                    });
                 }
             }
             None
@@ -1955,31 +2011,44 @@ impl Editor {
         match mv {
             None => false,
             Some(Move::To(b)) => {
-                self.activate(ctx, te_id, b, None);
+                self.activate(ctx, b, None);
                 false
             }
-            Some(Move::Swap(other)) => {
-                let mine = self.body[range.clone()].to_owned();
-                let theirs = self.body[other.clone()].to_owned();
-                let offset = cursor - range.start;
-                let new_start = if other.start < range.start {
-                    let sep = self.body[other.end..range.start].to_owned();
-                    self.body
-                        .replace_range(other.start..range.end, &format!("{mine}{sep}{theirs}"));
-                    other.start
+            Some(Move::SwapLine(dir)) => {
+                let lines = live::line_ranges(&self.body);
+                let Some(li) = lines.iter().position(|l| cursor <= l.end) else {
+                    return false;
+                };
+                let Some(oi) = li.checked_add_signed(dir).filter(|o| *o < lines.len()) else {
+                    return false;
+                };
+                // Seulement à l'intérieur du segment (pas à travers un
+                // tableau, un bloc de formule…).
+                if lines[oi].start < range.start || lines[oi].end > range.end {
+                    return false;
+                }
+                let (a, b) = if li < oi { (li, oi) } else { (oi, li) };
+                let (la, lb) = (lines[a].clone(), lines[b].clone());
+                let (ta, tb) = (
+                    self.body[la.clone()].to_owned(),
+                    self.body[lb.clone()].to_owned(),
+                );
+                let mid = self.body[la.end..lb.start].to_owned();
+                let offset = cursor - lines[li].start;
+                self.body
+                    .replace_range(la.start..lb.end, &format!("{tb}{mid}{ta}"));
+                let new_line_start = if li < oi {
+                    la.start + tb.len() + mid.len()
                 } else {
-                    let sep = self.body[range.end..other.start].to_owned();
-                    self.body
-                        .replace_range(range.start..other.end, &format!("{theirs}{sep}{mine}"));
-                    range.start + theirs.len() + sep.len()
+                    la.start
                 };
                 self.history.break_group();
                 self.commit_body(project, EditKind::Discrete, now_ms);
-                self.activate(ctx, te_id, new_start + offset, None);
+                self.activate(ctx, new_line_start + offset, None);
                 true
             }
             Some(Move::Select(a, b)) => {
-                self.activate(ctx, te_id, b, Some(a));
+                self.activate(ctx, b, Some(a));
                 self.last_cursor = Some(b);
                 self.last_sel = Some(a.min(b)..a.max(b));
                 false
@@ -1987,25 +2056,95 @@ impl Editor {
             Some(Move::Join(sep, b)) => {
                 self.body.replace_range(sep, "");
                 self.commit_body(project, EditKind::Typing, now_ms);
-                self.activate(ctx, te_id, b, None);
+                self.activate(ctx, b, None);
                 true
             }
             Some(Move::Text(e)) => {
                 self.body = e.text;
                 self.history.break_group();
                 self.commit_body(project, EditKind::Discrete, now_ms);
-                self.activate(ctx, te_id, e.selection.end, None);
+                self.activate(ctx, e.selection.end, None);
                 true
             }
-            Some(Move::Table(op)) => match table::edit(text, cursor - range.start, op) {
-                Some((t, pos)) => {
-                    self.body.replace_range(range.clone(), &t);
-                    self.commit_body(project, EditKind::Discrete, now_ms);
-                    self.activate(ctx, te_id, range.start + pos, None);
-                    true
+        }
+    }
+
+    /// Touches dans une case de tableau.
+    fn cell_keys(
+        &mut self,
+        ctx: &egui::Context,
+        start: usize,
+        r: usize,
+        c: usize,
+        project: &mut Project,
+        now_ms: u64,
+    ) -> bool {
+        use egui::{Key, Modifiers};
+        enum K {
+            Op(table::Op),
+            Up,
+            Down,
+        }
+        let Some(si) = self
+            .preview
+            .segs
+            .iter()
+            .position(|s| s.range.start == start)
+        else {
+            return false;
+        };
+        let seg = self.preview.segs[si].clone();
+        let k = ctx.input_mut(|i| {
+            if i.consume_key(Modifiers::SHIFT, Key::Tab) {
+                Some(K::Op(table::Op::PrevCell))
+            } else if i.consume_key(Modifiers::NONE, Key::Tab) {
+                Some(K::Op(table::Op::NextCell))
+            } else if i.consume_key(Modifiers::NONE, Key::Enter) {
+                Some(K::Op(table::Op::NextRow))
+            } else if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                Some(K::Up)
+            } else if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                Some(K::Down)
+            } else {
+                None
+            }
+        });
+        let text = self.body[seg.range.clone()].to_owned();
+        match k {
+            None => false,
+            Some(K::Op(op)) => {
+                let cursor = table::cell_start(&text, r, c).unwrap_or(0);
+                match table::edit(&text, cursor, op) {
+                    Some((t, pos)) => {
+                        self.body.replace_range(seg.range.clone(), &t);
+                        self.commit_body(project, EditKind::Discrete, now_ms);
+                        self.activate(ctx, seg.range.start + pos, None);
+                        true
+                    }
+                    None => false,
                 }
-                None => false,
-            },
+            }
+            Some(K::Up) => {
+                if r > 0 {
+                    self.preview.drags.pending_focus = Some((start, r - 1, c, 0));
+                } else if let Some(p) = si
+                    .checked_sub(1)
+                    .and_then(|i| self.preview.segs.get(i))
+                    .cloned()
+                {
+                    self.activate(ctx, p.range.end, None);
+                }
+                false
+            }
+            Some(K::Down) => {
+                let rows = table::parse(&text).map_or(0, |p| p.table.rows.len());
+                if r + 1 < rows {
+                    self.preview.drags.pending_focus = Some((start, r + 1, c, 0));
+                } else if let Some(nx) = self.preview.segs.get(si + 1).cloned() {
+                    self.activate(ctx, nx.range.start, None);
+                }
+                false
+            }
         }
     }
 
@@ -2049,6 +2188,12 @@ impl Editor {
     #[cfg(test)]
     pub fn unit_heights(&self) -> Vec<f32> {
         self.unit_rects.iter().map(|(_, y)| y.max - y.min).collect()
+    }
+
+    /// Case de tableau qui a le focus : (ligne, colonne) (tests).
+    #[cfg(test)]
+    pub fn focused_cell(&self) -> Option<(usize, usize)> {
+        self.preview.drags.focused_cell.map(|(_, r, c)| (r, c))
     }
 
     /// Une unité est-elle en cours de modification ? (tests)

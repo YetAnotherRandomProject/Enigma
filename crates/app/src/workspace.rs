@@ -3236,32 +3236,37 @@ mod ui_tests {
         fn editor<'a>(h: &'a mut Harness<'_, State>) -> &'a mut crate::editor::Editor {
             h.state_mut().ws.as_mut().unwrap().editor.as_mut().unwrap()
         }
-        // Tout est mis en forme : aucun texte Markdown affiché.
+        // Au repos : tout est mis en forme, aucun texte Markdown affiché.
         assert!(harness.query_by_role(Role::MultilineTextInput).is_none());
         snapshot(&mut harness, "30_lecture_directe");
 
-        // Modifier la dernière ligne, Entrée : nouvelle ligne en édition.
+        // Modifier un élément : TOUTE la fiche passe en édition. Le texte
+        // est modifiable partout (deux champs : avant et après le tableau)
+        // et le tableau garde son rendu, avec des cases modifiables.
         editor(&mut harness).edit_at_end();
         harness.run_steps(4);
+        let texts: Vec<String> = harness
+            .query_all_by_role(Role::MultilineTextInput)
+            .filter_map(|n| n.value())
+            .collect();
         assert_eq!(
-            harness
-                .get_by_role(Role::MultilineTextInput)
-                .value()
-                .as_deref(),
-            Some("Fin")
+            texts,
+            ["# Plan\n\n- [ ] fouiller\n- [x] lire\n", "\nFin"],
+            "texte avant et après le tableau"
         );
+        snapshot(&mut harness, "31_fiche_en_edition");
+        // Les cases du tableau sont des champs de saisie (3 lignes × 2 colonnes).
+        let cells = harness.query_all_by_role(Role::TextInput).count();
+        assert!(cells >= 6, "{cells} champs de saisie");
+
+        // Frappe dans le dernier champ : « Fin » → « Finsuite ».
         harness
-            .get_by_role(Role::MultilineTextInput)
+            .query_all_by_role(Role::MultilineTextInput)
+            .last()
+            .unwrap()
             .type_text("\nsuite");
         harness.run_steps(4);
         assert!(body_text(&harness).ends_with("Fin\nsuite"));
-        assert_eq!(
-            harness
-                .get_by_role(Role::MultilineTextInput)
-                .value()
-                .as_deref(),
-            Some("suite")
-        );
         // Retour arrière en début de ligne : fusion avec la précédente.
         harness.key_press(egui::Key::Home);
         harness.run_steps(2);
@@ -3272,34 +3277,33 @@ mod ui_tests {
             "{}",
             body_text(&harness)
         );
-        assert_eq!(
-            harness
-                .get_by_role(Role::MultilineTextInput)
-                .value()
-                .as_deref(),
-            Some("Finsuite")
-        );
-        // Flèche haut depuis la première ligne : unité précédente.
-        harness.key_press(egui::Key::ArrowUp);
-        harness.run_steps(4);
-        assert_eq!(
-            harness
-                .get_by_role(Role::MultilineTextInput)
-                .value()
-                .as_deref(),
-            Some("")
-        );
+        // Les listes de tâches du premier champ restent éditables sans
+        // quitter l'édition.
+        assert!(editor(&mut harness).is_editing());
 
-        // Tableau : frappe dans une cellule vide, colonnes réalignées.
+        // Tableau : frappe dans une case vide, colonnes réalignées.
         let body = body_text(&harness);
         let cell = body.find("|  |  |").unwrap() + 2;
         editor(&mut harness).edit_at(cell);
         harness.run_steps(4);
-        harness.get_by_role(Role::MultilineTextInput).type_text("x");
+        let focused_cell = |h: &Harness<'_, State>| {
+            h.state()
+                .ws
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .unwrap()
+                .focused_cell()
+        };
+        assert_eq!(focused_cell(&harness), Some((1, 0)), "1re case de données");
+        harness.key_press(egui::Key::X);
+        harness.event(egui::Event::Text("x".into()));
         harness.run_steps(4);
         harness.key_press(egui::Key::Tab);
         harness.run_steps(4);
-        harness.get_by_role(Role::MultilineTextInput).type_text("y");
+        assert_eq!(focused_cell(&harness), Some((1, 1)), "Tab : case suivante");
+        harness.event(egui::Event::Text("y z".into()));
         harness.run_steps(4);
         let body = body_text(&harness);
         let units = enigma_core::live::units(&body);
@@ -3311,15 +3315,18 @@ mod ui_tests {
         let widths: Vec<usize> = text.lines().map(|l| l.chars().count()).collect();
         assert!(widths.windows(2).all(|w| w[0] == w[1]), "{text}");
         let p = enigma_core::table::parse(text).unwrap();
-        assert_eq!(p.table.rows[1], ["x", "y"], "{text}");
-        snapshot(&mut harness, "31_tableau_edition");
+        assert_eq!(p.table.rows[1], ["x", "y z"], "{text}");
+        // On peut taper des espaces dans une case (le tableau réécrit les
+        // supprimerait en fin de case).
+        assert_eq!(focused_cell(&harness), Some((1, 1)));
+        snapshot(&mut harness, "32_tableau_edition");
 
-        // Échap : fin de la modification, tout est de nouveau mis en forme.
+        // Échap : retour à l'aperçu, tout est de nouveau mis en forme.
         harness.key_press(egui::Key::Escape);
         harness.run_steps(4);
         assert!(!editor(&mut harness).is_editing());
         assert!(harness.query_by_role(Role::MultilineTextInput).is_none());
-        snapshot(&mut harness, "32_tableau_lecture");
+        snapshot(&mut harness, "33_tableau_lecture");
     }
 
     fn new_note(harness: &mut Harness<'_, State>, title: &str, body: &str) {
@@ -3354,12 +3361,9 @@ mod ui_tests {
             .unwrap()
             .edit_at(0);
         harness.run_steps(4);
-        assert_eq!(editing_text(&harness).as_deref(), Some("a"));
-        // Maj+Bas : la ligne suivante passe aussi en édition.
-        harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
-        harness.run_steps(4);
-        assert_eq!(editing_text(&harness).as_deref(), Some("a\nb"));
-        // Ctrl+A : toute la fiche.
+        // Toute la fiche est en édition d'un coup.
+        assert_eq!(editing_text(&harness).as_deref(), Some("a\nb\nc"));
+        // Ctrl+A : tout le texte.
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
         harness.run_steps(4);
         assert_eq!(editing_text(&harness).as_deref(), Some("a\nb\nc"));
@@ -3384,7 +3388,10 @@ mod ui_tests {
         harness.key_press(egui::Key::Enter);
         harness.run_steps(4);
         assert_eq!(body_text(&harness), "- un\n  - deux\n- ");
-        assert_eq!(editing_text(&harness).as_deref(), Some("- "));
+        assert_eq!(
+            editing_text(&harness).as_deref(),
+            Some("- un\n  - deux\n- ")
+        );
     }
 
     #[test]
@@ -3414,7 +3421,7 @@ mod ui_tests {
         assert_eq!(open_title(&harness), "Essai");
         assert_eq!(
             editing_text(&harness).as_deref(),
-            Some("Le code 1945 ouvre le coffre.")
+            Some("Intro\nLe code 1945 ouvre le coffre.\nFin")
         );
 
         // Ouverture rapide : fiches seulement, création si absente.
@@ -3483,7 +3490,7 @@ mod ui_tests {
         harness.get_by_label("Source › Code").click();
         harness.run_steps(6);
         assert_eq!(open_title(&harness), "Source");
-        assert_eq!(editing_text(&harness).as_deref(), Some("## Code"));
+        assert!(editing_text(&harness).is_some_and(|t| t.contains("## Code")));
         // Rétrolien compté une fois malgré les deux références.
         let ws = harness.state().ws.as_ref().unwrap();
         let source = ws.project.resolve_title("Source").unwrap().clone();
@@ -3540,7 +3547,10 @@ mod ui_tests {
         harness.key_press_modifiers(egui::Modifiers::ALT, egui::Key::ArrowUp);
         harness.run_steps(4);
         assert_eq!(body_text(&harness), "# Partie\ndeux\nun\n## Sous\ntrois");
-        assert_eq!(editing_text(&harness).as_deref(), Some("deux"));
+        assert_eq!(
+            editing_text(&harness).as_deref(),
+            Some("# Partie\ndeux\nun\n## Sous\ntrois")
+        );
 
         // « / » en fin de fiche : commandes, filtrées ; Entrée insère.
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
@@ -3700,7 +3710,7 @@ mod ui_tests {
         harness.run_steps(6);
         let body = body_text(&harness);
         assert!(body.starts_with("Début\n\n## Essai ("), "{body}");
-        assert_eq!(editing_text(&harness).as_deref(), Some(""));
+        assert!(editing_text(&harness).is_some_and(|t| t.contains("## Essai (")));
     }
 
     #[test]
@@ -3986,6 +3996,117 @@ mod ui_tests {
             statut >= bottom,
             "« Statut » ({statut}) recouvre les catégories ({bottom})"
         );
+    }
+
+    #[test]
+    fn edit_mode_keeps_renders_and_table_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        egui_extras::install_image_loaders(&harness.ctx);
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(
+            dir.path().join("assets/plan.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="#4aa3ff"/></svg>"##,
+        )
+        .unwrap();
+        let body = "# Titre\n\n![plan|160](assets/plan.svg)\n\n| Pièce | Code |\n| ----- | ---- |\n| Salle | 1945 |\n\n$$\n\\frac{a}{b}\n$$\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n> [!indice] Le coffre\n> Code à 4 chiffres\n\nFin";
+        new_note(&mut harness, "Essai", body);
+        for _ in 0..10 {
+            harness.run_steps(2);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let editor = |h: &mut Harness<'_, State>| -> *mut crate::editor::Editor {
+            h.state_mut().ws.as_mut().unwrap().editor.as_mut().unwrap() as *mut _
+        };
+        let _ = editor;
+        // Clic sur la case « 1945 » de l'aperçu : toute la fiche passe en
+        // édition, curseur dans cette case.
+        let ws = harness.state().ws.as_ref().unwrap();
+        let cell_at = body.find("1945").unwrap();
+        assert!(ws.editor.as_ref().is_some_and(|e| !e.is_editing()));
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .edit_at(cell_at);
+        for _ in 0..10 {
+            harness.run_steps(2);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        snapshot(&mut harness, "60_edition_complete");
+        let focus = |h: &Harness<'_, State>| {
+            h.state()
+                .ws
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .unwrap()
+                .focused_cell()
+        };
+        assert_eq!(focus(&harness), Some((1, 1)), "case « 1945 »");
+        // Tout le texte est modifiable : titre, ligne d'image, formule,
+        // diagramme, encadré et fin sont dans des champs.
+        let fields: Vec<String> = harness
+            .query_all_by_role(Role::MultilineTextInput)
+            .filter_map(|n| n.value())
+            .collect();
+        assert!(
+            fields.iter().any(|f| f.starts_with("# Titre")),
+            "{fields:?}"
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|f| f.contains("![plan|160](assets/plan.svg)"))
+        );
+        assert!(fields.iter().any(|f| f.contains("\\frac{a}{b}")));
+        assert!(fields.iter().any(|f| f.contains("flowchart LR")));
+        assert!(fields.iter().any(|f| f.contains("[!indice] Le coffre")));
+        assert!(fields.iter().any(|f| f.ends_with("Fin")));
+
+        // Barre d'outils du tableau : une ligne de plus.
+        harness.get_by_label("+ Ligne après").click();
+        harness.run_steps(6);
+        let table_text = |h: &Harness<'_, State>| {
+            let b = body_text(h);
+            let u = enigma_core::live::units(&b);
+            let t = u
+                .iter()
+                .find(|u| u.kind == enigma_core::live::UnitKind::Table)
+                .unwrap();
+            enigma_core::table::parse(&b[t.range.clone()])
+                .unwrap()
+                .table
+        };
+        assert_eq!(table_text(&harness).body_rows(), 2);
+        assert_eq!(
+            focus(&harness).map(|f| f.0),
+            Some(2),
+            "focus sur la nouvelle ligne"
+        );
+        // ↑ : retour à la case au-dessus (même colonne).
+        harness.key_press(egui::Key::ArrowUp);
+        harness.run_steps(4);
+        assert_eq!(focus(&harness), Some((1, 1)));
+        // Frappe dans la case : le tableau est réécrit.
+        harness.event(egui::Event::Text("0".into()));
+        harness.run_steps(4);
+        assert_eq!(table_text(&harness).rows[1][1], "01945");
+        // Suppr. colonne : le tableau n'a plus qu'une colonne.
+        harness.get_by_label("Suppr. colonne").click();
+        harness.run_steps(6);
+        assert_eq!(table_text(&harness).cols(), 1);
+
+        // Échap : retour à l'aperçu complet.
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(6);
+        assert!(harness.query_by_role(Role::MultilineTextInput).is_none());
+        snapshot(&mut harness, "61_apercu_apres_edition");
     }
 
     #[test]
