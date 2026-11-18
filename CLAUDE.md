@@ -181,6 +181,25 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
 - Lancer sur la démo : `cargo run -p enigma-app -- exemples/blue_prince_demo`
   (attention : modifie les fichiers de la démo ; travailler sur une copie).
 
+## Build et publication
+- Exécutable : `cargo build --release -p enigma-app` → `target/release/enigma(.exe)`
+  (un seul fichier : les packs fournis sont intégrés, voir
+  `app/bundled_packs.rs`, et déposés au démarrage dans
+  `<données locales>/Enigma Notes/data/packs-integres`).
+- CI GitHub (`.github/workflows/ci.yml`) : fmt + clippy + tests sur Windows,
+  Linux et macOS à chaque push/PR.
+- Publier une version : mettre `version` de `[workspace.package]` à jour,
+  commiter, puis `git tag vX.Y.Z && git push origin vX.Y.Z`.
+  `release.yml` vérifie que l'étiquette correspond, construit
+  `enigma-windows-x86_64.exe`, `enigma-linux-x86_64`, `enigma-macos-aarch64`,
+  `enigma-macos-x86_64` (+ `.sha256`) et crée la Release.
+- Mise à jour automatique (`app/update.rs`, dépôt
+  `YetAnotherRandomProject/Enigma`) : vérification au démarrage (désactivable,
+  menu Aide ; jamais en debug), l'utilisateur choisit d'installer ;
+  téléchargement, contrôle SHA-256, remplacement de l'exécutable
+  (`self-replace`), redémarrage. Ne jamais renommer les fichiers publiés
+  sans adapter `update::asset_name`.
+
 ## Méthode
 Un jalon à la fois. Fin de jalon : tout compile, tests verts, résumé de ce qui
 marche + comment tester, puis **arrêt en attendant le feu vert**. Rien des

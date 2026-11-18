@@ -9,10 +9,12 @@ use enigma_core::shortcut::Keymap;
 use crate::commands::{self, Command};
 use crate::notices::Notices;
 use crate::paths;
+use crate::update::{self, Updater};
 use crate::workspace::{AppRequest, Workspace};
 
 const RECENT_KEY: &str = "recent_projects";
 const MAX_RECENT: usize = 8;
+const AUTO_UPDATE_KEY: &str = "auto_update";
 
 pub struct EnigmaApp {
     recent: Vec<PathBuf>,
@@ -23,6 +25,9 @@ pub struct EnigmaApp {
     keymap: Keymap,
     /// Fichier des raccourcis (`None` : illisible, donc jamais écrasé).
     keymap_path: Option<PathBuf>,
+    updater: Updater,
+    /// Chercher une mise à jour au démarrage.
+    auto_update: bool,
 }
 
 impl EnigmaApp {
@@ -51,7 +56,16 @@ impl EnigmaApp {
             start: Instant::now(),
             keymap,
             keymap_path,
+            updater: Updater::default(),
+            auto_update: cc
+                .storage
+                .and_then(|s| eframe::get_value(s, AUTO_UPDATE_KEY))
+                .unwrap_or(true),
         };
+        // Pas de vérification automatique en développement.
+        if app.auto_update && !cfg!(debug_assertions) {
+            app.updater.check(&cc.egui_ctx, false);
+        }
         // Dossier passé en argument (`enigma <dossier>`), sinon le dernier
         // projet ouvert s'il existe encore.
         let from_args = std::env::args_os().nth(1).map(PathBuf::from);
@@ -150,6 +164,7 @@ impl EnigmaApp {
                     }
                 }
             });
+            self.updater.menu_ui(ui, &mut self.auto_update);
             if let Some(cmd) = run {
                 match &mut self.workspace {
                     Some(ws) => ws.run_command(cmd, &ctx, &mut self.notices),
@@ -207,6 +222,21 @@ impl eframe::App for EnigmaApp {
         let now_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
+        self.updater.poll();
+        if self.updater.wants_banner() {
+            let action = egui::Panel::top("update_banner")
+                .show(ui, |ui| self.updater.banner_ui(ui))
+                .inner;
+            if action == update::Action::Restart {
+                if let Some(ws) = &mut self.workspace {
+                    ws.flush(&mut self.notices);
+                }
+                match update::restart() {
+                    Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(e) => self.notices.error(e),
+                }
+            }
+        }
         if !self.notices.is_empty() {
             egui::Panel::bottom("notices").show(ui, |ui| self.notices.ui(ui));
         }
@@ -234,6 +264,7 @@ impl eframe::App for EnigmaApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, RECENT_KEY, &self.recent);
+        eframe::set_value(storage, AUTO_UPDATE_KEY, &self.auto_update);
         if let Some(ws) = &mut self.workspace {
             ws.flush(&mut self.notices);
         }

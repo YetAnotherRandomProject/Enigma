@@ -7,7 +7,8 @@ use std::path::PathBuf;
 /// 1. dossier utilisateur (ex. `%APPDATA%\Enigma Notes\data\packs`) ;
 /// 2. `packs/` à côté de l'exécutable ;
 /// 3. `packs/` du dossier courant ;
-/// 4. en développement, `packs/` du dépôt.
+/// 4. en développement, `packs/` du dépôt ;
+/// 5. packs intégrés à l'exécutable (voir `bundled_packs`).
 pub fn pack_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(dirs) = directories::ProjectDirs::from("", "", "Enigma Notes") {
@@ -24,6 +25,12 @@ pub fn pack_roots() -> Vec<PathBuf> {
     }
     #[cfg(debug_assertions)]
     roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packs"));
+    if let Some(dir) = crate::bundled_packs::root() {
+        match crate::bundled_packs::install(&dir) {
+            Ok(()) => roots.push(dir),
+            Err(e) => tracing::warn!("packs intégrés non installés : {e}"),
+        }
+    }
     let mut seen = std::collections::HashSet::new();
     roots.retain(|r| seen.insert(r.clone()));
     roots
