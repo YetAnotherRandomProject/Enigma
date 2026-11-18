@@ -10,6 +10,7 @@
 //! - [`board`] : tableau d'enquête (cartes placées à la main).
 //! - [`shortcut`] : raccourcis clavier configurables.
 //! - [`fuzzy`] : recherche approximative (palette de commandes).
+//! - [`search`] : recherche dans tout le projet (mots, expressions, regex, champs).
 //! - [`table`] : tableaux Markdown alignés.
 //! - [`live`] : découpage d'une fiche en unités d'édition (ligne, tableau, bloc de code).
 
@@ -29,6 +30,7 @@ pub mod note;
 pub mod pack;
 pub mod project;
 pub mod render;
+pub mod search;
 pub mod shortcut;
 pub mod storage;
 pub mod table;

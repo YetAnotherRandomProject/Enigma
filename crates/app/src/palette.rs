@@ -15,6 +15,8 @@ const MAX_ITEMS: usize = 12;
 pub enum PaletteItem {
     Command(Command),
     Note(NoteId),
+    /// Créer une fiche de ce titre (ouverture rapide sans résultat exact).
+    Create(String),
 }
 
 pub enum PaletteOutcome {
@@ -28,6 +30,17 @@ pub struct Palette {
     pub query: String,
     selected: usize,
     focused: bool,
+    /// Ouverture rapide : fiches seulement (et création).
+    notes_only: bool,
+}
+
+impl Palette {
+    pub fn notes_only() -> Palette {
+        Palette {
+            notes_only: true,
+            ..Palette::default()
+        }
+    }
 }
 
 /// Résultats pour une requête : commandes disponibles et fiches, triés par
@@ -40,7 +53,7 @@ pub fn items(
 ) -> Vec<(PaletteItem, String)> {
     let mut scored: Vec<(i64, u8, PaletteItem, String)> = Vec::new();
     for &c in Command::ALL {
-        if c == Command::Palette || !available(c) {
+        if matches!(c, Command::Palette | Command::QuickOpen) || !available(c) {
             continue;
         }
         if let Some(s) = fuzzy::score(query, c.label()) {
@@ -80,7 +93,14 @@ impl Palette {
         keymap: &Keymap,
         available: impl Fn(Command) -> bool,
     ) -> PaletteOutcome {
-        let results = items(&self.query, project, &available);
+        let mut results = items(&self.query, project, &available);
+        if self.notes_only {
+            results.retain(|(i, _)| matches!(i, PaletteItem::Note(_)));
+            let q = self.query.trim();
+            if !q.is_empty() && project.resolve_title(q).is_none() {
+                results.push((PaletteItem::Create(q.to_owned()), format!("Créer « {q} »")));
+            }
+        }
         // Navigation consommée avant la zone de saisie.
         let (up, down, enter, escape) = ctx.input_mut(|i| {
             (
@@ -113,8 +133,11 @@ impl Palette {
             let before = self.query.clone();
             let edit = ui.add_sized(
                 [460.0, 24.0],
-                egui::TextEdit::singleline(&mut self.query)
-                    .hint_text("Commande ou titre de fiche…"),
+                egui::TextEdit::singleline(&mut self.query).hint_text(if self.notes_only {
+                    "Titre de la fiche à ouvrir…"
+                } else {
+                    "Commande ou titre de fiche…"
+                }),
             );
             if !self.focused {
                 edit.request_focus();
@@ -131,6 +154,7 @@ impl Palette {
                 let (tag, extra) = match item {
                     PaletteItem::Command(c) => ("", c.bindings_text(keymap)),
                     PaletteItem::Note(_) => ("fiche", String::new()),
+                    PaletteItem::Create(_) => ("nouvelle", String::new()),
                 };
                 let row = ui.horizontal(|ui| {
                     let r = ui.selectable_label(k == self.selected, label);

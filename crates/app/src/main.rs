@@ -23,6 +23,7 @@ mod paths;
 mod project_file;
 mod quick_add;
 mod reading;
+mod search_ui;
 mod session;
 mod shortcuts_ui;
 mod system_open;

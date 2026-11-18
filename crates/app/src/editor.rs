@@ -70,6 +70,8 @@ pub struct Editor {
     drag_anchor: Option<usize>,
     /// Position verticale de chaque unité à l'image précédente.
     unit_rects: Vec<(Range<usize>, egui::Rangef)>,
+    /// Faire défiler jusqu'au texte en édition (résultat de recherche…).
+    reveal: bool,
     /// Formulaires « + » pour enrichir le pack depuis la fiche.
     quick_category: QuickAdd,
     quick_status: QuickAdd,
@@ -407,6 +409,7 @@ impl Editor {
             last_galley_pos: egui::Pos2::ZERO,
             drag_anchor: None,
             unit_rects: Vec::new(),
+            reveal: false,
             quick_category: QuickAdd::default(),
             quick_status: QuickAdd::default(),
             quick_field: QuickAdd::default(),
@@ -759,6 +762,7 @@ impl Editor {
         let mut table_op: Option<table::Op> = None;
         let mut menu = |ui: &mut egui::Ui| format_menu(ui, false);
         let mut unit_rects: Vec<(Range<usize>, egui::Rangef)> = Vec::new();
+        let reveal = std::mem::take(&mut self.reveal);
         {
             let project_ref: &Project = project;
             let body = &self.body;
@@ -831,6 +835,9 @@ impl Editor {
                                 );
                             }
                             let output = te.show(ui);
+                            if reveal {
+                                ui.scroll_to_rect(output.response.rect, Some(egui::Align::Center));
+                            }
                             let r = output.response.rect.expand2(egui::vec2(6.0, 2.0));
                             ui.painter().set(
                                 bg,
@@ -1457,6 +1464,15 @@ impl Editor {
                 }
                 None => false,
             },
+        }
+    }
+
+    /// Place le curseur à cet octet et fait défiler jusqu'à lui.
+    pub fn reveal(&mut self, b: usize) {
+        let b = b.min(self.body.len());
+        if self.body.is_char_boundary(b) {
+            self.pending_cursor = Some(self.body[..b].chars().count());
+            self.reveal = true;
         }
     }
 

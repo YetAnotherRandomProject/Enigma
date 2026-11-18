@@ -155,6 +155,57 @@ pub fn wiki_links(text: &str) -> Vec<WikiLink> {
     scan_wiki_links(text, &in_code)
 }
 
+/// Tag `#nom` trouvé dans le corps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagRef {
+    /// `#` compris.
+    pub range: Range<usize>,
+    /// Sans `#` (peut contenir `/` : `lieu/manoir`).
+    pub name: String,
+}
+
+/// Tags `#nom` (lettres, chiffres, `_`, `-`, `/`, pas seulement des
+/// chiffres), précédés d'un espace ou en début de ligne, hors code. Les
+/// titres (`# Titre`) et les `#` d'un lien `[[Fiche#Section]]` n'en sont
+/// pas.
+pub fn tags(text: &str) -> Vec<TagRef> {
+    let mut in_code = vec![false; text.len()];
+    for (event, range) in Parser::new_ext(text, options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) | Event::Code(_) => mark(&mut in_code, &range),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for (i, c) in text.char_indices() {
+        if c != '#' || in_code[i] {
+            continue;
+        }
+        let prev_ok = text[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|p| p.is_whitespace() || p == '(');
+        if !prev_ok {
+            continue;
+        }
+        let rest = &text[i + 1..];
+        let len = rest
+            .char_indices()
+            .take_while(|(_, ch)| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '/'))
+            .last()
+            .map_or(0, |(j, ch)| j + ch.len_utf8());
+        let name = rest[..len].trim_end_matches(['/', '-']);
+        if name.is_empty() || name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        out.push(TagRef {
+            range: i..i + 1 + name.len(),
+            name: name.to_owned(),
+        });
+    }
+    out
+}
+
 /// Lien `[[...` en cours de saisie (pas encore refermé) sous le curseur.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Completion {

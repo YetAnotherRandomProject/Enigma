@@ -49,6 +49,13 @@ pub enum AppRequest {
     AssociateFiles,
 }
 
+/// Onglet du panneau de gauche.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LeftTab {
+    Notes,
+    Search,
+}
+
 /// Vue de la zone centrale.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -129,6 +136,8 @@ pub struct Workspace {
     /// Lignes affichées et leur clé de cache.
     rows: Vec<ListRow>,
     rows_key: Option<(u64, bool, Vec<String>)>,
+    pub left_tab: LeftTab,
+    search: crate::search_ui::SearchPanel,
 }
 
 impl Workspace {
@@ -199,6 +208,8 @@ impl Workspace {
             collapsed: std::collections::HashSet::new(),
             rows: Vec::new(),
             rows_key: None,
+            left_tab: LeftTab::Notes,
+            search: crate::search_ui::SearchPanel::default(),
         };
         ws.refresh_packs();
         Ok(ws)
@@ -397,6 +408,16 @@ impl Workspace {
                     None => Some(Palette::default()),
                 };
             }
+            Command::QuickOpen => {
+                self.palette = match self.palette {
+                    Some(_) => None,
+                    None => Some(Palette::notes_only()),
+                };
+            }
+            Command::SearchAll => {
+                self.left_tab = LeftTab::Search;
+                self.search.focus = true;
+            }
             Command::NewNote => self.open_new_note_dialog(),
             Command::Save => self.flush(notices),
             Command::Undo | Command::Redo => {
@@ -413,6 +434,7 @@ impl Workspace {
             }
             Command::Find => {
                 self.view = View::Note;
+                self.left_tab = LeftTab::Notes;
                 self.focus_search = true;
             }
             Command::ShowNote => self.view = View::Note,
@@ -764,7 +786,28 @@ impl Workspace {
             .resizable(true)
             .default_size(260.0)
             .min_size(180.0)
-            .show(ui, |ui| self.list_ui(ui, notices));
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.left_tab, LeftTab::Notes, "Fiches");
+                    ui.selectable_value(&mut self.left_tab, LeftTab::Search, "Recherche")
+                        .on_hover_text(
+                            "Rechercher dans le texte de toutes les fiches (Ctrl+Maj+F)",
+                        );
+                });
+                ui.separator();
+                match self.left_tab {
+                    LeftTab::Notes => self.list_ui(ui, notices),
+                    LeftTab::Search => {
+                        if let Some((id, at)) = self.search.ui(ui, &self.project) {
+                            self.view = View::Note;
+                            self.select(&id, notices);
+                            if let (Some(b), Some(ed)) = (at, &mut self.editor) {
+                                ed.reveal(b);
+                            }
+                        }
+                    }
+                }
+            });
 
         // En vue graphe, le panneau reste affiché même sans sélection : sinon
         // sélectionner un nœud redimensionnerait le canevas sous le curseur.
@@ -902,6 +945,15 @@ impl Workspace {
             PaletteOutcome::Open => self.palette = Some(palette),
             PaletteOutcome::Closed => {}
             PaletteOutcome::Run(PaletteItem::Command(cmd)) => self.run_command(cmd, ctx, notices),
+            PaletteOutcome::Run(PaletteItem::Create(title)) => {
+                match self.project.create_note(&title, Vec::new(), String::new()) {
+                    Ok(id) => {
+                        self.select(&id, notices);
+                        self.view = View::Note;
+                    }
+                    Err(e) => notices.error(format!("Création impossible : {e}")),
+                }
+            }
             PaletteOutcome::Run(PaletteItem::Note(id)) => {
                 self.select(&id, notices);
                 if self.view != View::Board {
@@ -2160,6 +2212,56 @@ mod ui_tests {
         harness.run_steps(4);
         assert_eq!(body_text(&harness), "- un\n  - deux\n- ");
         assert_eq!(editing_text(&harness).as_deref(), Some("- "));
+    }
+
+    #[test]
+    fn full_text_search_and_quick_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        new_note(
+            &mut harness,
+            "Essai",
+            "Intro\nLe code 1945 ouvre le coffre.\nFin",
+        );
+        harness.key_press_modifiers(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::F,
+        );
+        harness.run_steps(4);
+        let is_search = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+            n.role() == Role::TextInput
+                && n.placeholder() == Some("Rechercher dans tout le projet…")
+        };
+        harness.get_by(is_search).type_text("/\\d{4}/ coffre");
+        harness.run_steps(4);
+        snapshot(&mut harness, "40_recherche");
+        // Clic sur la ligne trouvée : la fiche s'ouvre, ligne en édition.
+        harness.get_by_label_contains("Le code 1945").click();
+        harness.run_steps(6);
+        assert_eq!(open_title(&harness), "Essai");
+        assert_eq!(
+            editing_text(&harness).as_deref(),
+            Some("Le code 1945 ouvre le coffre.")
+        );
+
+        // Ouverture rapide : fiches seulement, création si absente.
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(2);
+        harness.key_press_modifiers(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::O,
+        );
+        harness.run_steps(4);
+        let quick = |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+            n.role() == Role::TextInput && n.placeholder() == Some("Titre de la fiche à ouvrir…")
+        };
+        harness.get_by(quick).focus();
+        harness.run_steps(1);
+        harness.get_by(quick).type_text("Nouvelle piste");
+        harness.run_steps(2);
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(6);
+        assert_eq!(open_title(&harness), "Nouvelle piste");
     }
 
     #[test]
