@@ -3920,6 +3920,29 @@ mod ui_tests {
     }
 
     #[test]
+    fn pack_editor_window_keeps_a_fixed_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            ws.pack_editor = Some(PackEditor::edit_current(&ws.project, None));
+        }
+        harness.run_steps(8);
+        let size = |h: &Harness<'_, State>| h.get_by_label("Modifier le pack de jeu").rect();
+        let first = size(&harness);
+        // Des dizaines d'images sans y toucher : la fenêtre ne bouge pas.
+        harness.run_steps(80);
+        assert_eq!(size(&harness), first, "la fenêtre a changé toute seule");
+        // Et elle garde sa taille d'une section à l'autre.
+        for label in ["Général", "Catégories", "Statuts", "Champs", "Modèles"] {
+            harness.get_by_label(label).click();
+            harness.run_steps(12);
+            assert_eq!(size(&harness), first, "taille changée sur « {label} »");
+        }
+    }
+
+    #[test]
     fn rename_from_title_and_external_reload() {
         let dir = tempfile::tempdir().unwrap();
         let mut harness = setup(dir.path());

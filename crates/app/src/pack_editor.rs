@@ -91,6 +91,9 @@ pub enum Outcome {
     Saved,
 }
 
+/// Hauteur de la zone défilante des sections.
+const SCROLL_H: f32 = 360.0;
+
 impl PackEditor {
     /// Modifier le pack actuel du projet.
     pub fn edit_current(project: &Project, user_dir: Option<&Path>) -> PackEditor {
@@ -211,7 +214,11 @@ impl PackEditor {
         egui::Window::new(title)
             .id(egui::Id::unique("pack_editor"))
             .open(&mut open)
-            .default_size([640.0, 520.0])
+            // Taille fixe : une fenêtre redimensionnable dont la zone défilante
+            // prend « tout l'espace restant » grandit d'elle-même à chaque
+            // image dès que le pied de page est plus haut que prévu.
+            .default_width(640.0)
+            .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
                 if let Some(info) = &self.info {
@@ -226,10 +233,10 @@ impl PackEditor {
                 ui.separator();
 
                 let problems = self.problems(project);
-                let footer_h = 40.0 + 16.0 * problems.len().min(6) as f32;
                 egui::ScrollArea::vertical()
                     .id_salt("pack_editor_scroll")
-                    .max_height((ui.available_height() - footer_h).max(120.0))
+                    .min_scrolled_height(SCROLL_H)
+                    .max_height(SCROLL_H)
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.section {
                         Section::General => self.general_ui(ui),
