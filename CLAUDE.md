@@ -259,6 +259,17 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
   SVG d'egui n'a aucune police : sans cela le texte disparaît). Export
   PDF : Markdown → source Typst (`markdown_to_typst`) → `typst-pdf`.
   Coût : l'exécutable release passe d'environ 24 Mo à 74 Mo.
+- **Packs en ligne** (`app/pack_catalog.rs`) : l'API GitHub
+  `contents/packs` du dépôt (`update::REPO`) liste les dossiers, puis le
+  `pack.json` de chacun est téléchargé (`raw.githubusercontent.com/…/HEAD/`),
+  validé comme un pack local (id = nom du dossier, noms limités à
+  `[a-z0-9_-]`, 256 Ko max). La recherche part toute seule seulement si le
+  projet n'a pas de pack (ou que celui qu'il réclame manque), si les
+  vérifications automatiques sont permises et hors développement ; le menu
+  Pack a toujours « Chercher des packs en ligne… ». Rien n'est installé
+  sans clic (bandeau « Installer … » ou « Télécharger : … ») : le pack est
+  écrit dans le dossier de packs de l'utilisateur. Pour publier un pack :
+  l'ajouter dans `packs/<id>/pack.json` du dépôt.
 - **Versions** (`enigma_core::versions`) : `Project::save` garde le
   contenu *remplacé* (pas le nouveau) dans `.enigma/versions/<id>/`.
 - **Dans kittest** : l'indication (`placeholder`) d'un champ n'existe que
@@ -312,9 +323,8 @@ avec messages d'erreur lisibles. Un projet référence son pack dans
 
 ## Build et publication
 - Exécutable : `cargo build --release -p enigma-app` → `target/release/enigma(.exe)`
-  (un seul fichier : les packs fournis sont intégrés, voir
-  `app/bundled_packs.rs`, et déposés au démarrage dans
-  `<données locales>/Enigma Notes/data/packs-integres`).
+  (un seul fichier, **sans aucun pack intégré** : ceux du dépôt officiel,
+  dossier `packs/`, sont cherchés en ligne, voir « Packs en ligne »).
 - CI GitHub (`.github/workflows/ci.yml`) : fmt + clippy + tests sur Windows,
   Linux et macOS à chaque push/PR.
 - Publier une version : mettre `version` de `[workspace.package]` à jour,

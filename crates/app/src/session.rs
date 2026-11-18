@@ -59,18 +59,15 @@ impl Session {
         match Workspace::open(file.workdir(), pack_roots, ctx, notices) {
             Ok(mut ws) => {
                 if new_project && ws.project.config().pack.is_none() {
-                    // Nouveau projet : le pack Blue Prince s'il est là, sinon le premier.
+                    // Nouveau projet : le premier pack installé, s'il y en a un (sinon
+                    // le dépôt officiel en propose).
                     let packs: Vec<String> = ws
                         .project
                         .available_packs()
                         .into_iter()
                         .filter_map(|d| d.result.ok().map(|p| p.id))
                         .collect();
-                    let choice = packs
-                        .iter()
-                        .find(|id| *id == "blue_prince")
-                        .or(packs.first())
-                        .cloned();
+                    let choice = packs.first().cloned();
                     let meta = ws.project.root().join(enigma_core::project::META_DIR);
                     let _ = std::fs::create_dir_all(&meta);
                     if let Some(id) = choice

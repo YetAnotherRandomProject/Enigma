@@ -5,7 +5,6 @@
 
 mod app;
 mod board_view;
-mod bundled_packs;
 mod clipboard;
 mod colors;
 mod commands;
@@ -17,6 +16,7 @@ mod graph_export;
 mod graph_view;
 mod highlight;
 mod notices;
+mod pack_catalog;
 mod pack_editor;
 mod palette;
 mod paths;

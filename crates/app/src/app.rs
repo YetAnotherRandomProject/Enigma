@@ -11,6 +11,7 @@ use enigma_core::shortcut::Keymap;
 
 use crate::commands::{self, Command};
 use crate::notices::Notices;
+use crate::pack_catalog::{PackCatalog, State as CatState};
 use crate::paths;
 use crate::session::{Session, converted_path, is_project_file};
 use crate::update::{self, Updater};
@@ -32,6 +33,8 @@ pub struct EnigmaApp {
     /// Fichier des raccourcis (`None` : illisible, donc jamais écrasé).
     keymap_path: Option<PathBuf>,
     updater: Updater,
+    /// Packs du dépôt officiel (recherche en arrière-plan).
+    catalog: PackCatalog,
     /// Chercher une mise à jour au démarrage.
     auto_update: bool,
     /// Ancien dossier de fiches dont on propose la conversion.
@@ -70,6 +73,7 @@ impl EnigmaApp {
             keymap,
             keymap_path,
             updater: Updater::default(),
+            catalog: PackCatalog::default(),
             auto_update: cc
                 .storage
                 .and_then(|s| eframe::get_value(s, AUTO_UPDATE_KEY))
@@ -285,7 +289,7 @@ impl EnigmaApp {
             }
             if let Some(s) = &mut self.session {
                 ui.separator();
-                s.ws.pack_selector_ui(ui, &mut self.notices);
+                s.ws.pack_selector_ui(ui, &mut self.notices, &mut self.catalog);
                 ui.separator();
                 ui.weak(s.path().display().to_string());
             }
@@ -382,6 +386,72 @@ fn recent_label(p: &Path) -> String {
     }
 }
 
+impl EnigmaApp {
+    /// Suggère les packs du dépôt officiel quand le projet n'a pas de pack
+    /// (ou que le pack qu'il réclame manque). La recherche part toute seule
+    /// si les vérifications automatiques sont permises (jamais en
+    /// développement) ; l'installation attend toujours un clic.
+    fn pack_suggestions(&mut self, ui: &mut egui::Ui) {
+        self.catalog.poll();
+        let Some(s) = &mut self.session else {
+            return;
+        };
+        if !s.ws.needs_pack() {
+            return;
+        }
+        if self.catalog.state == CatState::Idle && self.auto_update && !cfg!(debug_assertions) {
+            self.catalog.fetch(ui.ctx());
+        }
+        if self.catalog.state != CatState::Ready || self.catalog.dismissed {
+            return;
+        }
+        let installed = s.ws.installed_pack_ids();
+        let wanted = s.ws.wanted_pack();
+        let choices: Vec<_> = self
+            .catalog
+            .suggestions(&installed, wanted.as_deref())
+            .into_iter()
+            .take(4)
+            .cloned()
+            .collect();
+        if choices.is_empty() {
+            return;
+        }
+        let mut picked = None;
+        let mut later = false;
+        egui::Panel::top("pack_suggestions").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(match &wanted {
+                    Some(id) => format!(
+                        "Le pack « {id} » de ce projet manque. Le dépôt officiel le propose :"
+                    ),
+                    None => "Ce projet n'a pas de pack de jeu. Le dépôt officiel en propose :"
+                        .to_owned(),
+                });
+                for p in &choices {
+                    let r = ui.button(format!("Installer « {} »", p.name));
+                    let r = match &p.description {
+                        Some(d) => r.on_hover_text(d),
+                        None => r,
+                    };
+                    if r.clicked() {
+                        picked = Some(p.clone());
+                    }
+                }
+                if ui.button("Plus tard").clicked() {
+                    later = true;
+                }
+            });
+        });
+        if later {
+            self.catalog.dismissed = true;
+        }
+        if let (Some(p), Some(s)) = (picked, &mut self.session) {
+            s.ws.install_online_pack(&p, true, &mut self.notices);
+        }
+    }
+}
+
 impl eframe::App for EnigmaApp {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let files = crate::clipboard::translate(raw_input, crate::clipboard::read_system);
@@ -408,6 +478,7 @@ impl eframe::App for EnigmaApp {
                 }
             }
         }
+        self.pack_suggestions(ui);
         if !self.notices.is_empty() {
             egui::Panel::bottom("notices").show(ui, |ui| self.notices.ui(ui));
         }

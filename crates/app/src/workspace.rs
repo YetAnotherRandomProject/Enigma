@@ -1301,8 +1301,67 @@ impl Workspace {
         self.last_edit = Some(Instant::now());
     }
 
+    /// Identifiants des packs trouvés sur cet ordinateur.
+    pub fn installed_pack_ids(&self) -> Vec<String> {
+        self.packs.iter().map(|p| p.id.clone()).collect()
+    }
+
+    /// Le projet n'a pas de pack, ou le pack qu'il réclame est introuvable :
+    /// l'application peut en suggérer un du dépôt officiel.
+    pub fn needs_pack(&self) -> bool {
+        self.project.config().pack.is_none() || self.project.pack_issue().is_some()
+    }
+
+    /// Pack réclamé par le projet (introuvable sur cet ordinateur).
+    pub fn wanted_pack(&self) -> Option<String> {
+        self.project
+            .config()
+            .pack
+            .clone()
+            .filter(|_| self.project.pack_issue().is_some())
+    }
+
+    /// Installe un pack du dépôt officiel (dossier de packs de l'utilisateur)
+    /// et, avec `use_it`, l'attribue au projet.
+    pub fn install_online_pack(
+        &mut self,
+        pack: &crate::pack_catalog::OnlinePack,
+        use_it: bool,
+        notices: &mut Notices,
+    ) {
+        let Some(dir) = self.user_packs_dir.clone() else {
+            notices
+                .error("Pas de dossier de packs pour installer « ".to_owned() + &pack.name + " ».");
+            return;
+        };
+        if let Err(e) = crate::pack_catalog::install(pack, &dir) {
+            notices.error(format!("Pack « {} » non installé : {e}", pack.name));
+            return;
+        }
+        self.refresh_packs();
+        notices.info(format!("Pack « {} » installé.", pack.name));
+        if use_it {
+            match self.project.set_pack(Some(pack.id.clone())) {
+                Ok(()) => {
+                    if let Some(issue) = self.project.pack_issue() {
+                        notices.error(format!("Pack de jeu : {issue}"));
+                    }
+                }
+                Err(e) => notices.error(format!("Changement de pack impossible : {e}")),
+            }
+        }
+    }
+
     /// Sélecteur de pack de jeu (barre du haut).
-    pub fn pack_selector_ui(&mut self, ui: &mut egui::Ui, notices: &mut Notices) {
+    pub fn pack_selector_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        notices: &mut Notices,
+        catalog: &mut crate::pack_catalog::PackCatalog,
+    ) {
+        use crate::pack_catalog::State as CatState;
+        let mut download: Option<crate::pack_catalog::OnlinePack> = None;
+        let mut search = false;
         let current = self.project.config().pack.clone();
         let label = match (&current, self.project.pack_issue()) {
             (None, _) => "Aucun pack".to_owned(),
@@ -1339,7 +1398,48 @@ impl Workspace {
                 if ui.button("Actualiser la liste").clicked() {
                     refresh = true;
                 }
+                ui.separator();
+                ui.label(RichText::new("Packs du dépôt officiel").small().weak());
+                match &catalog.state {
+                    CatState::Idle => {
+                        if ui.button("Chercher des packs en ligne…").clicked() {
+                            search = true;
+                        }
+                    }
+                    CatState::Loading => {
+                        ui.weak("Recherche en cours…");
+                    }
+                    CatState::Failed(e) => {
+                        ui.colored_label(ui.visuals().error_fg_color, e.as_str());
+                        if ui.button("Réessayer").clicked() {
+                            search = true;
+                        }
+                    }
+                    CatState::Ready => {
+                        let installed = self.installed_pack_ids();
+                        let missing = catalog.suggestions(&installed, None);
+                        if missing.is_empty() {
+                            ui.weak("Tous les packs du dépôt sont installés.");
+                        }
+                        for p in missing {
+                            let r = ui.button(format!("Télécharger : {}", p.name));
+                            let r = match &p.description {
+                                Some(d) => r.on_hover_text(d),
+                                None => r,
+                            };
+                            if r.clicked() {
+                                download = Some(p.clone());
+                            }
+                        }
+                    }
+                }
             });
+        if search {
+            catalog.fetch(ui.ctx());
+        }
+        if let Some(p) = download {
+            self.install_online_pack(&p, current.is_none(), notices);
+        }
         if !self.project.pack().id.is_empty()
             && ui
                 .button("Modifier le pack…")
@@ -3734,6 +3834,32 @@ mod ui_tests {
             ws.export_pdf(&id, &out, &mut state.notices);
         }
         assert!(std::fs::read(&out).unwrap().starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn online_pack_is_installed_and_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        let json = r##"{ "version": 1, "id": "essai", "name": "Essai en ligne",
+            "categories": [ { "id": "a", "label": "A", "color": "#112233" } ] }"##;
+        let online = crate::pack_catalog::validate("essai", json).unwrap();
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            ws.project.set_pack(None).unwrap();
+            assert!(ws.needs_pack());
+            assert!(!ws.installed_pack_ids().contains(&"essai".to_owned()));
+            ws.install_online_pack(&online, true, &mut state.notices);
+            assert!(ws.installed_pack_ids().contains(&"essai".to_owned()));
+            assert!(!ws.needs_pack());
+            assert_eq!(ws.project.pack().name, "Essai en ligne");
+        }
+        // Installé dans le dossier de l'utilisateur, pas dans le dépôt.
+        assert!(
+            dir.path()
+                .join(".packs-utilisateur/essai/pack.json")
+                .is_file()
+        );
     }
 
     #[test]
