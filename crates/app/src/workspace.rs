@@ -79,6 +79,21 @@ enum Dialog {
     ConfirmDelete(NoteId),
     /// Choix d'un modèle du pack à insérer dans la fiche ouverte.
     InsertTemplate,
+    /// Historique des versions d'une fiche (version choisie).
+    Versions {
+        id: NoteId,
+        selected: usize,
+    },
+    /// Choix de la fiche dans laquelle fusionner.
+    Merge {
+        id: NoteId,
+        query: String,
+    },
+    /// Titre de la fiche extraite de la sélection.
+    Extract {
+        title: String,
+        error: Option<String>,
+    },
 }
 
 /// Ligne de la liste des fiches (en-tête de catégorie ou fiche).
@@ -171,6 +186,7 @@ struct PaneOutcome {
     insert_template: bool,
     search_tag: Option<String>,
     open: Option<(NoteId, Option<String>)>,
+    extract: bool,
 }
 
 impl Workspace {
@@ -447,6 +463,9 @@ impl Workspace {
             | Command::Redo
             | Command::InsertImage
             | Command::InsertTemplate
+            | Command::VersionHistory
+            | Command::MergeNote
+            | Command::ExtractSelection
             | Command::CloseTab
             | Command::SplitView
             | Command::FindInNote => self.editor.is_some(),
@@ -480,6 +499,21 @@ impl Workspace {
                 self.left_tab = LeftTab::Search;
                 self.search.focus = true;
             }
+            Command::VersionHistory => {
+                if let Some(id) = self.editor.as_ref().map(|e| e.id.clone()) {
+                    self.flush(notices);
+                    self.dialog = Some(Dialog::Versions { id, selected: 0 });
+                }
+            }
+            Command::MergeNote => {
+                if let Some(id) = self.editor.as_ref().map(|e| e.id.clone()) {
+                    self.dialog = Some(Dialog::Merge {
+                        id,
+                        query: String::new(),
+                    });
+                }
+            }
+            Command::ExtractSelection => self.open_extract_dialog(notices),
             Command::InsertTemplate => {
                 if self.editor.is_some() {
                     self.view = View::Note;
@@ -862,6 +896,7 @@ impl Workspace {
         out.edited = edited || body.edited || insert_table.is_some();
         out.insert_template = body.insert_template;
         out.search_tag = body.search_tag;
+        out.extract = body.extract;
         out.open = body.open.map(|id| (id, body.open_section));
         out
     }
@@ -876,6 +911,9 @@ impl Workspace {
         }
         if out.insert_template {
             self.dialog = Some(Dialog::InsertTemplate);
+        }
+        if out.extract {
+            self.open_extract_dialog(notices);
         }
         if let Some(tag) = out.search_tag {
             self.search_tag(&tag);
@@ -1118,6 +1156,30 @@ impl Workspace {
             e.set_salt(salt);
             e
         })
+    }
+
+    /// Demande le titre de la fiche à extraire de la sélection.
+    fn open_extract_dialog(&mut self, notices: &mut Notices) {
+        let Some(sel) = self.editor.as_ref().map(|e| e.selection_text()) else {
+            return;
+        };
+        if sel.trim().is_empty() {
+            notices.info("Sélectionnez d'abord le texte à extraire.");
+            return;
+        }
+        let first = sel
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim_start_matches(['#', '-', '*', '>', ' '])
+            .chars()
+            .take(60)
+            .collect::<String>();
+        self.view = View::Note;
+        self.dialog = Some(Dialog::Extract {
+            title: first.trim().to_owned(),
+            error: None,
+        });
     }
 
     /// Montre les fiches qui portent ce tag (onglet Recherche).
@@ -2234,6 +2296,9 @@ impl Workspace {
         let mut close = false;
         let mut created = None;
         let mut insert_template: Option<enigma_core::pack::Template> = None;
+        let mut restore: Option<(NoteId, String)> = None;
+        let mut merge: Option<(NoteId, NoteId)> = None;
+        let mut extract: Option<String> = None;
         let mut delete = None;
         match dialog {
             Dialog::NewNote {
@@ -2308,6 +2373,178 @@ impl Workspace {
                     close = true;
                 }
             }
+            Dialog::Versions { id, selected } => {
+                let versions = enigma_core::versions::list(self.project.root(), id);
+                let current = self
+                    .project
+                    .note(id)
+                    .and_then(|n| n.serialize().ok())
+                    .unwrap_or_default();
+                let title = self
+                    .project
+                    .note(id)
+                    .map(|n| n.meta.title.clone())
+                    .unwrap_or_default();
+                let resp = egui::Modal::new(egui::Id::unique("versions")).show(ctx, |ui| {
+                    ui.set_width(760.0);
+                    ui.heading(format!("Historique : {title}"));
+                    if versions.is_empty() {
+                        ui.weak(
+                            "Aucune version gardée pour l'instant : une copie est prise à \
+                             l'enregistrement, au plus toutes les 10 minutes.",
+                        );
+                    }
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(200.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("versions_list")
+                                .max_height(420.0)
+                                .show(ui, |ui| {
+                                    for (k, v) in versions.iter().enumerate() {
+                                        let when = crate::project_file::file_date(
+                                            std::time::UNIX_EPOCH
+                                                + std::time::Duration::from_secs(v.time),
+                                        );
+                                        let label = format!("{when} ({} o)", v.size);
+                                        if ui.selectable_label(*selected == k, label).clicked() {
+                                            *selected = k;
+                                        }
+                                    }
+                                });
+                        });
+                        ui.add_space(12.0);
+                        ui.vertical(|ui| {
+                            let Some(v) = versions.get(*selected) else {
+                                return;
+                            };
+                            let old = enigma_core::versions::read(v).unwrap_or_default();
+                            ui.label(
+                                RichText::new("Différences avec la fiche actuelle (rouge : seulement dans cette version, vert : ajouté depuis)")
+                                    .small()
+                                    .weak(),
+                            );
+                            egui::ScrollArea::vertical()
+                                .id_salt("versions_diff")
+                                .max_height(400.0)
+                                .show(ui, |ui| {
+                                    use enigma_core::versions::Diff;
+                                    let red = ui.visuals().error_fg_color;
+                                    let green = Color32::from_rgb(0x27, 0xae, 0x60);
+                                    for d in enigma_core::versions::line_diff(&old, &current) {
+                                        let (prefix, text, color) = match d {
+                                            Diff::Same(t) => ("  ", t, ui.visuals().weak_text_color()),
+                                            Diff::Removed(t) => ("- ", t, red),
+                                            Diff::Added(t) => ("+ ", t, green),
+                                        };
+                                        ui.label(
+                                            RichText::new(format!("{prefix}{text}"))
+                                                .monospace()
+                                                .color(color),
+                                        );
+                                    }
+                                });
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        if let Some(v) = versions.get(*selected)
+                            && ui
+                                .button("Restaurer cette version")
+                                .on_hover_text("Annulable avec Ctrl+Z")
+                                .clicked()
+                        {
+                            restore = Some((
+                                id.clone(),
+                                enigma_core::versions::read(v).unwrap_or_default(),
+                            ));
+                        }
+                        if ui.button("Fermer").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                if resp.should_close() {
+                    close = true;
+                }
+            }
+            Dialog::Merge { id, query } => {
+                let resp = egui::Modal::new(egui::Id::unique("merge_note")).show(ctx, |ui| {
+                    ui.set_width(380.0);
+                    let title = self
+                        .project
+                        .note(id)
+                        .map(|n| n.meta.title.clone())
+                        .unwrap_or_default();
+                    ui.heading(format!("Fusionner « {title} » avec…"));
+                    ui.label(
+                        RichText::new(
+                            "Le texte, les catégories, les champs et les liens vont dans la \
+                             fiche choisie ; les liens qui visaient cette fiche visent la \
+                             nouvelle ; cette fiche va à la corbeille.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(query)
+                            .hint_text("Fiche de destination")
+                            .desired_width(360.0),
+                    )
+                    .request_focus();
+                    for other in self.project.search(query).into_iter().take(10) {
+                        if other == *id {
+                            continue;
+                        }
+                        let Some(n) = self.project.note(&other) else {
+                            continue;
+                        };
+                        if ui.button(&n.meta.title).clicked() {
+                            merge = Some((id.clone(), other.clone()));
+                        }
+                    }
+                    if ui.button("Annuler").clicked() {
+                        close = true;
+                    }
+                });
+                if resp.should_close() {
+                    close = true;
+                }
+            }
+            Dialog::Extract { title, error } => {
+                let resp = egui::Modal::new(egui::Id::unique("extract_note")).show(ctx, |ui| {
+                    ui.set_width(380.0);
+                    ui.heading("Extraire la sélection");
+                    ui.label(
+                        RichText::new(
+                            "Le texte sélectionné devient une nouvelle fiche ; il est \
+                             remplacé ici par un lien vers elle.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(title)
+                            .hint_text("Titre de la nouvelle fiche")
+                            .desired_width(360.0),
+                    );
+                    edit.request_focus();
+                    if let Some(e) = error {
+                        ui.colored_label(ui.visuals().error_fg_color, e.as_str());
+                    }
+                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.button("Extraire").clicked() || enter {
+                            extract = Some(title.clone());
+                        }
+                        if ui.button("Annuler").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                if resp.should_close() {
+                    close = true;
+                }
+            }
             Dialog::InsertTemplate => {
                 let templates = self.project.pack().templates.clone();
                 let resp = egui::Modal::new(egui::Id::unique("insert_template")).show(ctx, |ui| {
@@ -2370,7 +2607,85 @@ impl Workspace {
             }
         }
 
-        if let Some(t) = insert_template {
+        if let Some((id, text)) = restore {
+            self.dialog = None;
+            match enigma_core::Note::parse(&text, "") {
+                Ok(old) => {
+                    let mut meta = old.meta;
+                    if let Some(cur) = self.project.note(&id) {
+                        // Le titre (et le fichier) restent ceux d'aujourd'hui.
+                        meta.title = cur.meta.title.clone();
+                        meta.id = cur.meta.id.clone();
+                    }
+                    let res = self
+                        .project
+                        .set_meta(&id, meta)
+                        .and_then(|()| self.project.set_body(&id, old.body));
+                    match res {
+                        Ok(()) => {
+                            if let Some(ed) = self.editor.as_mut().filter(|e| e.id == id) {
+                                ed.sync_from_project(&self.project, self.now_ms);
+                            }
+                            self.mark_edited();
+                            notices.info("Version restaurée (Ctrl+Z pour revenir).");
+                        }
+                        Err(e) => notices.error(format!("Restauration impossible : {e}")),
+                    }
+                }
+                Err(e) => notices.error(format!("Version illisible : {e}")),
+            }
+        } else if let Some((src, dst)) = merge {
+            self.dialog = None;
+            self.flush(notices);
+            if self.editor.as_ref().is_some_and(|e| e.id == src) {
+                self.editor = None;
+            }
+            self.forget_note(&src);
+            match self.project.merge_into(&src, &dst) {
+                Ok(updated) => {
+                    notices.info(format!(
+                        "Fiches fusionnées ; {} fiche(s) mise(s) à jour.",
+                        updated.len()
+                    ));
+                    self.disk_changed = true;
+                    self.select(&dst, notices);
+                    for ed in self.parked.values_mut() {
+                        ed.sync_from_project(&self.project, self.now_ms);
+                    }
+                }
+                Err(e) => notices.error(format!("Fusion impossible : {e}")),
+            }
+        } else if let Some(title) = extract {
+            let text = self
+                .editor
+                .as_ref()
+                .map(|e| e.selection_text())
+                .unwrap_or_default();
+            match self.project.create_note(&title, Vec::new(), text) {
+                Ok(new_id) => {
+                    self.dialog = None;
+                    let clean = self
+                        .project
+                        .note(&new_id)
+                        .map(|n| n.meta.title.clone())
+                        .unwrap_or(title);
+                    if let Some(ed) = &mut self.editor {
+                        ed.replace_selection(
+                            &format!("[[{clean}]]"),
+                            &mut self.project,
+                            self.now_ms,
+                        );
+                    }
+                    self.mark_edited();
+                    notices.info(format!("Fiche « {clean} » créée à partir de la sélection."));
+                }
+                Err(e) => {
+                    if let Some(Dialog::Extract { error, .. }) = &mut self.dialog {
+                        *error = Some(e.to_string());
+                    }
+                }
+            }
+        } else if let Some(t) = insert_template {
             self.dialog = None;
             if let Some(ed) = &mut self.editor {
                 let title = self
@@ -3282,6 +3597,67 @@ mod ui_tests {
         let other = ws.other.as_ref().unwrap().id.clone();
         assert_eq!(ws.project.note(&other).unwrap().meta.title, "Majordome");
         snapshot(&mut harness, "48_cote_a_cote");
+    }
+
+    #[test]
+    fn versions_extract_and_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        new_note(&mut harness, "Essai", "Intro\nligne à extraire\nfin");
+        let run = |h: &mut Harness<'_, State>, cmd: Command| {
+            let state = h.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            ws.run_command(cmd, &egui::Context::default(), &mut state.notices);
+            h.run_steps(10);
+        };
+        // Historique : la version gardée à la création, puis restaurée.
+        {
+            let ws = harness.state_mut().ws.as_mut().unwrap();
+            let id = ws.project.resolve_title("Essai").unwrap().clone();
+            ws.project.set_body(&id, "Tout changé".into()).unwrap();
+            let now = ws.now_ms;
+            ws.editor
+                .as_mut()
+                .unwrap()
+                .sync_from_project(&ws.project, now);
+        }
+        run(&mut harness, Command::VersionHistory);
+        snapshot(&mut harness, "50_versions");
+        harness.get_by_label("Restaurer cette version").click();
+        harness.run_steps(4);
+        assert_eq!(body_text(&harness), "Intro\nligne à extraire\nfin");
+
+        // Extraire la ligne sélectionnée.
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .select_bytes(6, 23);
+        harness.run_steps(4);
+        run(&mut harness, Command::ExtractSelection);
+        harness.get_by_label("Extraire").click();
+        harness.run_steps(4);
+        assert_eq!(body_text(&harness), "Intro\n[[ligne à extraire]]\nfin");
+        let ws = harness.state().ws.as_ref().unwrap();
+        let new = ws.project.resolve_title("ligne à extraire").unwrap();
+        assert_eq!(ws.project.note(new).unwrap().body, "ligne à extraire");
+
+        // Fusionner « Essai » dans « Majordome ».
+        run(&mut harness, Command::MergeNote);
+        harness
+            .get_all_by_label("Majordome")
+            .last()
+            .unwrap()
+            .click();
+        harness.run_steps(6);
+        let ws = harness.state().ws.as_ref().unwrap();
+        assert!(ws.project.resolve_title("Essai").is_none());
+        assert_eq!(open_title(&harness), "Majordome");
+        assert!(body_text(&harness).contains("## Essai\n\nIntro\n[[ligne à extraire]]"));
     }
 
     #[test]

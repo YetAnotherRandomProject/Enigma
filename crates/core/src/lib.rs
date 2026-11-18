@@ -36,6 +36,7 @@ pub mod sections;
 pub mod shortcut;
 pub mod storage;
 pub mod table;
+pub mod versions;
 
 pub use id::NoteId;
 pub use note::{FieldValue, MetaLink, Note, NoteMeta, Pos};

@@ -462,12 +462,98 @@ impl Project {
     /// Écrit une fiche sur le disque (atomiquement), qu'elle soit modifiée ou non.
     pub fn save(&mut self, id: &NoteId) -> Result<(), ProjectError> {
         let e = self.notes.get_mut(id).ok_or(ProjectError::UnknownNote)?;
-        let bytes = e.note.serialize()?.into_bytes();
-        write_atomic(&e.path, &bytes).map_err(io_err("écrire", &e.path))?;
-        e.disk_hash = Some(hash_bytes(&bytes));
+        let text = e.note.serialize()?;
+        // Le contenu remplacé est gardé pour l'historique des versions.
+        let previous = std::fs::read_to_string(&e.path)
+            .ok()
+            .filter(|old| *old != text);
+        let bytes = text.as_bytes();
+        write_atomic(&e.path, bytes).map_err(io_err("écrire", &e.path))?;
+        e.disk_hash = Some(hash_bytes(bytes));
         e.dirty = false;
         e.note.had_frontmatter = true;
+        if let Some(old) = previous {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            if let Err(err) = crate::versions::snapshot(&self.root, id, &old, now) {
+                tracing::warn!("historique des versions : {err}");
+            }
+        }
         Ok(())
+    }
+
+    /// Fusionne la fiche `src` dans `dst` : texte ajouté sous un titre,
+    /// catégories, champs absents et liens repris ; les références à `src`
+    /// (`[[Titre]]` et liens d'en-tête) visent désormais `dst` ; `src` va à
+    /// la corbeille. Rend les fiches réécrites.
+    pub fn merge_into(&mut self, src: &NoteId, dst: &NoteId) -> Result<Vec<NoteId>, ProjectError> {
+        if src == dst {
+            return Ok(Vec::new());
+        }
+        let s = self.note(src).ok_or(ProjectError::UnknownNote)?.clone();
+        let d = self.note(dst).ok_or(ProjectError::UnknownNote)?.clone();
+        let mut meta = d.meta.clone();
+        for c in &s.meta.categories {
+            if !meta.has_category(c) {
+                meta.toggle_category(c);
+            }
+        }
+        for (k, v) in &s.meta.fields {
+            meta.fields.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        for l in &s.meta.links {
+            if l.to != *dst && !meta.links.contains(l) {
+                meta.links.push(l.clone());
+            }
+        }
+        meta.links.retain(|l| l.to != *src);
+        let mut body = d.body.trim_end().to_owned();
+        if !s.body.trim().is_empty() {
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            body.push_str(&format!("## {}\n\n{}", s.meta.title, s.body.trim()));
+        }
+        // Dans le texte repris, les liens vers `src` visent `dst`.
+        if let Some(b) = markdown::rewrite_wiki_targets(&body, &s.meta.title, &d.meta.title) {
+            body = b;
+        }
+        self.set_meta(dst, meta)?;
+        self.set_body(dst, body)?;
+        self.save(dst)?;
+
+        let mut updated = vec![dst.clone()];
+        let ids: Vec<NoteId> = self.notes.keys().cloned().collect();
+        for other in ids {
+            if other == *src || other == *dst {
+                continue;
+            }
+            let Some(n) = self.note(&other).cloned() else {
+                continue;
+            };
+            let mut changed = false;
+            let mut m = n.meta.clone();
+            for l in &mut m.links {
+                if l.to == *src {
+                    l.to = dst.clone();
+                    changed = true;
+                }
+            }
+            if changed {
+                self.set_meta(&other, m)?;
+            }
+            if let Some(b) = markdown::rewrite_wiki_targets(&n.body, &s.meta.title, &d.meta.title) {
+                self.set_body(&other, b)?;
+                changed = true;
+            }
+            if changed {
+                self.save(&other)?;
+                updated.push(other);
+            }
+        }
+        self.delete(src)?;
+        Ok(updated)
     }
 
     /// Fiches ayant des modifications non enregistrées.
@@ -1807,5 +1893,49 @@ title: Fiche {i}
             Err(ProjectError::Pack(_))
         ));
         assert!(open(d.path()).pack().problems().is_empty());
+    }
+
+    #[test]
+    fn merge_moves_text_meta_and_references() {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = Project::open(d.path(), &[]).unwrap();
+        let a = p
+            .create_note(
+                "Clé rouillée",
+                vec!["objet".into()],
+                "Trouvée au puits. Voir [[Coffre]].".into(),
+            )
+            .unwrap();
+        let b = p
+            .create_note("Coffre", vec!["piece".into()], "Fermé.".into())
+            .unwrap();
+        let c = p
+            .create_note(
+                "Journal",
+                vec![],
+                "La [[Clé rouillée]] ouvre le [[coffre]].".into(),
+            )
+            .unwrap();
+        p.merge_into(&a, &b).unwrap();
+        assert!(p.note(&a).is_none(), "fiche fusionnée à la corbeille");
+        let merged = p.note(&b).unwrap();
+        assert_eq!(
+            merged.body,
+            "Fermé.
+
+## Clé rouillée
+
+Trouvée au puits. Voir [[Coffre]]."
+        );
+        assert!(merged.meta.has_category("objet") && merged.meta.has_category("piece"));
+        assert_eq!(
+            p.note(&c).unwrap().body,
+            "La [[Coffre]] ouvre le [[coffre]]."
+        );
+        // L'ancienne version de la fiche de destination a été gardée.
+        let kept = crate::versions::list(d.path(), &b);
+        assert_eq!(kept.len(), 1);
+        let old = crate::versions::read(&kept[0]).unwrap();
+        assert!(old.contains("Fermé.") && !old.contains("rouillée"), "{old}");
     }
 }

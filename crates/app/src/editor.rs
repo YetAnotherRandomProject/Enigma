@@ -140,6 +140,8 @@ pub struct BodyOutcome {
     pub search_tag: Option<String>,
     /// Ouvrir le choix d'un modèle à insérer.
     pub insert_template: bool,
+    /// Extraire la sélection dans une nouvelle fiche.
+    pub extract: bool,
     /// Ouvrir le sélecteur « Insérer une image ou un fichier ».
     pub insert_file: bool,
 }
@@ -165,6 +167,8 @@ pub enum MenuChoice {
     Cut,
     /// Copier un lien vers la section ou le paragraphe du curseur.
     CopyLinkHere,
+    /// Extraire la sélection dans une nouvelle fiche.
+    Extract,
 }
 
 /// Menu contextuel du texte.
@@ -186,6 +190,12 @@ pub fn format_menu(ui: &mut egui::Ui, has_selection: bool) -> Option<MenuChoice>
     if has_selection {
         item(ui, "Couper", "Ctrl+X", MenuChoice::Cut);
         item(ui, "Copier", "Ctrl+C", MenuChoice::Copy);
+        item(
+            ui,
+            "Extraire dans une nouvelle fiche…",
+            "",
+            MenuChoice::Extract,
+        );
         ui.separator();
     }
     item(
@@ -1612,6 +1622,7 @@ impl Editor {
                 outcome.edited = true;
             }
             MenuChoice::InsertFile => outcome.insert_file = true,
+            MenuChoice::Extract => outcome.extract = true,
             MenuChoice::CopyLinkHere => {
                 let title = project
                     .note(&self.id)
@@ -2021,6 +2032,13 @@ impl Editor {
         }
     }
 
+    /// Sélectionne une plage (octets) en édition (tests).
+    #[cfg(test)]
+    pub fn select_bytes(&mut self, a: usize, b: usize) {
+        self.pending_anchor = Some(self.body[..a].chars().count());
+        self.pending_cursor = Some(self.body[..b].chars().count());
+    }
+
     /// Commence à écrire à cet octet (tests).
     #[cfg(test)]
     pub fn edit_at(&mut self, b: usize) {
@@ -2031,6 +2049,29 @@ impl Editor {
     #[cfg(test)]
     pub fn is_editing(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// Texte sélectionné (vide sans sélection).
+    pub fn selection_text(&self) -> String {
+        self.selected_text()
+    }
+
+    /// Remplace la sélection par `text` (étape d'historique).
+    pub fn replace_selection(&mut self, text: &str, project: &mut Project, now_ms: u64) {
+        let len = self.body.len();
+        let Some(sel) = self
+            .last_sel
+            .clone()
+            .filter(|r| r.end <= len && !r.is_empty())
+        else {
+            return;
+        };
+        self.body.replace_range(sel.clone(), text);
+        let end = sel.start + text.len();
+        self.last_sel = Some(end..end);
+        self.last_cursor = Some(end);
+        self.pending_cursor = Some(self.body[..end].chars().count());
+        self.commit_body(project, EditKind::Discrete, now_ms);
     }
 
     /// Texte sélectionné (vide sans sélection).
