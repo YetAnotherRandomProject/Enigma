@@ -142,6 +142,8 @@ pub enum Block {
     ListItem {
         depth: usize,
         marker: String,
+        /// Liste de tâches : case cochée ou non.
+        task: Option<bool>,
         spans: Vec<Inline>,
     },
     Quote(Vec<Inline>),
@@ -175,6 +177,7 @@ struct Builder<'t> {
     /// Compteurs des listes ouvertes (`None` : liste à puces).
     lists: Vec<Option<u64>>,
     item_marker: String,
+    item_task: Option<bool>,
     /// Fin du dernier lien `[[...]]` émis (ses morceaux suivants sont ignorés).
     wiki_done_until: usize,
 }
@@ -254,6 +257,7 @@ impl Builder<'_> {
             Some(Container::Item) => Block::ListItem {
                 depth: self.lists.len().saturating_sub(1),
                 marker: std::mem::take(&mut self.item_marker),
+                task: self.item_task.take(),
                 spans,
             },
             _ if self.quote_depth > 0 => Block::Quote(spans),
@@ -289,6 +293,7 @@ pub fn blocks(text: &str) -> Vec<Block> {
         quote_depth: 0,
         lists: Vec::new(),
         item_marker: String::new(),
+        item_task: None,
         wiki_done_until: 0,
     };
     let mut image: Option<(Range<usize>, String, String)> = None;
@@ -422,7 +427,7 @@ pub fn blocks(text: &str) -> Vec<Block> {
                 b.flush();
                 b.blocks.push(Block::Rule);
             }
-            Event::TaskListMarker(done) => b.push_plain(if done { "[x] " } else { "[ ] " }),
+            Event::TaskListMarker(done) => b.item_task = Some(done),
             Event::Html(t) | Event::InlineHtml(t) => b.push_plain(&t),
             _ => {}
         }
@@ -524,6 +529,7 @@ mod tests {
                     depth,
                     marker,
                     spans,
+                    ..
                 } => Some((*depth, marker.as_str(), texts(spans))),
                 _ => None,
             })

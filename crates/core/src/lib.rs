@@ -10,6 +10,8 @@
 //! - [`board`] : tableau d'enquête (cartes placées à la main).
 //! - [`shortcut`] : raccourcis clavier configurables.
 //! - [`fuzzy`] : recherche approximative (palette de commandes).
+//! - [`table`] : tableaux Markdown alignés.
+//! - [`live`] : découpage d'une fiche en unités d'édition (ligne, tableau, bloc de code).
 
 pub mod board;
 pub mod container;
@@ -20,6 +22,7 @@ pub mod id;
 pub mod import;
 pub mod link_edit;
 pub mod links;
+pub mod live;
 pub mod markdown;
 pub mod md_edit;
 pub mod note;
@@ -28,6 +31,7 @@ pub mod project;
 pub mod render;
 pub mod shortcut;
 pub mod storage;
+pub mod table;
 
 pub use id::NoteId;
 pub use note::{FieldValue, MetaLink, Note, NoteMeta, Pos};
