@@ -79,6 +79,8 @@ pub struct Editor {
     slash_rect: Option<egui::Rect>,
     /// `/` dont les propositions ont été fermées (Échap).
     slash_dismissed: Option<usize>,
+    /// Commande « / » Modèle… choisie : ouvrir le choix des modèles.
+    want_template: bool,
     /// Formulaires « + » pour enrichir le pack depuis la fiche.
     quick_category: QuickAdd,
     quick_status: QuickAdd,
@@ -134,6 +136,8 @@ pub struct BodyOutcome {
     pub open_section: Option<String>,
     /// Chercher les fiches qui portent ce tag.
     pub search_tag: Option<String>,
+    /// Ouvrir le choix d'un modèle à insérer.
+    pub insert_template: bool,
     /// Ouvrir le sélecteur « Insérer une image ou un fichier ».
     pub insert_file: bool,
 }
@@ -472,6 +476,7 @@ impl Editor {
             slash: None,
             slash_rect: None,
             slash_dismissed: None,
+            want_template: false,
             quick_category: QuickAdd::default(),
             quick_status: QuickAdd::default(),
             quick_field: QuickAdd::default(),
@@ -1339,6 +1344,7 @@ impl Editor {
             }
             None => {}
         }
+        outcome.insert_template = std::mem::take(&mut self.want_template);
         outcome
     }
 
@@ -1372,6 +1378,12 @@ impl Editor {
                 self.body.insert_str(at, text);
                 self.commit_body(project, EditKind::Discrete, now_ms);
                 self.pending_cursor = Some(self.body[..at + cursor].chars().count());
+            }
+            crate::slash::SlashAction::InsertTemplate => {
+                self.commit_body(project, EditKind::Discrete, now_ms);
+                self.last_cursor = Some(at);
+                self.pending_cursor = Some(self.body[..at].chars().count());
+                self.want_template = true;
             }
             crate::slash::SlashAction::InsertFile => {
                 self.commit_body(project, EditKind::Discrete, now_ms);
@@ -2092,6 +2104,28 @@ impl Editor {
         self.commit_body(project, EditKind::Discrete, now_ms);
     }
 
+    /// Insère un modèle (déjà rempli) en bloc au curseur ; `cursor` :
+    /// position dans `text` où placer le curseur ensuite.
+    pub fn insert_template(
+        &mut self,
+        text: &str,
+        cursor: Option<usize>,
+        project: &mut Project,
+        now_ms: u64,
+    ) {
+        let len = self.body.len();
+        let pos = self
+            .last_cursor
+            .filter(|&p| p <= len && self.body.is_char_boundary(p))
+            .unwrap_or(len);
+        self.insert_text(text, true, project, now_ms);
+        if let Some(c) = cursor
+            && let Some(start) = self.body[pos..].find(text).map(|i| pos + i)
+        {
+            self.pending_cursor = Some(self.body[..start + c].chars().count());
+        }
+    }
+
     /// Enregistre le tampon courant comme nouvel état (historique + projet).
     fn commit_body(&mut self, project: &mut Project, kind: EditKind, now_ms: u64) {
         let old_body = std::mem::replace(&mut self.snap.body, self.body.clone());
@@ -2279,18 +2313,144 @@ impl Editor {
                                 new_meta = Some(m);
                             }
                         }
-                        FieldKind::Number | FieldKind::Text => {
-                            let buf = self.field_bufs.entry(def.id.clone()).or_default();
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(buf)
-                                    .desired_width(140.0)
-                                    .hint_text(if def.kind == FieldKind::Number {
-                                        "nombre"
+                        FieldKind::List => {
+                            let items: Vec<String> = match current {
+                                Some(FieldValue::List(l)) => l.clone(),
+                                Some(v) if !v.display().is_empty() => vec![v.display()],
+                                _ => Vec::new(),
+                            };
+                            let key = format!("{}#nouveau", def.id);
+                            ui.vertical(|ui| {
+                                let mut remove = None;
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    for (i, it) in items.iter().enumerate() {
+                                        if ui
+                                            .add(egui::Button::new(format!("{it} ×")).small())
+                                            .on_hover_text("Retirer")
+                                            .clicked()
+                                        {
+                                            remove = Some(i);
+                                        }
+                                    }
+                                });
+                                let buf = self.field_bufs.entry(key).or_default();
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(buf)
+                                        .desired_width(140.0)
+                                        .hint_text("+ ajouter (Entrée)"),
+                                );
+                                let mut list = items.clone();
+                                if let Some(i) = remove {
+                                    list.remove(i);
+                                }
+                                if r.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    && !buf.trim().is_empty()
+                                {
+                                    list.push(buf.trim().to_owned());
+                                    buf.clear();
+                                    r.request_focus();
+                                }
+                                if list != items {
+                                    let mut m = self.snap.meta.clone();
+                                    if list.is_empty() {
+                                        m.fields.remove(&def.id);
                                     } else {
-                                        "texte"
-                                    }),
-                            );
-                            if resp.lost_focus() {
+                                        m.fields.insert(def.id.clone(), FieldValue::List(list));
+                                    }
+                                    new_meta = Some(m);
+                                }
+                            });
+                        }
+                        FieldKind::Link => {
+                            let current_id = match current {
+                                Some(FieldValue::Text(s)) => NoteId::parse(s),
+                                _ => None,
+                            };
+                            let title = current_id
+                                .as_ref()
+                                .and_then(|id| project.note(id))
+                                .map(|n| n.meta.title.clone());
+                            let shown = match (&title, &current_id) {
+                                (Some(t), _) => t.clone(),
+                                (None, Some(id)) => format!("{id} (introuvable)"),
+                                (None, None) => "—".to_owned(),
+                            };
+                            let qkey = format!("{}#filtre", def.id);
+                            egui::ComboBox::from_id_salt(("field_link", def.id.as_str()))
+                                .selected_text(shown)
+                                .width(140.0)
+                                .show_ui(ui, |ui| {
+                                    let q = self.field_bufs.entry(qkey).or_default();
+                                    ui.add(
+                                        egui::TextEdit::singleline(q)
+                                            .hint_text("filtrer…")
+                                            .desired_width(160.0),
+                                    )
+                                    .request_focus();
+                                    if ui
+                                        .selectable_label(current_id.is_none(), "Aucune")
+                                        .clicked()
+                                    {
+                                        let mut m = self.snap.meta.clone();
+                                        m.fields.remove(&def.id);
+                                        new_meta = Some(m);
+                                    }
+                                    for nid in project.search(q).into_iter().take(30) {
+                                        if nid == self.id {
+                                            continue;
+                                        }
+                                        let Some(n) = project.note(&nid) else {
+                                            continue;
+                                        };
+                                        let on = current_id.as_ref() == Some(&nid);
+                                        if ui.selectable_label(on, &n.meta.title).clicked() {
+                                            let mut m = self.snap.meta.clone();
+                                            m.fields.insert(
+                                                def.id.clone(),
+                                                FieldValue::Text(nid.as_str().to_owned()),
+                                            );
+                                            new_meta = Some(m);
+                                        }
+                                    }
+                                });
+                        }
+                        FieldKind::Number | FieldKind::Text | FieldKind::Date => {
+                            let buf = self.field_bufs.entry(def.id.clone()).or_default();
+                            let mut today = false;
+                            let resp = ui
+                                .horizontal(|ui| {
+                                    let r = ui.add(
+                                        egui::TextEdit::singleline(buf)
+                                            .desired_width(if def.kind == FieldKind::Date {
+                                                96.0
+                                            } else {
+                                                140.0
+                                            })
+                                            .hint_text(match def.kind {
+                                                FieldKind::Number => "nombre",
+                                                FieldKind::Date => "AAAA-MM-JJ",
+                                                _ => "texte",
+                                            }),
+                                    );
+                                    if def.kind == FieldKind::Date
+                                        && ui
+                                            .small_button("Auj.")
+                                            .on_hover_text("Date du jour")
+                                            .clicked()
+                                    {
+                                        today = true;
+                                    }
+                                    r
+                                })
+                                .inner;
+                            if today {
+                                let d =
+                                    crate::project_file::file_date(std::time::SystemTime::now());
+                                *buf = d.get(..10).unwrap_or(&d).to_owned();
+                            }
+                            if resp.lost_focus() || today {
                                 match parse_field(def.kind, buf) {
                                     Ok(value) => {
                                         let mut m = self.snap.meta.clone();
@@ -2386,7 +2546,26 @@ fn parse_field(kind: FieldKind, text: &str) -> Result<Option<FieldValue>, ()> {
                     .ok_or(())
             }
         }
-        FieldKind::Text => Ok(Some(FieldValue::Text(t.to_owned()))),
+        FieldKind::Text | FieldKind::Link => Ok(Some(FieldValue::Text(t.to_owned()))),
+        FieldKind::Date => {
+            let parts: Vec<&str> = t.split('-').collect();
+            let ok = matches!(parts.as_slice(), [y, m, d]
+                if y.len() == 4
+                    && y.parse::<u16>().is_ok()
+                    && m.parse::<u8>().is_ok_and(|m| (1..=12).contains(&m))
+                    && d.parse::<u8>().is_ok_and(|d| (1..=31).contains(&d)));
+            if ok {
+                Ok(Some(FieldValue::Text(t.to_owned())))
+            } else {
+                Err(())
+            }
+        }
+        FieldKind::List => Ok(Some(FieldValue::List(
+            t.split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        ))),
         FieldKind::Bool => Ok(Some(FieldValue::Bool(matches!(
             t.to_lowercase().as_str(),
             "oui" | "true" | "1"
@@ -2411,5 +2590,11 @@ mod tests {
         assert_eq!(parse_field(FieldKind::Number, "abc"), Err(()));
         assert_eq!(parse_field(FieldKind::Number, "inf"), Err(()));
         assert_eq!(parse_field(FieldKind::Number, ""), Ok(None));
+        assert_eq!(
+            parse_field(FieldKind::Date, "2026-11-18"),
+            Ok(Some(FieldValue::Text("2026-11-18".into())))
+        );
+        assert_eq!(parse_field(FieldKind::Date, "18/11/2026"), Err(()));
+        assert_eq!(parse_field(FieldKind::Date, "2026-13-01"), Err(()));
     }
 }

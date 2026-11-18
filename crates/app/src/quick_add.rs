@@ -93,10 +93,10 @@ impl QuickAdd {
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             match kind {
                 Kind::Field => {
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.field_kind, FieldKind::Text, "Texte");
-                        ui.selectable_value(&mut self.field_kind, FieldKind::Number, "Nombre");
-                        ui.selectable_value(&mut self.field_kind, FieldKind::Bool, "Oui/non");
+                    ui.horizontal_wrapped(|ui| {
+                        for k in FieldKind::ALL {
+                            ui.selectable_value(&mut self.field_kind, k, k.label());
+                        }
                     });
                 }
                 _ => {

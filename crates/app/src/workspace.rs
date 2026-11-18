@@ -77,6 +77,8 @@ enum Dialog {
         focus: bool,
     },
     ConfirmDelete(NoteId),
+    /// Choix d'un modèle du pack à insérer dans la fiche ouverte.
+    InsertTemplate,
 }
 
 /// Ligne de la liste des fiches (en-tête de catégorie ou fiche).
@@ -402,6 +404,7 @@ impl Workspace {
             | Command::Undo
             | Command::Redo
             | Command::InsertImage
+            | Command::InsertTemplate
             | Command::FindInNote => self.editor.is_some(),
             c if commands::format_of(c).is_some() => self.editor.is_some(),
             // Association de fichiers : Windows seulement pour l'instant.
@@ -429,6 +432,12 @@ impl Workspace {
             Command::SearchAll => {
                 self.left_tab = LeftTab::Search;
                 self.search.focus = true;
+            }
+            Command::InsertTemplate => {
+                if self.editor.is_some() {
+                    self.view = View::Note;
+                    self.dialog = Some(Dialog::InsertTemplate);
+                }
             }
             Command::FindInNote => {
                 self.view = View::Note;
@@ -1508,6 +1517,9 @@ impl Workspace {
         if edited || body.edited || insert_table.is_some() {
             self.mark_edited();
         }
+        if body.insert_template {
+            self.dialog = Some(Dialog::InsertTemplate);
+        }
         if let Some(tag) = body.search_tag {
             self.search_tag(&tag);
         }
@@ -1773,6 +1785,7 @@ impl Workspace {
         };
         let mut close = false;
         let mut created = None;
+        let mut insert_template: Option<enigma_core::pack::Template> = None;
         let mut delete = None;
         match dialog {
             Dialog::NewNote {
@@ -1822,8 +1835,19 @@ impl Workspace {
                             let chosen = template
                                 .as_deref()
                                 .and_then(|id| templates.iter().find(|t| t.id == id));
-                            match self.project.create_from_template(title, chosen) {
-                                Ok(id) => created = Some(id),
+                            let vars = crate::project_file::template_vars();
+                            match self.project.create_from_template(title, chosen, &vars) {
+                                Ok(id) => {
+                                    let cursor = chosen.and_then(|t| {
+                                        enigma_core::pack::expand_template(
+                                            &t.body,
+                                            title.trim(),
+                                            &vars,
+                                        )
+                                        .1
+                                    });
+                                    created = Some((id, cursor));
+                                }
                                 Err(e) => {
                                     *error = Some(e.to_string());
                                     *focus = true;
@@ -1831,6 +1855,35 @@ impl Workspace {
                             }
                         }
                     });
+                });
+                if resp.should_close() {
+                    close = true;
+                }
+            }
+            Dialog::InsertTemplate => {
+                let templates = self.project.pack().templates.clone();
+                let resp = egui::Modal::new(egui::Id::unique("insert_template")).show(ctx, |ui| {
+                    ui.set_width(340.0);
+                    ui.heading("Insérer un modèle");
+                    if templates.is_empty() {
+                        ui.weak("Le pack n'a aucun modèle (Modifier le pack de jeu… › Modèles).");
+                    }
+                    for t in &templates {
+                        if ui.button(&t.label).clicked() {
+                            insert_template = Some(t.clone());
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Variables : {{titre}}, {{date}}, {{heure}}, {{curseur}} (position du curseur)",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    if ui.button("Annuler").clicked() {
+                        close = true;
+                    }
                 });
                 if resp.should_close() {
                     close = true;
@@ -1869,10 +1922,26 @@ impl Workspace {
             }
         }
 
-        if let Some(id) = created {
+        if let Some(t) = insert_template {
+            self.dialog = None;
+            if let Some(ed) = &mut self.editor {
+                let title = self
+                    .project
+                    .note(&ed.id)
+                    .map(|n| n.meta.title.clone())
+                    .unwrap_or_default();
+                let vars = crate::project_file::template_vars();
+                let (text, cursor) = enigma_core::pack::expand_template(&t.body, &title, &vars);
+                ed.insert_template(&text, cursor, &mut self.project, self.now_ms);
+                self.mark_edited();
+            }
+        } else if let Some((id, cursor)) = created {
             self.dialog = None;
             self.filter.text.clear();
             self.select(&id, notices);
+            if let (Some(c), Some(ed)) = (cursor, &mut self.editor) {
+                ed.reveal(c);
+            }
         } else if let Some(id) = delete {
             self.dialog = None;
             if self.editor.as_ref().is_some_and(|e| e.id == id) {
@@ -2619,6 +2688,105 @@ mod ui_tests {
         harness.run_steps(4);
         assert!(harness.query_by_label("Partie (replié)").is_some());
         snapshot(&mut harness, "46_section_repliee");
+    }
+
+    #[test]
+    fn date_list_link_fields_and_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            let user = ws.user_packs_dir.clone();
+            ws.project
+                .update_pack(user.as_deref(), |p| {
+                    p.add_field("Vu le", enigma_core::pack::FieldKind::Date);
+                    p.add_field("Objets", enigma_core::pack::FieldKind::List);
+                    p.add_field("Lieu", enigma_core::pack::FieldKind::Link);
+                    p.templates.push(enigma_core::pack::Template {
+                        id: "journal".into(),
+                        label: "Entrée de journal".into(),
+                        body: "## {{titre}} ({{date}})\n{{curseur}}".into(),
+                        ..Default::default()
+                    });
+                })
+                .unwrap();
+        }
+        new_note(&mut harness, "Essai", "Début");
+        let field = |hint: &'static str| {
+            move |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+                n.role() == Role::TextInput && n.placeholder() == Some(hint)
+            }
+        };
+        // Liste : deux valeurs ajoutées avec Entrée.
+        for v in ["clé", "lampe"] {
+            harness.get_by(field("+ ajouter (Entrée)")).focus();
+            harness.run_steps(1);
+            harness.get_by(field("+ ajouter (Entrée)")).type_text(v);
+            harness.key_press(egui::Key::Enter);
+            harness.run_steps(3);
+        }
+        // Date : « Auj. ».
+        harness.get_by_label("Auj.").click();
+        harness.run_steps(3);
+        // Lien : choix d'une fiche dans la liste.
+        // Le panneau des champs est dessiné avant la fiche : premier menu.
+        harness
+            .get_all_by_role(Role::ComboBox)
+            .next()
+            .unwrap()
+            .click();
+        harness.run_steps(4);
+        harness
+            .get_all_by_label("Majordome")
+            .last()
+            .unwrap()
+            .click();
+        harness.run_steps(4);
+        snapshot(&mut harness, "47_champs");
+        let ws = harness.state().ws.as_ref().unwrap();
+        let id = ws.project.resolve_title("Essai").unwrap();
+        let fields = &ws.project.note(id).unwrap().meta.fields;
+        assert_eq!(fields.len(), 3, "{fields:?}");
+        assert_eq!(
+            fields["objets"],
+            enigma_core::FieldValue::List(vec!["clé".into(), "lampe".into()])
+        );
+        assert!(matches!(&fields["vu_le"], enigma_core::FieldValue::Text(d) if d.len() == 10));
+        let majordome = ws.project.resolve_title("Majordome").unwrap();
+        assert_eq!(
+            fields["lieu"],
+            enigma_core::FieldValue::Text(majordome.as_str().to_owned())
+        );
+
+        // Modèle inséré à la fin, curseur sur {{curseur}}.
+        harness
+            .state_mut()
+            .ws
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .edit_at_end();
+        harness.run_steps(4);
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(2);
+        {
+            let state = harness.state_mut();
+            let ws = state.ws.as_mut().unwrap();
+            ws.run_command(
+                Command::InsertTemplate,
+                &egui::Context::default(),
+                &mut state.notices,
+            );
+        }
+        harness.run_steps(10);
+        harness.get_by_label("Entrée de journal").click();
+        harness.run_steps(6);
+        let body = body_text(&harness);
+        assert!(body.starts_with("Début\n\n## Essai ("), "{body}");
+        assert_eq!(editing_text(&harness).as_deref(), Some(""));
     }
 
     #[test]

@@ -312,6 +312,7 @@ impl Project {
         &mut self,
         title: &str,
         template: Option<&Template>,
+        vars: &crate::pack::TemplateVars,
     ) -> Result<NoteId, ProjectError> {
         match template {
             None => self.create_with(title, Vec::new(), None, String::new()),
@@ -321,7 +322,7 @@ impl Project {
                     &clean,
                     t.categories.clone(),
                     t.status.clone(),
-                    t.body_for(&clean),
+                    t.body_for(&clean, vars),
                 )
             }
         }
@@ -1765,13 +1766,17 @@ title: Fiche {i}
             status: Some("theorie".into()),
             body: "# {{title}}\n\n## Indices\n".into(),
         };
-        let id = p.create_from_template(" Serre ", Some(&t)).unwrap();
+        let id = p
+            .create_from_template(" Serre ", Some(&t), &Default::default())
+            .unwrap();
         let n = p.note(&id).unwrap();
         assert_eq!(n.meta.title, "Serre");
         assert_eq!(n.meta.categories, ["piece"]);
         assert_eq!(n.meta.status.as_deref(), Some("theorie"));
         assert_eq!(n.body, "# Serre\n\n## Indices\n");
-        let empty = p.create_from_template("Vide", None).unwrap();
+        let empty = p
+            .create_from_template("Vide", None, &Default::default())
+            .unwrap();
         assert!(p.note(&empty).unwrap().body.is_empty());
     }
 

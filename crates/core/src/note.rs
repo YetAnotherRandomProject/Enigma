@@ -65,6 +65,8 @@ pub enum FieldValue {
     Int(i64),
     Float(f64),
     Text(String),
+    /// Liste de textes.
+    List(Vec<String>),
     /// Toute autre structure YAML (liste, table…), conservée telle quelle.
     Other(serde_yaml_ng::Value),
 }
@@ -85,6 +87,7 @@ impl FieldValue {
             FieldValue::Int(i) => i.to_string(),
             FieldValue::Float(f) => f.to_string(),
             FieldValue::Text(s) => s.clone(),
+            FieldValue::List(l) => l.join(", "),
             FieldValue::Other(v) => serde_yaml_ng::to_string(v)
                 .map(|s| s.trim().to_owned())
                 .unwrap_or_default(),

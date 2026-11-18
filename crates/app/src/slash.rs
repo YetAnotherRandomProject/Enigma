@@ -19,6 +19,8 @@ pub enum SlashAction {
         cursor: usize,
     },
     InsertFile,
+    /// Choisir un modèle du pack.
+    InsertTemplate,
 }
 
 pub struct SlashItem {
@@ -29,7 +31,7 @@ pub struct SlashItem {
 }
 
 fn all() -> Vec<SlashItem> {
-    use SlashAction::{Format as F, InsertFile, Snippet};
+    use SlashAction::{Format as F, InsertFile, InsertTemplate, Snippet};
     let s = |label, keys, action| SlashItem {
         label,
         keys,
@@ -128,6 +130,7 @@ fn all() -> Vec<SlashItem> {
         s("Séparateur", "hr rule ligne", F(Format::Rule)),
         s("Date du jour", "date aujourd'hui", F(Format::Date)),
         s("Image ou fichier…", "image media son", InsertFile),
+        s("Modèle…", "template modele", InsertTemplate),
     ]
 }
 

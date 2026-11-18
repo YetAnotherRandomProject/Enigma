@@ -68,6 +68,15 @@ pub fn file_date(t: SystemTime) -> String {
     )
 }
 
+/// Variables des modèles pour l'instant présent (date et heure UTC).
+pub fn template_vars() -> enigma_core::pack::TemplateVars {
+    let d = file_date(SystemTime::now());
+    enigma_core::pack::TemplateVars {
+        date: d.get(..10).unwrap_or(&d).to_owned(),
+        time: d.get(11..).unwrap_or("").replace('h', ":"),
+    }
+}
+
 /// `dir/Nom (suffixe).enigma`, numéroté s'il existe déjà.
 fn sibling(file: &Path, suffix: &str) -> PathBuf {
     let dir = file.parent().unwrap_or(Path::new("."));

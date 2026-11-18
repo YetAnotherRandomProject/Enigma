@@ -99,6 +99,38 @@ pub enum FieldKind {
     Text,
     #[serde(alias = "boolean")]
     Bool,
+    /// Date `AAAA-MM-JJ`.
+    Date,
+    /// Liste de textes.
+    #[serde(alias = "liste")]
+    List,
+    /// Lien vers une fiche (identifiant de la fiche : un renommage ne le
+    /// casse pas).
+    #[serde(alias = "lien")]
+    Link,
+}
+
+impl FieldKind {
+    pub const ALL: [FieldKind; 6] = [
+        FieldKind::Text,
+        FieldKind::Number,
+        FieldKind::Bool,
+        FieldKind::Date,
+        FieldKind::List,
+        FieldKind::Link,
+    ];
+
+    /// Libellé pour l'interface.
+    pub fn label(self) -> &'static str {
+        match self {
+            FieldKind::Number => "Nombre",
+            FieldKind::Text => "Texte",
+            FieldKind::Bool => "Oui / non",
+            FieldKind::Date => "Date",
+            FieldKind::List => "Liste",
+            FieldKind::Link => "Lien vers une fiche",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -123,12 +155,43 @@ pub struct Template {
     pub body: String,
 }
 
+/// Valeurs des variables de modèle qui dépendent du moment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TemplateVars {
+    /// `AAAA-MM-JJ`.
+    pub date: String,
+    /// `HH:MM`.
+    pub time: String,
+}
+
+/// Remplace les variables d'un modèle : `{{titre}}` (`{{title}}`),
+/// `{{date}}`, `{{heure}}` (`{{time}}`) ; `{{curseur}}` (`{{cursor}}`) est
+/// retiré et sa position (octets) rendue, pour y placer le curseur.
+pub fn expand_template(text: &str, title: &str, vars: &TemplateVars) -> (String, Option<usize>) {
+    let mut out = text.to_owned();
+    for (k, v) in [
+        ("{{title}}", title),
+        ("{{titre}}", title),
+        ("{{date}}", vars.date.as_str()),
+        ("{{heure}}", vars.time.as_str()),
+        ("{{time}}", vars.time.as_str()),
+    ] {
+        out = out.replace(k, v);
+    }
+    let mut cursor = None;
+    for marker in ["{{curseur}}", "{{cursor}}"] {
+        if let Some(i) = out.find(marker) {
+            out.replace_range(i..i + marker.len(), "");
+            cursor.get_or_insert(i);
+        }
+    }
+    (out, cursor)
+}
+
 impl Template {
-    /// Corps d'une nouvelle fiche : `{{title}}` / `{{titre}}` remplacés.
-    pub fn body_for(&self, title: &str) -> String {
-        self.body
-            .replace("{{title}}", title)
-            .replace("{{titre}}", title)
+    /// Corps d'une nouvelle fiche, variables remplacées.
+    pub fn body_for(&self, title: &str, vars: &TemplateVars) -> String {
+        expand_template(&self.body, title, vars).0
     }
 }
 
@@ -598,5 +661,38 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert!(found[0].result.is_ok());
         assert!(found[1].result.is_err());
+    }
+
+    #[test]
+    fn template_variables() {
+        let vars = TemplateVars {
+            date: "2026-11-18".into(),
+            time: "21:05".into(),
+        };
+        let (t, c) = expand_template(
+            "# {{titre}}
+Vu le {{date}} à {{heure}}.
+{{curseur}}fin",
+            "Serre",
+            &vars,
+        );
+        assert_eq!(
+            t,
+            "# Serre
+Vu le 2026-11-18 à 21:05.
+fin"
+        );
+        assert_eq!(&t[c.unwrap()..], "fin");
+        let kinds: Vec<FieldKind> =
+            serde_json::from_str(r#"["date","liste","lien","list"]"#).unwrap();
+        assert_eq!(
+            kinds,
+            [
+                FieldKind::Date,
+                FieldKind::List,
+                FieldKind::Link,
+                FieldKind::List
+            ]
+        );
     }
 }

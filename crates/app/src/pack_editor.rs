@@ -510,7 +510,7 @@ impl PackEditor {
                     egui::ComboBox::new(("field_kind", i), "")
                         .selected_text(kind_label(f.kind))
                         .show_ui(ui, |ui| {
-                            for k in [FieldKind::Number, FieldKind::Text, FieldKind::Bool] {
+                            for k in FieldKind::ALL {
                                 ui.selectable_value(&mut f.kind, k, kind_label(k));
                             }
                         });
@@ -622,11 +622,7 @@ impl PackEditor {
 }
 
 fn kind_label(k: FieldKind) -> &'static str {
-    match k {
-        FieldKind::Number => "Nombre",
-        FieldKind::Text => "Texte",
-        FieldKind::Bool => "Oui / non",
-    }
+    k.label()
 }
 
 fn remove_button(ui: &mut egui::Ui, locked: bool) -> bool {
