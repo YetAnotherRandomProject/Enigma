@@ -1605,7 +1605,7 @@ fn draw_pie(painter: &egui::Painter, center: Pos2, r: f32, colors: &[Color32], e
 
 /// Aperçu d'une fiche au survol.
 fn note_preview(ui: &mut egui::Ui, project: &Project, id: &NoteId, z_field: Option<&str>) {
-    note_summary(ui, project, id);
+    note_summary(ui, project, id, None);
     let Some(note) = project.note(id) else {
         return;
     };
@@ -1634,9 +1634,9 @@ fn note_preview(ui: &mut egui::Ui, project: &Project, id: &NoteId, z_field: Opti
     );
 }
 
-/// Résumé d'une fiche (titre, catégories, statut, début du texte) : aperçu
-/// au survol dans le graphe et sur les liens du texte.
-pub fn note_summary(ui: &mut egui::Ui, project: &Project, id: &NoteId) {
+/// Résumé d'une fiche (titre, catégories, statut, début du texte ou de la
+/// section visée) : aperçu au survol dans le graphe et sur les liens.
+pub fn note_summary(ui: &mut egui::Ui, project: &Project, id: &NoteId, section: Option<&str>) {
     let Some(note) = project.note(id) else {
         return;
     };
@@ -1659,8 +1659,21 @@ pub fn note_summary(ui: &mut egui::Ui, project: &Project, id: &NoteId) {
             ui.label(RichText::new(format!("• {label}")).color(color).small());
         }
     });
-    let excerpt: String = note
-        .body
+    let part = enigma_core::sections::excerpt(&note.body, section);
+    if let Some(s) = section {
+        let label = if s.starts_with('^') {
+            "Paragraphe".to_owned()
+        } else {
+            format!("Section « {s} »")
+        };
+        ui.label(RichText::new(label).small().italics());
+        if part.is_none() {
+            ui.colored_label(ui.visuals().warn_fg_color, "introuvable");
+        }
+    }
+    let excerpt: String = part
+        .as_deref()
+        .unwrap_or(&note.body)
         .lines()
         .filter(|l| !l.trim().is_empty())
         .take(6)

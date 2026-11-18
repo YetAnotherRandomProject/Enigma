@@ -684,6 +684,22 @@ impl Workspace {
         self.editor = Editor::open(&self.project, id);
     }
 
+    /// Place l'éditeur sur une section (`Titre`) ou un paragraphe (`^id`)
+    /// de la fiche ouverte.
+    fn reveal_section(&mut self, id: &NoteId, section: Option<&str>) {
+        let Some(section) = section else {
+            return;
+        };
+        let at = self
+            .project
+            .note(id)
+            .and_then(|n| enigma_core::sections::locate(&n.body, Some(section)));
+        if let (Some(r), Some(ed)) = (at, &mut self.editor) {
+            let line_end = ed_line_end(ed.body_text(), r.start);
+            ed.reveal(line_end);
+        }
+    }
+
     fn mark_edited(&mut self) {
         self.last_edit = Some(Instant::now());
     }
@@ -1418,6 +1434,7 @@ impl Workspace {
         }
         if let Some(target) = body.open {
             self.select(&target, notices);
+            self.reveal_section(&target, body.open_section.as_deref());
         }
     }
 
@@ -1791,6 +1808,13 @@ impl Workspace {
             self.dialog = None;
         }
     }
+}
+
+/// Fin de la ligne qui commence à `start`.
+fn ed_line_end(body: &str, start: usize) -> usize {
+    body.get(start..)
+        .and_then(|t| t.find('\n'))
+        .map_or(body.len(), |i| start + i)
 }
 
 /// Étiquette colorée du type de lien.
@@ -2376,6 +2400,34 @@ mod ui_tests {
         );
         assert!(harness.query_by_label("Mentions non liées (0)").is_some());
         assert!(harness.query_by_label("Rétroliens (1)").is_some());
+    }
+
+    #[test]
+    fn section_links_and_embeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = setup(dir.path());
+        new_note(
+            &mut harness,
+            "Source",
+            "# Manoir\nintro\n## Code\nLe code est 1945. ^c1\n## Fin\nz",
+        );
+        new_note(
+            &mut harness,
+            "Cible",
+            "Voir [[Source#^c1]].\n\n![[Source#Code]]\n\nFin.",
+        );
+        harness.run_steps(6);
+        snapshot(&mut harness, "42_insertion");
+        // Le cadre inséré porte le titre de la section ; clic : ouverture
+        // de la fiche sur la section.
+        harness.get_by_label("Source › Code").click();
+        harness.run_steps(6);
+        assert_eq!(open_title(&harness), "Source");
+        assert_eq!(editing_text(&harness).as_deref(), Some("## Code"));
+        // Rétrolien compté une fois malgré les deux références.
+        let ws = harness.state().ws.as_ref().unwrap();
+        let source = ws.project.resolve_title("Source").unwrap().clone();
+        assert_eq!(ws.project.backlinks(&source).len(), 1);
     }
 
     #[test]

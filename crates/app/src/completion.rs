@@ -18,6 +18,8 @@ pub enum ItemKind {
     Create(String),
     /// Type de lien (identifiant du pack).
     LinkType(String),
+    /// Section de la fiche visée (texte du titre).
+    Section(String),
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +67,28 @@ pub fn items_for(c: &Completion, project: &Project) -> Vec<Item> {
                 });
             }
             items
+        }
+        Completion::Section { target, query, .. } => {
+            let q = enigma_core::search::fold(query.trim());
+            let Some(note) = project
+                .resolve_title(target)
+                .and_then(|id| project.note(id))
+            else {
+                return Vec::new();
+            };
+            enigma_core::sections::headings(&note.body)
+                .into_iter()
+                .filter(|h| {
+                    let f = enigma_core::search::fold(&h.text);
+                    q.is_empty() || f.windows(q.len()).any(|w| w == q.as_slice())
+                })
+                .map(|h| Item {
+                    label: format!("{}{}", "  ".repeat(usize::from(h.level) - 1), h.text),
+                    detail: None,
+                    color: None,
+                    kind: ItemKind::Section(h.text),
+                })
+                .collect()
         }
         Completion::LinkType { query, .. } => {
             let q = query.trim().to_lowercase();
@@ -126,6 +150,7 @@ impl Popup {
                     let title = match &self.context {
                         Completion::Title { .. } => "Lier à une fiche",
                         Completion::LinkType { .. } => "Type de lien",
+                        Completion::Section { .. } => "Section de la fiche",
                     };
                     ui.label(RichText::new(title).weak().small());
                     for (i, item) in self.items.iter().enumerate() {
@@ -144,7 +169,9 @@ impl Popup {
                     ui.separator();
                     let hint = match &self.context {
                         Completion::Title { .. } => "Entrée : insérer · Tab : puis un type · Échap",
-                        Completion::LinkType { .. } => "Entrée : insérer · Échap : fermer",
+                        Completion::LinkType { .. } | Completion::Section { .. } => {
+                            "Entrée : insérer · Échap : fermer"
+                        }
                     };
                     ui.label(RichText::new(hint).weak().small());
                 });

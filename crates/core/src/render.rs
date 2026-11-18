@@ -115,10 +115,11 @@ pub struct InlineStyle {
 /// Lien porté par un morceau de texte.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InlineLink {
-    /// `[[Titre]]` ou `[[Titre|type]]`.
+    /// `[[Titre]]`, `[[Titre|type]]`, `[[Titre#Section]]`, `[[Titre#^id]]`.
     Wiki {
         target: String,
         kind: Option<String>,
+        section: Option<String>,
     },
     /// Lien Markdown classique.
     Url(String),
@@ -200,8 +201,15 @@ impl Builder<'_> {
             .wiki
             .iter()
             .find(|w| w.range.start < range.end && range.start < w.range.end)
-            .map(|w| (w.range.clone(), w.target.clone(), w.kind.clone()));
-        if let Some((wrange, target, kind)) = found {
+            .map(|w| {
+                (
+                    w.range.clone(),
+                    w.target.clone(),
+                    w.kind.clone(),
+                    w.section.clone(),
+                )
+            });
+        if let Some((wrange, target, kind, section)) = found {
             let before = wrange.start.saturating_sub(range.start);
             if before > 0
                 && let Some(head) = s.get(..before)
@@ -209,10 +217,19 @@ impl Builder<'_> {
                 self.push_plain(head);
             }
             let end = wrange.end;
+            let text = match section.as_deref() {
+                Some(s) if s.starts_with('^') => format!("{target} › ¶"),
+                Some(s) => format!("{target} › {s}"),
+                None => target.clone(),
+            };
             self.spans.push(Inline {
-                text: target.clone(),
+                text,
                 style: self.style,
-                link: Some(InlineLink::Wiki { target, kind }),
+                link: Some(InlineLink::Wiki {
+                    target,
+                    kind,
+                    section,
+                }),
             });
             self.wiki_done_until = end;
             if range.end > end
@@ -248,6 +265,16 @@ impl Builder<'_> {
 
     /// Termine le bloc en cours (texte accumulé).
     fn flush(&mut self) {
+        // Identifiant de paragraphe `^id` en fin de texte : masqué.
+        if let Some(last) = self.spans.last_mut()
+            && last.link.is_none()
+            && let Some((_, r)) = crate::sections::block_id(&last.text)
+        {
+            last.text.truncate(r.start);
+            if last.text.is_empty() {
+                self.spans.pop();
+            }
+        }
         if self.spans.is_empty() {
             return;
         }
@@ -520,7 +547,8 @@ mod tests {
         assert!(p.iter().any(|s| s.link
             == Some(InlineLink::Wiki {
                 target: "Coffre du bureau".into(),
-                kind: Some("ouvre".into())
+                kind: Some("ouvre".into()),
+                section: None,
             })));
         let items: Vec<(usize, &str, String)> = b
             .iter()

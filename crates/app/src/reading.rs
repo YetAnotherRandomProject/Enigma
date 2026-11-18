@@ -33,10 +33,11 @@ const HANDLE: f32 = 12.0;
 const CELL_MIN: Vec2 = Vec2::new(56.0, BODY_SIZE + 6.0);
 
 /// Ce que l'utilisateur a demandé dans la fiche mise en forme.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ViewAction {
     /// Clic sur `[[Titre]]`.
-    OpenTitle(String),
+    /// Fiche à ouvrir, et section ou paragraphe (`^id`) où se placer.
+    OpenTitle(String, Option<String>),
     /// Nouvelle largeur d'une image (fin du glisser) ; plage dans la fiche.
     Resize { image: ImageRef, width: u32 },
     /// Ouvrir une pièce jointe avec l'application du système.
@@ -86,6 +87,12 @@ pub enum Content {
         /// Cellules par ligne de données (en-tête compris).
         rows: Vec<Vec<CellView>>,
     },
+    /// Ligne réduite à `![[Fiche]]`, `![[Fiche#Section]]` ou
+    /// `![[Fiche#^id]]` : contenu de l'autre fiche inséré.
+    Embed {
+        target: String,
+        section: Option<String>,
+    },
 }
 
 pub struct CachedUnit {
@@ -111,6 +118,31 @@ pub struct Drags {
     /// Tableau : (début, déplacement cumulé).
     table: Option<(usize, Vec2)>,
     menu_byte: usize,
+    /// Contenus insérés `![[…]]` : (version du contenu du projet, chemin
+    /// de la fiche, unités), par cible écrite.
+    embeds: std::collections::HashMap<String, (u64, std::path::PathBuf, Vec<CachedUnit>)>,
+    /// Profondeur d'insertion (une fiche insérée dans une fiche insérée…).
+    depth: usize,
+}
+
+/// Profondeur maximale des insertions imbriquées.
+const MAX_EMBED_DEPTH: usize = 2;
+
+/// `![[Fiche#Section]]` seul sur la ligne : (fiche, section).
+fn embed_of(line: &str) -> Option<(String, Option<String>)> {
+    let inner = line.trim().strip_prefix("![[")?.strip_suffix("]]")?;
+    if inner.contains("]]") || inner.contains("[[") {
+        return None;
+    }
+    let inner = inner.split('|').next().unwrap_or(inner);
+    let (target, section) = match inner.split_once('#') {
+        Some((t, s)) => (
+            t.trim(),
+            Some(s.trim().to_owned()).filter(|s| !s.is_empty()),
+        ),
+        None => (inner.trim(), None),
+    };
+    (!target.is_empty()).then(|| (target.to_owned(), section))
 }
 
 #[derive(Default)]
@@ -167,6 +199,10 @@ fn build(body: &str) -> Vec<CachedUnit> {
             let text = &body[unit.range.clone()];
             let base = unit.range.start;
             let content = match unit.kind {
+                UnitKind::Line if embed_of(text).is_some() => {
+                    let (target, section) = embed_of(text).unwrap_or_default();
+                    Content::Embed { target, section }
+                }
                 UnitKind::Line => {
                     let (indent, lead) = live::indent(text);
                     let source = &text[lead..];
@@ -311,7 +347,130 @@ impl Drags {
             Content::Table { cols, rows } => {
                 self.table_ui(ui, &cu.unit.range, *cols, rows, project, note_path, menu)
             }
+            Content::Embed { target, section } => {
+                self.embed_ui(ui, cu, target, section.as_deref(), project, menu)
+            }
         }
+    }
+
+    /// Contenu d'une autre fiche, encadré, avec son titre. Un clic dans le
+    /// contenu ouvre cette fiche à cet endroit ; « Modifier » montre la
+    /// syntaxe `![[…]]`.
+    fn embed_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        cu: &CachedUnit,
+        target: &str,
+        section: Option<&str>,
+        project: &Project,
+        menu: &mut Menu<'_>,
+    ) -> Option<ViewAction> {
+        let mut action = None;
+        let visuals = ui.visuals().clone();
+        let accent = crate::theme::accent(&visuals);
+        let resolved = project.resolve_title(target).cloned();
+        let open = ViewAction::OpenTitle(target.to_owned(), section.map(str::to_owned));
+        let frame = egui::Frame::new()
+            .fill(visuals.faint_bg_color)
+            .stroke(visuals.widgets.noninteractive.bg_stroke)
+            .inner_margin(egui::Margin {
+                left: 12,
+                right: 8,
+                top: 4,
+                bottom: 6,
+            })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let title = match section {
+                        Some(s) if s.starts_with('^') => format!("{target} › paragraphe"),
+                        Some(s) => format!("{target} › {s}"),
+                        None => target.to_owned(),
+                    };
+                    if ui
+                        .add(
+                            egui::Label::new(RichText::new(title).small().color(accent))
+                                .sense(Sense::click()),
+                        )
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text("Ouvrir la fiche")
+                        .clicked()
+                    {
+                        action = Some(match &resolved {
+                            Some(_) => open.clone(),
+                            None => ViewAction::OpenTitle(target.to_owned(), None),
+                        });
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("Modifier")
+                            .on_hover_text("Modifier la ligne ![[…]]")
+                            .clicked()
+                        {
+                            action = Some(ViewAction::EditAt(cu.unit.range.end));
+                        }
+                    });
+                });
+                let Some(id) = &resolved else {
+                    ui.colored_label(
+                        visuals.error_fg_color,
+                        format!("Fiche « {target} » introuvable (clic sur le titre : la créer)"),
+                    );
+                    return;
+                };
+                if self.depth >= MAX_EMBED_DEPTH {
+                    ui.weak("(insertion trop imbriquée)");
+                    return;
+                }
+                let key = format!("{target}#{}", section.unwrap_or(""));
+                let version = project.content_version();
+                let fresh = self.embeds.get(&key).is_some_and(|(v, _, _)| *v == version);
+                if !fresh {
+                    let note = project.note(id);
+                    let text = note.and_then(|n| enigma_core::sections::excerpt(&n.body, section));
+                    let path = project
+                        .entry(id)
+                        .map(|e| e.path.clone())
+                        .unwrap_or_default();
+                    let units = text.as_deref().map(build).unwrap_or_default();
+                    self.embeds.insert(key.clone(), (version, path, units));
+                }
+                let Some((_, path, units)) = self.embeds.remove(&key) else {
+                    return;
+                };
+                if units.is_empty()
+                    || section.is_some_and(|s| {
+                        project.note(id).is_some_and(|n| {
+                            enigma_core::sections::locate(&n.body, Some(s)).is_none()
+                        })
+                    })
+                {
+                    ui.colored_label(
+                        visuals.warn_fg_color,
+                        "Section introuvable dans cette fiche.",
+                    );
+                }
+                self.depth += 1;
+                for u in &units {
+                    let a = self.unit_ui(ui, u, project, &path, menu);
+                    // Les actions qui modifieraient le texte ouvrent la fiche.
+                    match a {
+                        Some(ViewAction::OpenTitle(..) | ViewAction::OpenFile(_)) => action = a,
+                        Some(
+                            ViewAction::EditAt(_)
+                            | ViewAction::DragFrom(_)
+                            | ViewAction::ToggleTask(_),
+                        ) => action = Some(open.clone()),
+                        _ => {}
+                    }
+                }
+                self.depth -= 1;
+                self.embeds.insert(key, (version, path, units));
+            });
+        let r = frame.response.rect;
+        ui.painter()
+            .vline(r.left() + 1.0, r.y_range(), Stroke::new(2.0, accent));
+        action
     }
 
     /// Ligne vide, ou sans rendu (définition de lien…) : texte atténué.
@@ -967,14 +1126,14 @@ impl Drags {
         let index_at = |pos: Pos2| galley.cursor_from_pos(pos - rect.min).index.0;
         let link_at = |i: usize| links.iter().find(|(r, _)| r.contains(&i)).map(|(_, l)| *l);
         match resp.hover_pos().and_then(|p| link_at(index_at(p))) {
-            Some(InlineLink::Wiki { target, .. })
-                if let Some(id) = project.resolve_title(target) =>
-            {
-                // Aperçu de la fiche liée.
+            Some(InlineLink::Wiki {
+                target, section, ..
+            }) if let Some(id) = project.resolve_title(target) => {
+                // Aperçu de la fiche liée (ou de la section visée).
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                 let id = id.clone();
                 resp.clone().on_hover_ui_at_pointer(|ui| {
-                    crate::graph_view::note_summary(ui, project, &id);
+                    crate::graph_view::note_summary(ui, project, &id, section.as_deref());
                     ui.separator();
                     ui.label(RichText::new("Clic : ouvrir la fiche").small().weak());
                 });
@@ -1015,7 +1174,9 @@ impl Drags {
         {
             let i = index_at(pos);
             return Some(match link_at(i) {
-                Some(InlineLink::Wiki { target, .. }) => ViewAction::OpenTitle(target.clone()),
+                Some(InlineLink::Wiki {
+                    target, section, ..
+                }) => ViewAction::OpenTitle(target.clone(), section.clone()),
                 Some(InlineLink::Url(u)) => {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(u));
                     return None;

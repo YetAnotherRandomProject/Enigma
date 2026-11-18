@@ -84,6 +84,8 @@ pub struct BodyOutcome {
     pub edited: bool,
     /// Fiche à ouvrir (Ctrl+clic sur un lien).
     pub open: Option<NoteId>,
+    /// Section ou paragraphe (`^id`) où se placer dans la fiche ouverte.
+    pub open_section: Option<String>,
     /// Ouvrir le sélecteur « Insérer une image ou un fichier ».
     pub insert_file: bool,
 }
@@ -107,6 +109,8 @@ pub enum MenuChoice {
     InsertFile,
     Copy,
     Cut,
+    /// Copier un lien vers la section ou le paragraphe du curseur.
+    CopyLinkHere,
 }
 
 /// Menu contextuel du texte.
@@ -202,6 +206,12 @@ pub fn format_menu(ui: &mut egui::Ui, has_selection: bool) -> Option<MenuChoice>
         "Bloc de code",
         "",
         MenuChoice::Format(Format::CodeBlock),
+    );
+    item(
+        ui,
+        "Copier le lien vers ce paragraphe",
+        "",
+        MenuChoice::CopyLinkHere,
     );
     ui.separator();
     ui.menu_button("Insérer", |ui| {
@@ -440,6 +450,11 @@ impl Editor {
 
     #[cfg(test)]
     pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// Texte de la fiche.
+    pub fn body_text(&self) -> &str {
         &self.body
     }
 
@@ -970,6 +985,7 @@ impl Editor {
                 && let Some(link) = cursor_byte.and_then(|b| markdown::wiki_link_at(&self.body, b))
             {
                 outcome.open = self.open_or_create(&link.target, project, notices);
+                outcome.open_section = link.section.clone();
             }
 
             // Suggestions.
@@ -1059,8 +1075,9 @@ impl Editor {
                 self.activate(&ctx, te_id, b, None);
                 self.drag_anchor = Some(b);
             }
-            Some(ViewAction::OpenTitle(title)) => {
+            Some(ViewAction::OpenTitle(title, section)) => {
                 outcome.open = self.open_or_create(&title, project, notices);
+                outcome.open_section = section;
             }
             Some(ViewAction::OpenFile(path)) => {
                 if let Err(e) = crate::system_open::open(&path) {
@@ -1137,6 +1154,30 @@ impl Editor {
                 outcome.edited = true;
             }
             MenuChoice::InsertFile => outcome.insert_file = true,
+            MenuChoice::CopyLinkHere => {
+                let title = project
+                    .note(&self.id)
+                    .map(|n| n.meta.title.clone())
+                    .unwrap_or_default();
+                let at = self.last_cursor.unwrap_or(0).min(self.body.len());
+                let line_start = self.body[..at].rfind('\n').map_or(0, |i| i + 1);
+                let heading = enigma_core::sections::headings(&self.body)
+                    .into_iter()
+                    .find(|h| h.line.start == line_start);
+                let link = match heading {
+                    Some(h) => format!("[[{title}#{}]]", h.text),
+                    None => {
+                        let (text, id) = enigma_core::sections::ensure_block_id(&self.body, at);
+                        if text != self.body {
+                            self.body = text;
+                            self.commit_body(project, EditKind::Discrete, now_ms);
+                            outcome.edited = true;
+                        }
+                        format!("[[{title}#^{id}]]")
+                    }
+                };
+                ctx.copy_text(link);
+            }
             MenuChoice::Copy => ctx.copy_text(self.selected_text()),
             MenuChoice::Cut => {
                 ctx.copy_text(self.selected_text());
@@ -1691,7 +1732,7 @@ impl Editor {
                             }
                         }
                     }
-                    ItemKind::LinkType(id) => id.clone(),
+                    ItemKind::LinkType(id) | ItemKind::Section(id) => id.clone(),
                 };
                 let then_type = nav == Nav::AcceptThenType && !project.pack().link_types.is_empty();
                 let (text, cursor) = markdown::apply_completion(

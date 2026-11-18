@@ -32,6 +32,7 @@ pub mod pack;
 pub mod project;
 pub mod render;
 pub mod search;
+pub mod sections;
 pub mod shortcut;
 pub mod storage;
 pub mod table;

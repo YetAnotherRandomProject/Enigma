@@ -50,6 +50,8 @@ pub struct WikiLink {
     pub target_range: Range<usize>,
     /// Type de lien après `|`, s'il y en a un.
     pub kind: Option<String>,
+    /// Section visée après `#` : titre de section, ou `^id` de paragraphe.
+    pub section: Option<String>,
 }
 
 /// Résultat complet de l'analyse.
@@ -217,20 +219,30 @@ pub enum Completion {
         target: String,
         query: String,
     },
+    /// Après `[[Titre#` : section partielle. `start` : octet après `#`.
+    Section {
+        start: usize,
+        target: String,
+        query: String,
+    },
 }
 
 impl Completion {
     /// Début du texte que le choix remplacera (jusqu'au curseur).
     pub fn start(&self) -> usize {
         match self {
-            Completion::Title { start, .. } | Completion::LinkType { start, .. } => *start,
+            Completion::Title { start, .. }
+            | Completion::LinkType { start, .. }
+            | Completion::Section { start, .. } => *start,
         }
     }
 
     /// Texte partiel déjà tapé.
     pub fn query(&self) -> &str {
         match self {
-            Completion::Title { query, .. } | Completion::LinkType { query, .. } => query,
+            Completion::Title { query, .. }
+            | Completion::LinkType { query, .. }
+            | Completion::Section { query, .. } => query,
         }
     }
 }
@@ -264,10 +276,17 @@ pub fn completion_at(text: &str, cursor: usize) -> Option<Completion> {
                 query: query.trim_start().to_owned(),
             })
         }
-        None => Some(Completion::Title {
-            start: abs_open + 2,
-            query: inner.trim_start().to_owned(),
-        }),
+        None => match inner.find('#') {
+            Some(h) => Some(Completion::Section {
+                start: abs_open + 2 + h + 1,
+                target: inner[..h].trim().to_owned(),
+                query: inner[h + 1..].trim_start().to_owned(),
+            }),
+            None => Some(Completion::Title {
+                start: abs_open + 2,
+                query: inner.trim_start().to_owned(),
+            }),
+        },
     }
 }
 
@@ -419,6 +438,13 @@ fn scan_wiki_links(text: &str, in_code: &[bool]) -> Vec<WikiLink> {
             }
             None => (inner, None),
         };
+        let (target_part, section) = match target_part.find('#') {
+            Some(h) => {
+                let s = target_part[h + 1..].trim();
+                (&target_part[..h], (!s.is_empty()).then(|| s.to_owned()))
+            }
+            None => (target_part, None),
+        };
         let lead_ws = target_part.len() - target_part.trim_start().len();
         let target = target_part.trim();
         if !target.is_empty() {
@@ -428,6 +454,7 @@ fn scan_wiki_links(text: &str, in_code: &[bool]) -> Vec<WikiLink> {
                 target: target.to_owned(),
                 target_range: t_start..t_start + target.len(),
                 kind,
+                section,
             });
         }
         from = close + 2;
